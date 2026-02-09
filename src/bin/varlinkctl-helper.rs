@@ -2,34 +2,133 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::warn;
+use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use rustix::event::{PollFd, PollFlags, poll};
-use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
+enum Stream {
+    Plain(TcpStream),
+    Tls(openssl::ssl::SslStream<TcpStream>),
+}
 
-fn ws_url(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("https://") {
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            Stream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+type Ws = WebSocket<Stream>;
+
+fn ws_tcp_stream(ws: &Ws) -> &TcpStream {
+    match ws.get_ref() {
+        Stream::Plain(s) => s,
+        Stream::Tls(s) => s.get_ref(),
+    }
+}
+
+/// Build an `SslConnector` with client certs and a custom CA loaded from the
+/// first existing directory:
+/// 1. `$XDG_CONFIG_HOME/varlink-http-bridge/`
+/// 2. `~/.config/varlink-http-bridge/`
+/// 3. `$CREDENTIALS_DIRECTORY` (systemd, see systemd.exec(5))
+fn build_ssl_connector() -> Result<SslConnector> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+
+    let maybe_credentials_dirs = [
+        std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("varlink-http-bridge")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/varlink-http-bridge")),
+        std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
+    ];
+    if let Some(dir) = maybe_credentials_dirs
+        .into_iter()
+        .flatten()
+        .find(|d| d.is_dir())
+    {
+        let cert = dir.join("client-cert-file");
+        let key = dir.join("client-key-file");
+        let ca = dir.join("server-ca-file");
+
+        if cert.exists() && key.exists() {
+            builder
+                .set_certificate_chain_file(&cert)
+                .with_context(|| format!("loading client certificate {}", cert.display()))?;
+            builder
+                .set_private_key_file(&key, SslFiletype::PEM)
+                .with_context(|| format!("loading client key {}", key.display()))?;
+            builder
+                .check_private_key()
+                .context("client certificate and key do not match")?;
+        }
+
+        if ca.exists() {
+            builder
+                .set_ca_file(&ca)
+                .with_context(|| format!("loading CA certificate {}", ca.display()))?;
+        }
+    }
+
+    Ok(builder.build())
+}
+
+fn connect_ws(url: &str) -> Result<Ws> {
+    let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
         format!("ws://{rest}")
     } else {
         url.to_string()
-    }
-}
+    };
+    let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
+    let use_tls = uri.scheme_str() == Some("wss");
+    let host = uri.host().context("URL has no host")?;
+    let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-fn ws_tcp_stream(ws: &Ws) -> Result<&TcpStream> {
-    match ws.get_ref() {
-        MaybeTlsStream::Plain(s) => Ok(s),
-        MaybeTlsStream::NativeTls(s) => Ok(s.get_ref()),
-        _ => bail!("unsupported TLS stream type {ws:?}"),
-    }
+    let tcp = TcpStream::connect((host, port))
+        .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+
+    let stream =
+        if use_tls {
+            let connector = build_ssl_connector()?;
+            Stream::Tls(connector.connect(host, tcp).context(
+                "TLS handshake failed: check client certificate if server requires mTLS",
+            )?)
+        } else {
+            Stream::Plain(tcp)
+        };
+
+    let ws_context = if use_tls {
+        "WebSocket handshake failed: check client cert if server requires mTLS"
+    } else {
+        "WebSocket handshake failed"
+    };
+    let (ws, _) = tungstenite::client(ws_url, stream).context(ws_context)?;
+    Ok(ws)
 }
 
 /// Forward all data from the WebSocket to fd3 until it would block or the peer closes.
@@ -50,7 +149,7 @@ fn forward_ws_until_would_block(ws: &mut Ws, fd3: &mut UnixStream) -> Result<boo
 }
 
 fn graceful_close(ws: &mut Ws) -> Result<()> {
-    let tcp = ws_tcp_stream(ws)?;
+    let tcp = ws_tcp_stream(ws);
     tcp.set_nonblocking(false)?;
     tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -79,7 +178,7 @@ fn main() -> Result<()> {
     }
 
     // XXX: once https://github.com/systemd/systemd/issues/40640 is implemented
-    // we can remove the env_url and this confusing mach
+    // we can remove the env_url and this confusing match
     let env_url = std::env::var("VARLINK_BRIDGE_URL").ok();
     let arg_url = std::env::args().nth(1);
     let bridge_url = match (env_url, arg_url) {
@@ -87,20 +186,18 @@ fn main() -> Result<()> {
         (None, None) => bail!("bridge URL required via VARLINK_BRIDGE_URL or argv[1]"),
         (Some(url), None) | (None, Some(url)) => url,
     };
-    let ws_url = ws_url(&bridge_url);
 
     // Safety: fd 3 is passed to us via the sd_listen_fds() protocol.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     rustix::io::fcntl_getfd(&fd3).context("fd 3 is not valid (LISTEN_FDS protocol error?)")?;
     let mut fd3 = UnixStream::from(fd3);
 
-    let (mut ws, _) = tungstenite::connect(&ws_url)
-        .with_context(|| format!("WebSocket connect to {ws_url} failed"))?;
+    let mut ws = connect_ws(&bridge_url)?;
 
     // Set non-blocking so that we deal with incomplete websocket
     // frames in ws.read() - they return WouldBlock now and we can
     // continue when waking up from PollFd next time.
-    ws_tcp_stream(&ws)?.set_nonblocking(true)?;
+    ws_tcp_stream(&ws).set_nonblocking(true)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
@@ -114,7 +211,7 @@ fn main() -> Result<()> {
 
         let mut pollfds = [
             PollFd::new(&fd3, PollFlags::IN),
-            PollFd::new(ws_tcp_stream(&ws)?, PollFlags::IN),
+            PollFd::new(ws_tcp_stream(&ws), PollFlags::IN),
         ];
         match poll(&mut pollfds, None) {
             // signal interrupted poll: continue to re-check shutdown flag

@@ -31,7 +31,7 @@ async fn run_test_server(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener)
+        run_server(&varlink_sockets_path, listener, None)
             .await
             .expect("server failed")
     });
@@ -370,7 +370,7 @@ async fn test_varlink_sockets_dir_or_file_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir_or_file, listener).await;
+    let res = run_server(&varlink_sockets_dir_or_file, listener, None).await;
 
     assert!(res.is_err());
     assert!(
@@ -649,5 +649,366 @@ async fn test_varlinkctl_helper_userdb_get_user_record() {
     assert!(
         users.len() >= 2,
         "expected at least 2 user records, got users {users:#?}"
+    );
+}
+
+struct TestPki {
+    _tmpdir: tempfile::TempDir,
+    ca_cert_pem: Vec<u8>,
+    server_cert_path: std::path::PathBuf,
+    server_key_path: std::path::PathBuf,
+    ca_cert_path: std::path::PathBuf,
+    client_cert_path: std::path::PathBuf,
+    client_key_path: std::path::PathBuf,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+}
+
+#[rustfmt::skip]
+fn make_test_pki() -> TestPki {
+    use std::process::Command;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let d = tmpdir.path();
+
+    let openssl = |args: &[&str]| {
+        let out = Command::new("openssl").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "openssl {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // CA key + self-signed cert
+    openssl(&[
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", d.join("ca-key.pem").to_str().unwrap(),
+        "-out",    d.join("ca.pem").to_str().unwrap(),
+        "-subj",   "/CN=Test CA",
+        "-days",   "365",
+    ]);
+
+    // Server key + CSR + cert signed by CA (with SAN)
+    openssl(&[
+        "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", d.join("server-key.pem").to_str().unwrap(),
+        "-out",    d.join("server.csr").to_str().unwrap(),
+        "-subj",   "/CN=localhost",
+        "-addext", "subjectAltName=DNS:localhost",
+    ]);
+    openssl(&[
+        "x509", "-req",
+        "-in",      d.join("server.csr").to_str().unwrap(),
+        "-CA",      d.join("ca.pem").to_str().unwrap(),
+        "-CAkey",   d.join("ca-key.pem").to_str().unwrap(),
+        "-CAcreateserial",
+        "-out",     d.join("server-cert.pem").to_str().unwrap(),
+        "-days",    "365",
+        "-copy_extensions", "copy",
+    ]);
+
+    // Client key + CSR + cert signed by CA
+    openssl(&[
+        "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", d.join("client-key.pem").to_str().unwrap(),
+        "-out",    d.join("client.csr").to_str().unwrap(),
+        "-subj",   "/CN=test-client",
+    ]);
+    openssl(&[
+        "x509", "-req",
+        "-in",      d.join("client.csr").to_str().unwrap(),
+        "-CA",      d.join("ca.pem").to_str().unwrap(),
+        "-CAkey",   d.join("ca-key.pem").to_str().unwrap(),
+        "-CAcreateserial",
+        "-out",     d.join("client-cert.pem").to_str().unwrap(),
+        "-days",    "365",
+    ]);
+
+    TestPki {
+        ca_cert_pem:       std::fs::read(d.join("ca.pem")).unwrap(),
+        server_cert_path:  d.join("server-cert.pem"),
+        server_key_path:   d.join("server-key.pem"),
+        ca_cert_path:      d.join("ca.pem"),
+        client_cert_path:  d.join("client-cert.pem"),
+        client_key_path:   d.join("client-key.pem"),
+        client_cert_pem:   std::fs::read(d.join("client-cert.pem")).unwrap(),
+        client_key_pem:    std::fs::read(d.join("client-key.pem")).unwrap(),
+        _tmpdir: tmpdir,
+    }
+}
+
+async fn run_test_tls_server(
+    varlink_sockets_path: &str,
+    tls_acceptor: openssl::ssl::SslAcceptor,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port failed");
+    let local_addr = listener
+        .local_addr()
+        .expect("failed to extract local address");
+
+    let varlink_sockets_path = varlink_sockets_path.to_string();
+    let task_handle = tokio::spawn(async move {
+        run_server(&varlink_sockets_path, listener, Some(tls_acceptor))
+            .await
+            .expect("server failed")
+    });
+
+    (task_handle, local_addr)
+}
+
+#[tokio::test]
+async fn test_tls_basic_connection() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        None,
+    )
+    .unwrap();
+
+    let (server, local_addr) =
+        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    defer! {
+        server.abort();
+    };
+
+    let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .resolve("localhost", local_addr)
+        .build()
+        .unwrap();
+
+    let res = client
+        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .send()
+        .await
+        .expect("TLS connection failed");
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn test_mtls_accepts_client_cert_and_rejects_without() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(pki.ca_cert_path.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let (server, local_addr) =
+        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    defer! {
+        server.abort();
+    };
+
+    // Without a client certificate the TLS handshake is rejected
+    let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+    let client_no_cert = Client::builder()
+        .add_root_certificate(ca_cert)
+        .resolve("localhost", local_addr)
+        .build()
+        .unwrap();
+
+    let result = client_no_cert
+        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .send()
+        .await;
+    assert!(
+        result.is_err(),
+        "connection without client cert should fail with mTLS"
+    );
+
+    // With a valid client certificate the request succeeds
+    let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+    let identity =
+        reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem).unwrap();
+    let client_with_cert = Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .resolve("localhost", local_addr)
+        .build()
+        .unwrap();
+
+    let res = client_with_cert
+        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .send()
+        .await
+        .expect("mTLS connection with client cert failed");
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn test_tls_credentials_directory_fallback() {
+    let pki = make_test_pki();
+
+    // Set up a fake credentials directory with the well-known file names
+    let creds_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        &pki.server_cert_path,
+        creds_dir.path().join("tls-cert-file"),
+    )
+    .unwrap();
+    std::fs::copy(
+        &pki.server_key_path,
+        creds_dir.path().join("tls-private-key-file"),
+    )
+    .unwrap();
+
+    // No CLI flags — resolve_tls_acceptor should pick up creds from the directory
+    let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()))
+        .expect("credentials directory fallback failed")
+        .expect("expected Some(acceptor) from credentials directory");
+
+    let varlink_dir = tempfile::tempdir().unwrap();
+    let (server, local_addr) =
+        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    defer! {
+        server.abort();
+    };
+
+    let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .resolve("localhost", local_addr)
+        .build()
+        .unwrap();
+
+    let res = client
+        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .send()
+        .await
+        .expect("TLS via credentials directory failed");
+    assert_eq!(res.status(), 200);
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlinkctl_helper_mtls_hostname_describe() {
+    let pki = make_test_pki();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(pki.ca_cert_path.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let (server, local_addr) = run_test_tls_server("/run/systemd", acceptor).await;
+    defer! {
+        server.abort();
+    };
+
+    let fake_xdg_home = tempfile::tempdir().unwrap();
+    let tls_dir = fake_xdg_home.path().join("varlink-http-bridge");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    std::fs::copy(&pki.client_cert_path, tls_dir.join("client-cert-file")).unwrap();
+    std::fs::copy(&pki.client_key_path, tls_dir.join("client-key-file")).unwrap();
+    std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
+
+    let bridge_url = format!(
+        "https://localhost:{}/ws/sockets/io.systemd.Hostname",
+        local_addr.port()
+    );
+
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.Hostname.Describe",
+            "{}",
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .env("XDG_CONFIG_HOME", fake_xdg_home.path())
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "varlinkctl failed (stderr: {stderr})"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8 in varlinkctl output");
+    let line = stdout.trim().trim_start_matches('\x1e');
+    let body: Value =
+        serde_json::from_str(line).expect("varlinkctl output not valid JSON: {e}: {line:?}");
+
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(body["Hostname"], expected_hostname);
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlinkctl_helper_mtls_no_client_cert() {
+    let pki = make_test_pki();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(pki.ca_cert_path.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let (server, local_addr) = run_test_tls_server("/run/systemd", acceptor).await;
+    defer! {
+        server.abort();
+    };
+
+    // Provide the server CA (so the client trusts the server) but NO client cert/key
+    let fake_xdg_home = tempfile::tempdir().unwrap();
+    let tls_dir = fake_xdg_home.path().join("varlink-http-bridge");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
+
+    let bridge_url = format!(
+        "https://localhost:{}/ws/sockets/io.systemd.Hostname",
+        local_addr.port()
+    );
+
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.Hostname.Describe",
+            "{}",
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .env("XDG_CONFIG_HOME", fake_xdg_home.path())
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected failure without client cert, but helper succeeded"
+    );
+    assert!(
+        stderr.contains("handshake failed: check client cert if server requires mTLS"),
+        "expected mTLS hint in error, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_tls_credentials_directory_returns_none_without_creds() {
+    let empty_dir = tempfile::tempdir().unwrap();
+    let result = resolve_tls_acceptor(None, None, None, Some(empty_dir.path())).unwrap();
+    assert!(
+        result.is_none(),
+        "empty credentials dir should yield no TLS"
     );
 }

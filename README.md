@@ -42,7 +42,6 @@ This makes the bridge compatible with libvarlink `varlink --brige`
 via `websocat --binary`, enabling full varlink features (including
 `--more`) over the network.
 
-
 ## Examples (curl)
 
 Using curl for direct calls is usually more convenient/ergonimic than
@@ -182,4 +181,64 @@ $ varlink --bridge "websocat --binary ws://localhost:8080/ws/sockets/io.systemd.
   ...
 }
 
+```
+
+## TLS / mTLS
+
+TLS flag names follow the Kubernetes API server convention.
+
+```
+--tls-cert-file        path to TLS certificate PEM file
+--tls-private-key-file path to TLS private key PEM file
+--client-ca-file       path to CA certificate PEM for client verification (mTLS)
+```
+
+Providing `--client-ca-file` implicitly enables mTLS: the server will
+require clients to present a certificate signed by that CA.
+
+### systemd credentials
+
+When running as a systemd service, the bridge automatically discovers
+TLS material from `$CREDENTIALS_DIRECTORY` (see `systemd.exec(5)`).
+The credential file names match the CLI flag names:
+
+```ini
+[Service]
+LoadCredential=tls-cert-file:/etc/ssl/certs/bridge.pem
+LoadCredential=tls-private-key-file:/etc/ssl/private/bridge.pem
+LoadCredential=client-ca-file:/etc/ssl/ca/client-ca.pem
+```
+
+Explicit CLI flags take priority over credentials directory files.
+
+### Client (varlinkctl-helper)
+
+The `varlinkctl-helper` binary acts as a bridge between `varlinkctl`
+and `varlink-http-bridge`, supporting TLS and mTLS. It looks for
+client credentials in the first existing directory:
+
+* `$XDG_CONFIG_HOME/varlink-http-bridge/`
+* `~/.config/varlink-http-bridge/`
+* `$CREDENTIALS_DIRECTORY`
+
+The credential file names are:
+
+| File                   | Purpose                                   |
+|------------------------|-------------------------------------------|
+| `client-cert-file`     | Client certificate PEM (for mTLS)         |
+| `client-key-file`      | Client private key PEM (for mTLS)         |
+| `server-ca-file`       | CA certificate PEM (for private/self-signed server CAs) |
+
+The system CAs are used automatically. For mTLS, drop the client cert
+and key into the config directory:
+
+```console
+$ mkdir -p ~/.config/varlink-http-bridge
+$ cp client-cert.pem ~/.config/varlink-http-bridge/client-cert-file
+$ cp client-key.pem  ~/.config/varlink-http-bridge/client-key-file
+$ cp ca.pem          ~/.config/varlink-http-bridge/server-ca-file
+
+$ VARLINK_BRIDGE_URL=https://myhost:8080/ws/sockets/io.systemd.Hostname \
+    varlinkctl call exec:/usr/libexec/varlinkctl-helper \
+    io.systemd.Hostname.Describe '{}'
 ```

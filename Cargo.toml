@@ -16,12 +16,16 @@ argh = "0.1"
 # not using full regex as it adds more bloat and our requirements are minimal
 regex-lite = "0.1"
 listenfd = "1.0.2"
-tungstenite = { version = "0.28", features = ["native-tls"] }
+tungstenite = "0.28"
 rustix = { version = "1.0", features = ["event"] }
 signal-hook = "0.3"
+# using opeenssl here to keep size small, rusttls adds ~1.8MB binary size
+# and nativetls does not support mTLS
+openssl = "0.10"
+tokio-openssl = "0.6"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.14", default-features = false, features = ["runtime"] }
 scopeguard = "1.2"
 gethostname = "1.1.0"

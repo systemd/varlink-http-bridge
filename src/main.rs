@@ -190,6 +190,100 @@ async fn get_varlink_connection_with_validate_socket(
     Ok(connection)
 }
 
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: openssl::ssl::SslAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_openssl::SslStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let res: Result<_, Box<dyn std::error::Error>> = async {
+                let (stream, addr) = self
+                    .inner
+                    .accept()
+                    .await
+                    .map_err(|e| format!("TCP accept failed: {e}"))?;
+                let ssl = openssl::ssl::Ssl::new(self.acceptor.context())
+                    .map_err(|e| format!("SSL context error: {e}"))?;
+                let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)
+                    .map_err(|e| format!("SSL stream creation failed: {e}"))?;
+                std::pin::Pin::new(&mut tls_stream)
+                    .accept()
+                    .await
+                    .map_err(|e| format!("TLS handshake failed: {e}"))?;
+                Ok((tls_stream, addr))
+            }
+            .await;
+
+            match res {
+                Ok(conn) => return conn,
+                Err(e) => warn!("{e}"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+fn load_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_path: Option<&str>,
+) -> anyhow::Result<openssl::ssl::SslAcceptor> {
+    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+
+    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
+    builder.set_certificate_chain_file(cert_path)?;
+    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+    builder.check_private_key()?;
+
+    if let Some(ca_path) = client_ca_path {
+        builder.set_ca_file(ca_path)?;
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    }
+
+    Ok(builder.build())
+}
+
+/// Resolve TLS configuration: explicit paths take priority, then fall back to
+/// systemd's $`CREDENTIALS_DIRECTORY` (see systemd.exec(5)), then no TLS.
+/// Credential file names match the CLI flag names: tls-cert-file,
+/// tls-private-key-file, client-ca-file.
+fn resolve_tls_acceptor(
+    cli_cert: Option<String>,
+    cli_key: Option<String>,
+    cli_ca: Option<String>,
+    creds_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Option<openssl::ssl::SslAcceptor>> {
+    let cred = |name: &str| -> Option<String> {
+        creds_dir
+            .map(|d| d.join(name))
+            .filter(|p| p.exists())
+            .and_then(|p| p.to_str().map(String::from))
+    };
+
+    let tls_cert = cli_cert.or_else(|| cred("tls-cert-file"));
+    let tls_key = cli_key.or_else(|| cred("tls-private-key-file"));
+    let client_ca = cli_ca.or_else(|| cred("client-ca-file"));
+
+    match (tls_cert.as_deref(), tls_key.as_deref()) {
+        (Some(cert), Some(key)) => Ok(Some(load_tls_acceptor(cert, key, client_ca.as_deref())?)),
+        (None, None) => {
+            if client_ca.is_some() {
+                bail!("--client-ca-file requires --tls-cert-file and --tls-private-key-file");
+            }
+            Ok(None)
+        }
+        _ => bail!("--tls-cert-file and --tls-private-key-file must be specified together"),
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     varlink_sockets: Arc<VarlinkSockets>,
@@ -444,11 +538,26 @@ async fn shutdown_signal() {
     println!("Shutdown signal received, stopping server...");
 }
 
-async fn run_server(varlink_sockets_path: &str, listener: TcpListener) -> anyhow::Result<()> {
+async fn run_server(
+    varlink_sockets_path: &str,
+    listener: TcpListener,
+    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+) -> anyhow::Result<()> {
     let app = create_router(varlink_sockets_path)?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    if let Some(acceptor) = tls_acceptor {
+        let tls_listener = TlsListener {
+            inner: listener,
+            acceptor,
+        };
+        axum::serve(tls_listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     Ok(())
 }
@@ -464,6 +573,22 @@ struct Cli {
     /// varlink unix socket path to proxy: a directory of sockets/symlinks or a single socket
     #[argh(positional, default = "String::from(\"/run/systemd/registry\")")]
     varlink_sockets_path: String,
+
+    // TLS flag names follow the Kubernetes API server convention
+    // (--tls-cert-file, --tls-private-key-file, --client-ca-file).
+    // Providing --client-ca-file implicitly enables mTLS client
+    // certificate verification.
+    /// path to TLS certificate PEM file
+    #[argh(option)]
+    tls_cert_file: Option<String>,
+
+    /// path to TLS private key PEM file
+    #[argh(option)]
+    tls_private_key_file: Option<String>,
+
+    /// path to CA certificate PEM file for client certificate verification (mTLS)
+    #[argh(option)]
+    client_ca_file: Option<String>,
 }
 
 #[tokio::main]
@@ -483,14 +608,28 @@ async fn main() -> anyhow::Result<()> {
     } else {
         TcpListener::bind(&cli.bind).await?
     };
+
+    let creds_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
+    let tls_acceptor = resolve_tls_acceptor(
+        cli.tls_cert_file,
+        cli.tls_private_key_file,
+        cli.client_ca_file,
+        creds_dir.as_deref(),
+    )?;
+
     let local_addr = listener.local_addr()?;
+    let scheme = if tls_acceptor.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
 
     eprintln!("Varlink proxy started");
     eprintln!(
-        "Forwarding HTTP {local_addr} -> Varlink: {varlink_sockets_path}",
+        "Forwarding {scheme} {local_addr} -> Varlink: {varlink_sockets_path}",
         varlink_sockets_path = &cli.varlink_sockets_path
     );
-    run_server(&cli.varlink_sockets_path, listener).await
+    run_server(&cli.varlink_sockets_path, listener, tls_acceptor).await
 }
 
 #[cfg(test)]
