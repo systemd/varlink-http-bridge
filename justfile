@@ -1,3 +1,26 @@
+destdir := env("DESTDIR", "")
+prefix := "/usr"
+bindir := prefix / "bin"
+unitdir := prefix / "lib/systemd/system"
+bridgedir := prefix / "lib/systemd/varlink-bridges"
+
+install: install_server install_client
+
+install_server: (build "release")
+	install -Dm755 {{srv_binary}} {{destdir}}{{bindir}}/varlink-http-bridge
+	install -dm755 {{destdir}}{{unitdir}}
+	sed 's|@bindir@|{{bindir}}|g' data/varlink-http-bridge.service.in > {{destdir}}{{unitdir}}/varlink-http-bridge.service
+
+install_client: (build "release")
+	install -Dm755 {{helper_binary}} {{destdir}}{{bridgedir}}/http
+	ln -sf http {{destdir}}{{bridgedir}}/https
+	ln -sf http {{destdir}}{{bridgedir}}/ws
+	ln -sf http {{destdir}}{{bridgedir}}/wss
+
+[private]
+build profile:
+	cargo build --profile {{profile}}
+
 check: check_srv_binary_size check_helper_binary_size
 	cargo fmt --check
 	cargo clippy -- -W clippy::pedantic

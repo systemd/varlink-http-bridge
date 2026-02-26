@@ -1,0 +1,12 @@
+[Unit]
+Description=Varlink HTTP Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@bindir@/varlink-http-bridge
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
