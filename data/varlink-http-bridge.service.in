@@ -10,7 +10,8 @@
 
 [Unit]
 Description=Varlink HTTP Bridge
-After=network.target
+DefaultDependencies=no
+Conflicts=shutdown.target
 
 [Service]
 Type=simple
@@ -19,4 +20,4 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=network.target
