@@ -27,7 +27,7 @@ fn default_authorized_keys_path() -> String {
             .into_owned();
     }
     if rustix::process::getuid().is_root() {
-        return "/etc/varlink-http-bridge/authorized_keys".to_string();
+        return "/etc/varlink-httpd/authorized_keys".to_string();
     }
     let config_dir = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
         || {
@@ -37,7 +37,7 @@ fn default_authorized_keys_path() -> String {
         std::path::PathBuf::from,
     );
     config_dir
-        .join("varlink-http-bridge/authorized_keys")
+        .join("varlink-httpd/authorized_keys")
         .to_string_lossy()
         .into_owned()
 }
@@ -96,9 +96,9 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
         keys_count = keys.len()
     );
     if std::env::var_os("CREDENTIALS_DIRECTORY").is_some() {
-        eprintln!("  varlink-http-bridge");
+        eprintln!("  varlink-httpd");
     } else {
-        eprintln!("  varlink-http-bridge --authorized-keys={output_path}");
+        eprintln!("  varlink-httpd --authorized-keys={output_path}");
     }
 
     Ok(())

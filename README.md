@@ -1,4 +1,4 @@
-# varlink-http-bridge
+# varlink-httpd
 
 This is a http bridge to make local varlink services available via
 http. The main use case is systemd, so only the subset of varlink that
@@ -53,7 +53,7 @@ Using curl for direct calls is usually more convenient/ergonimic than
 using the websocket endpoint.
 
 ```console
-$ systemd-run --user ./target/debug/varlink-http-bridge
+$ systemd-run --user ./target/debug/varlink-httpd
 
 $ curl -s http://localhost:1031/sockets | jq
 {
@@ -119,7 +119,7 @@ Systemd version v260+ supports pluggable protocols for varlink, with that the br
 becomes even nicer.
 
 ```console
-# copy varlinkctl-helper into /usr/lib/systemd/varlink-bridges/http
+# copy varlinkctl-http into /usr/lib/systemd/varlink-bridges/http
 # (or use SYSTEMD_VARLINK_BRIDGES_DIR)
 $ varlinkctl introspect http://localhost:1031/ws/sockets/io.systemd.Hostname
 interface io.systemd
@@ -166,9 +166,9 @@ $ printf '{"method":"io.systemd.UserDatabase.GetUserRecord", "parameters": {"ser
       "gid": 0,
 ...
 
-# varlinkctl is supported via our varlinkctl-helper
+# varlinkctl is supported via our varlinkctl-http
 $ VARLINK_BRIDGE_URL=http://localhost:1031/ws/sockets/io.systemd.Multiplexer \
-    varlinkctl call --more /usr/libexec/varlinkctl-helper \
+    varlinkctl call --more /usr/libexec/varlinkctl-http \
 	io.systemd.UserDatabase.GetUserRecord '{"service":"io.systemd.Multiplexer"}'
 
 
@@ -216,14 +216,14 @@ LoadCredential=trust:/etc/ssl/ca/client-ca.pem
 
 Explicit CLI flags take priority over credentials directory files.
 
-### Client (varlinkctl-helper)
+### Client (varlinkctl-http)
 
-The `varlinkctl-helper` binary acts as a bridge between `varlinkctl`
-and `varlink-http-bridge`, supporting TLS and mTLS. It looks for
+The `varlinkctl-http` binary acts as a bridge between `varlinkctl`
+and `varlink-httpd`, supporting TLS and mTLS. It looks for
 client credentials in the first existing directory:
 
-* `$XDG_CONFIG_HOME/varlink-http-bridge/`
-* `~/.config/varlink-http-bridge/`
+* `$XDG_CONFIG_HOME/varlink-httpd/`
+* `~/.config/varlink-httpd/`
 * `$CREDENTIALS_DIRECTORY`
 
 The credential file names are:
@@ -238,13 +238,13 @@ The system CAs are used automatically. For mTLS, drop the client cert
 and key into the config directory:
 
 ```console
-$ mkdir -p ~/.config/varlink-http-bridge
-$ cp client-cert.pem ~/.config/varlink-http-bridge/client-cert-file
-$ cp client-key.pem  ~/.config/varlink-http-bridge/client-key-file
-$ cp ca.pem          ~/.config/varlink-http-bridge/server-ca-file
+$ mkdir -p ~/.config/varlink-httpd
+$ cp client-cert.pem ~/.config/varlink-httpd/client-cert-file
+$ cp client-key.pem  ~/.config/varlink-httpd/client-key-file
+$ cp ca.pem          ~/.config/varlink-httpd/server-ca-file
 
 $ VARLINK_BRIDGE_URL=https://myhost:1031/ws/sockets/io.systemd.Hostname \
-    varlinkctl call exec:/usr/libexec/varlinkctl-helper \
+    varlinkctl call exec:/usr/libexec/varlinkctl-http \
     io.systemd.Hostname.Describe '{}'
 ```
 
@@ -261,29 +261,29 @@ The bridge discovers authorized keys automatically from these
 locations (first match wins):
 
 1. `--authorized-keys=PATH` — explicit CLI flag
-2. `/etc/varlink-http-bridge/authorized_keys` — config file
+2. `/etc/varlink-httpd/authorized_keys` — config file
 3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — systemd per-service credential (see `systemd.exec(5)`)
 4. `/run/credentials/@system/ssh.authorized_keys.root` — system-wide credential (see `systemd.system-credentials(7)`)
 
 The simplest setup is to pass the path explicitly:
 
 ```console
-$ varlink-http-bridge --authorized-keys=~/.ssh/authorized_keys
+$ varlink-httpd --authorized-keys=~/.ssh/authorized_keys
 ```
 
 To fetch keys from GitHub (or any HTTPS URL) and save them locally,
 use the `import-ssh` subcommand:
 
 ```console
-$ run0 varlink-http-bridge import-ssh gh:myuser
-Wrote 3 key line(s) to /etc/varlink-http-bridge/authorized_keys, run with:
-  varlink-http-bridge --authorized-keys /etc/varlink-http-bridge/authorized_keys
+$ run0 varlink-httpd import-ssh gh:myuser
+Wrote 3 key line(s) to /etc/varlink-httpd/authorized_keys, run with:
+  varlink-httpd --authorized-keys /etc/varlink-httpd/authorized_keys
 ```
 
 The source can be `gh:<user>` (shorthand for
 `https://github.com/<user>.keys`) or any `https://` URL.  The output
 path is auto-detected but can be overridden with a second positional
-argument.  Once written to `/etc/varlink-http-bridge/authorized_keys`,
+argument.  Once written to `/etc/varlink-httpd/authorized_keys`,
 the bridge picks up the file automatically (discovery path 2) so the
 `--authorized-keys` flag is no longer needed.
 
@@ -297,7 +297,7 @@ LoadCredential=ssh.authorized_keys.root:/root/.ssh/authorized_keys
 
 ### Client setup (key selection)
 
-The varlinkctl-helper uses two methods for signing, checked in order:
+The varlinkctl-http uses two methods for signing, checked in order:
 
 1. **`VARLINK_SSH_KEY`** — If the private key is passed it will read
    the private key file directly. If the public key is passed it will
@@ -327,7 +327,7 @@ example, use regular TLS (not mTLS) for transport encryption and SSH
 keys for user authentication:
 
 ```console
-$ varlink-http-bridge \
+$ varlink-httpd \
     --cert=server.pem \
     --key=server-key.pem \
     --authorized-keys=~/.ssh/authorized_keys

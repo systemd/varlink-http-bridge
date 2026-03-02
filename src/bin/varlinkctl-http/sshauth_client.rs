@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
-use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
+use varlink_httpd::SSHAUTH_MAGIC_PREFIX;
 
 struct Signer {
     builder: sshauth::signer::TokenSignerBuilder,
@@ -45,7 +45,7 @@ pub(crate) fn maybe_add_auth_headers(
         bearer.parse().context("invalid auth header value")?,
     );
     request.headers_mut().insert(
-        varlink_http_bridge::SSHAUTH_NONCE_HEADER,
+        varlink_httpd::SSHAUTH_NONCE_HEADER,
         nonce.parse().context("invalid nonce header value")?,
     );
     Ok(())

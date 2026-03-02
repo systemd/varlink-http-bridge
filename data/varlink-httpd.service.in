@@ -15,7 +15,7 @@ Conflicts=shutdown.target
 
 [Service]
 Type=simple
-ExecStart=@bindir@/varlink-http-bridge --bind 0.0.0.0:1031
+ExecStart=@bindir@/varlink-httpd --bind 0.0.0.0:1031
 Restart=on-failure
 RestartSec=5
 

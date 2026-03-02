@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use crate::Authenticator;
-use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
+use varlink_httpd::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
 
 struct KeyCache {
     keys: HashMap<String, PublicKey>,
@@ -211,7 +211,7 @@ pub(crate) fn maybe_create_ssh_authenticator(
     // Priority: explicit CLI > /etc config > $CREDENTIALS_DIRECTORY >
     // system-wide /run/credentials/@system/ (see systemd.system-credentials(7))
     let authorized_keys_path = cli_authorized_keys
-        .or_else(|| exists(&root.join("etc/varlink-http-bridge/authorized_keys")))
+        .or_else(|| exists(&root.join("etc/varlink-httpd/authorized_keys")))
         .or_else(|| creds_dir.and_then(|d| exists(&d.join(SSH_AUTHORIZED_KEYS_CREDENTIAL))))
         .or_else(|| {
             exists(
