@@ -195,9 +195,13 @@ pub(crate) fn extract_nonce(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-/// Well-known credential name for SSH authorized keys, see
-/// systemd.system-credentials(7).
-const SSH_AUTHORIZED_KEYS_CREDENTIAL: &str = "ssh.authorized_keys.root";
+/// Well-known credential names for SSH authorized keys, see
+/// systemd.system-credentials(7).  The dedicated credential is checked
+/// first so it takes priority over the broader ephemeral one.
+const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
+    "ssh.authorized_keys.root",
+    "ssh.ephemeral-authorized_keys-all",
+];
 
 pub(crate) fn maybe_create_ssh_authenticator(
     cli_authorized_keys: Option<String>,
@@ -212,13 +216,18 @@ pub(crate) fn maybe_create_ssh_authenticator(
     // system-wide /run/credentials/@system/ (see systemd.system-credentials(7))
     let authorized_keys_path = cli_authorized_keys
         .or_else(|| exists(&root.join("etc/varlink-httpd/authorized_keys")))
-        .or_else(|| creds_dir.and_then(|d| exists(&d.join(SSH_AUTHORIZED_KEYS_CREDENTIAL))))
         .or_else(|| {
-            exists(
-                &root
-                    .join("run/credentials/@system")
-                    .join(SSH_AUTHORIZED_KEYS_CREDENTIAL),
-            )
+            creds_dir.and_then(|d| {
+                SSH_AUTHORIZED_KEYS_CREDENTIALS
+                    .iter()
+                    .find_map(|name| exists(&d.join(name)))
+            })
+        })
+        .or_else(|| {
+            let sys_creds = root.join("run/credentials/@system");
+            SSH_AUTHORIZED_KEYS_CREDENTIALS
+                .iter()
+                .find_map(|name| exists(&sys_creds.join(name)))
         });
 
     let Some(ak_path) = authorized_keys_path else {

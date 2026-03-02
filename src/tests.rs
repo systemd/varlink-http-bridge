@@ -1525,6 +1525,65 @@ mod sshauth_tests {
             "creds_dir (1 key) should take priority over /run (2 keys)"
         );
 
+        // 5b. ssh.ephemeral-authorized_keys-all is used when .root is absent (creds_dir)
+        let creds_dir_all = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds_dir_all
+                .path()
+                .join("ssh.ephemeral-authorized_keys-all"),
+            pubkey_a.as_bytes(),
+        )
+        .unwrap();
+        let auth =
+            maybe_create_ssh_authenticator(None, Some(creds_dir_all.path()), empty_root.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(auth.key_count(), 1, "should find key from .all credential");
+
+        // 5c. ssh.authorized_keys.root takes priority over .all (creds_dir)
+        let creds_dir_both = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds_dir_both.path().join("ssh.authorized_keys.root"),
+            pubkey_a.as_bytes(),
+        )
+        .unwrap();
+        let mut all_file = std::fs::File::create(
+            creds_dir_both
+                .path()
+                .join("ssh.ephemeral-authorized_keys-all"),
+        )
+        .unwrap();
+        writeln!(all_file, "{}", pubkey_b1.trim()).unwrap();
+        writeln!(all_file, "{}", pubkey_b2.trim()).unwrap();
+        drop(all_file);
+        let auth =
+            maybe_create_ssh_authenticator(None, Some(creds_dir_both.path()), empty_root.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            auth.key_count(),
+            1,
+            ".root (1 key) should take priority over .all (2 keys)"
+        );
+
+        // 5d. ssh.ephemeral-authorized_keys-all in /run/credentials/@system
+        let root_run_all = tempfile::tempdir().unwrap();
+        let run_dir = root_run_all.path().join("run/credentials/@system");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("ssh.ephemeral-authorized_keys-all"),
+            pubkey_a.as_bytes(),
+        )
+        .unwrap();
+        let auth = maybe_create_ssh_authenticator(None, None, root_run_all.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            auth.key_count(),
+            1,
+            "should find key from .all in /run path"
+        );
+
         // 6. CLI path overrides everything
         let cli_root = make_test_rootdir_with_keys(&[pubkey_a.trim()]);
         let cli_file = tempfile::NamedTempFile::new().unwrap();
