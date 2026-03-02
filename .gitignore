@@ -1,2 +1,6 @@
 /target
-~
+/mkosi/mkosi.cache
+/mkosi/mkosi.output
+mkosi.tools
+mkosi.tools.manifest
+*.list

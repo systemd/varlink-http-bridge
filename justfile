@@ -1,10 +1,11 @@
 destdir := env("DESTDIR", "")
 prefix := "/usr"
+sysconfdir := env("SYSCONFDIR", "/etc")
 bindir := prefix / "bin"
 unitdir := prefix / "lib/systemd/system"
 bridgedir := prefix / "lib/systemd/varlink-bridges"
 
-install: install_server install_client
+install: install_server install_client install_config
 
 install_server: (build "release")
 	install -Dm755 {{srv_binary}} {{destdir}}{{bindir}}/varlink-httpd
@@ -16,6 +17,9 @@ install_client: (build "release")
 	ln -sf http {{destdir}}{{bridgedir}}/https
 	ln -sf http {{destdir}}{{bridgedir}}/ws
 	ln -sf http {{destdir}}{{bridgedir}}/wss
+
+install_config:
+	install -dm755 {{destdir}}{{sysconfdir}}/varlink-httpd
 
 [private]
 build profile:
