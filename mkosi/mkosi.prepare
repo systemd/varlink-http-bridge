@@ -1,0 +1,42 @@
+#!/bin/sh
+set -e
+
+mkosi-chroot \
+    rpmspec \
+    --query \
+    --buildrequires \
+    --define "_topdir /var/tmp" \
+    --define "_sourcedir ." \
+    varlink-httpd.spec |
+        sort --unique |
+        tee /tmp/buildrequires |
+        xargs --delimiter '\n' mkosi-install
+
+until mkosi-chroot \
+    rpmbuild \
+    -bd \
+    --build-in-place \
+    --define "_topdir /var/tmp" \
+    --define "_sourcedir ." \
+    --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" \
+    varlink-httpd.spec
+do
+    EXIT_STATUS=$?
+    if [ $EXIT_STATUS -ne 11 ]; then
+        exit $EXIT_STATUS
+    fi
+
+    mkosi-chroot \
+        rpm \
+        --query \
+        --package \
+        --requires \
+        /var/tmp/SRPMS/*.buildreqs.nosrc.rpm |
+            grep --invert-match '^rpmlib(' |
+            sort --unique >/tmp/dynamic-buildrequires
+
+    sort /tmp/buildrequires /tmp/dynamic-buildrequires |
+        uniq --unique |
+        tee --append /tmp/buildrequires |
+        xargs --delimiter '\n' mkosi-install
+done

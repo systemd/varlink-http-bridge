@@ -1,0 +1,16 @@
+#!/bin/sh
+set -ex
+
+rpmbuild \
+    -bb \
+    --noprep \
+    --build-in-place \
+    $([ "$WITH_TESTS" = "0" ] && echo --nocheck) \
+    --define "_topdir /var/tmp" \
+    --define "_sourcedir $PWD" \
+    --define "_rpmdir ${BUILDDIR:-$PACKAGEDIR}" \
+    --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" \
+    varlink-httpd.spec
+
+mkdir -p "$SRCDIR"/mkosi/mkosi.output
+cp "${BUILDDIR:-$PACKAGEDIR}"/*.rpm "$SRCDIR"/mkosi/mkosi.output/
