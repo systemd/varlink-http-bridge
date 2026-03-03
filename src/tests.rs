@@ -1084,6 +1084,34 @@ mod sshauth_tests {
         (pubkey_line, key_path)
     }
 
+    /// Set up an SSH authenticator from a freshly generated ed25519 keypair.
+    ///
+    /// Returns the authenticator plus the path to the private key (for tests
+    /// that also need to sign tokens).
+    fn make_test_ssh_auth() -> (crate::auth_ssh::SshKeyAuthenticator, std::path::PathBuf) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let auth = maybe_create_ssh_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+        // Leak both tempdirs so they live for the test duration.
+        // (The keypair dir and the rootdir with authorized_keys.)
+        std::mem::forget(tmpdir);
+        std::mem::forget(root);
+        (auth, key_path)
+    }
+
+    /// Build a [`sshauth::signer::TokenSigner`] from the private key at `key_path`,
+    /// pre-configured with fingerprint and magic prefix matching the server.
+    fn make_test_token_signer(key_path: &std::path::Path) -> sshauth::signer::TokenSigner {
+        let privkey_pem = std::fs::read_to_string(key_path).unwrap();
+        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+        builder.build().unwrap()
+    }
+
     fn make_auth_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
         let tmpdir = tempfile::tempdir().unwrap();
         // Keep tmpdir so it lives for the test duration (but gets cleaned up eventually)
@@ -1093,26 +1121,7 @@ mod sshauth_tests {
 
     #[test]
     fn test_ssh_auth_parse_authorized_keys_ed25519() {
-        use openssl::pkey::PKey;
-
-        let pkey = PKey::generate_ed25519().unwrap();
-        let raw_pub = pkey.raw_public_key().unwrap();
-
-        // Build SSH blob: string "ssh-ed25519" + string <32 bytes>
-        let mut blob = Vec::new();
-        let algo = b"ssh-ed25519";
-        blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
-        blob.extend_from_slice(algo);
-        blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&raw_pub);
-
-        let b64_blob = openssl::base64::encode_block(&blob);
-        let line = format!("ssh-ed25519 {b64_blob} testkey@host");
-        let root = make_test_rootdir_with_keys(&[&line]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
+        let (auth, _) = make_test_ssh_auth();
         assert_eq!(auth.key_count(), 1);
     }
 
@@ -1157,21 +1166,9 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_rejects_expired_timestamp() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap()
-            .with_max_skew(0);
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let auth = auth.with_max_skew(0);
+        let signer = make_test_token_signer(&key_path);
 
         let nonce = "test-nonce-expired12345";
         let mut tb = signer.sign_for();
@@ -1191,23 +1188,12 @@ mod sshauth_tests {
     #[tokio::test]
     async fn test_ssh_auth_rejects_unknown_fingerprint() {
         // Key A: in authorized_keys
-        let tmpdir_a = tempfile::tempdir().unwrap();
-        let (pubkey_a_line, _) = generate_ed25519_keypair(tmpdir_a.path());
+        let (auth, _) = make_test_ssh_auth();
 
-        let root = make_test_rootdir_with_keys(&[pubkey_a_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        // Key B: NOT in authorized_keys
+        // Key B: NOT in authorized_keys — sign with this one
         let tmpdir_b = tempfile::tempdir().unwrap();
         let (_, key_path_b) = generate_ed25519_keypair(tmpdir_b.path());
-        let privkey_b_pem = std::fs::read_to_string(&key_path_b).unwrap();
-        let privkey_b = ssh_key::PrivateKey::from_openssh(&privkey_b_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey_b).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let signer = make_test_token_signer(&key_path_b);
 
         let nonce = "test-nonce-unknown-fp12345";
         let mut tb = signer.sign_for();
@@ -1229,20 +1215,8 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_verify_ed25519() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
 
         let nonce = "test-nonce-verify12345";
         let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -1265,23 +1239,7 @@ mod sshauth_tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let pkey = openssl::pkey::PKey::generate_ed25519().unwrap();
-        let raw_pub = pkey.raw_public_key().unwrap();
-
-        let mut blob = Vec::new();
-        let algo = b"ssh-ed25519";
-        blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
-        blob.extend_from_slice(algo);
-        blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&raw_pub);
-
-        let b64_blob = openssl::base64::encode_block(&blob);
-        let line = format!("ssh-ed25519 {b64_blob} testkey@host");
-        let root = make_test_rootdir_with_keys(&[&line]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
+        let (auth, _) = make_test_ssh_auth();
         let app = make_auth_test_router(vec![Box::new(auth)]);
         let response = app
             .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
@@ -1296,13 +1254,7 @@ mod sshauth_tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, _) = generate_ed25519_keypair(tmpdir.path());
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
+        let (auth, _) = make_test_ssh_auth();
         let app = make_auth_test_router(vec![Box::new(auth)]);
         let response = app
             .oneshot(
@@ -1377,23 +1329,7 @@ mod sshauth_tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let pkey = openssl::pkey::PKey::generate_ed25519().unwrap();
-        let raw_pub = pkey.raw_public_key().unwrap();
-
-        let mut blob = Vec::new();
-        let algo = b"ssh-ed25519";
-        blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
-        blob.extend_from_slice(algo);
-        blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&raw_pub);
-
-        let b64_blob = openssl::base64::encode_block(&blob);
-        let line = format!("ssh-ed25519 {b64_blob} testkey@host");
-        let root = make_test_rootdir_with_keys(&[&line]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
+        let (auth, _) = make_test_ssh_auth();
         let app = make_auth_test_router(vec![Box::new(auth)]);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -1419,20 +1355,8 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_rejects_replayed_nonce() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
 
         let nonce = "replay-me12345678";
         let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -1463,20 +1387,8 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_rejects_missing_nonce() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
 
         let mut tb = signer.sign_for();
         tb.action("method", "GET").action("path", "/sockets");
@@ -1491,20 +1403,8 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_channel_binding_mismatch_rejected() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
 
         let nonce = "cb-mismatch-test12345";
         let cb_signer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -1527,20 +1427,8 @@ mod sshauth_tests {
 
     #[tokio::test]
     async fn test_ssh_auth_channel_binding_match_accepted() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
-
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
-
-        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
-        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
-
-        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
-        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
-        let signer = builder.build().unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
 
         let nonce = "cb-match-test-123456";
         let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -1660,13 +1548,7 @@ mod sshauth_tests {
     #[tokio::test]
     async fn test_tls_ssh_e2e() {
         let pki = make_test_pki();
-
-        let ssh_dir = tempfile::tempdir().unwrap();
-        let (pubkey_line, key_path) = generate_ed25519_keypair(ssh_dir.path());
-        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
+        let (auth, key_path) = make_test_ssh_auth();
 
         let acceptor = load_tls_acceptor(
             pki.server_cert_path.to_str().unwrap(),
