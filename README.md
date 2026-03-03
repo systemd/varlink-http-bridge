@@ -299,9 +299,9 @@ LoadCredential=ssh.authorized_keys.root:/root/.ssh/authorized_keys
 
 The varlinkctl-helper uses two methods for signing, checked in order:
 
-1. **`VARLINK_SSH_KEY`** — read the private key file directly (no SSH
-   agent needed). Both the private key path and the `.pub` path are
-   accepted (`.pub` is stripped automatically to find the private key):
+1. **`VARLINK_SSH_KEY`** — If the private key is passed it will read
+   the private key file directly. If the public key is passed it will
+   look for the corresponding private key in the ssh agent.
 
    ```console
    $ export VARLINK_SSH_KEY=~/.ssh/id_ed25519
