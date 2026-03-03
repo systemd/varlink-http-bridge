@@ -26,12 +26,13 @@ static TOKIO_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyL
 pub(crate) fn maybe_add_auth_headers(
     request: &mut tungstenite::http::Request<()>,
     uri: &tungstenite::http::Uri,
+    tls_channel_binding: Option<&str>,
 ) -> Result<()> {
     let path_and_query = uri
         .path_and_query()
         .map_or(uri.path(), tungstenite::http::uri::PathAndQuery::as_str);
 
-    let (bearer, nonce) = match build_auth_token("GET", path_and_query) {
+    let (bearer, nonce) = match build_auth_token("GET", path_and_query, tls_channel_binding) {
         Ok(Some((bearer, nonce))) => (bearer, nonce),
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -53,7 +54,11 @@ pub(crate) fn maybe_add_auth_headers(
 /// Build an SSH auth token for the given HTTP method and path.
 ///
 /// Returns `Ok(None)` when no SSH credentials are available.
-fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<(String, String)>> {
+fn build_auth_token(
+    method: &str,
+    path_and_query: &str,
+    tls_channel_binding: Option<&str>,
+) -> Result<Option<(String, String)>> {
     // The sshauth crate is async so we need to run this inside an async context
     TOKIO_RT.block_on(async {
         let Some(mut signer) = build_signer().await? else {
@@ -75,7 +80,12 @@ fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<(String
         let mut tb = token_signer.sign_for();
         tb.action("method", method)
             .action("path", path_and_query)
-            .action("nonce", &nonce);
+            .action("nonce", &nonce)
+            .action(
+                "tls-channel-binding",
+                tls_channel_binding.unwrap_or_default(),
+            );
+
         let token: sshauth::token::Token = tb.sign().await?;
         Ok(Some((format!("Bearer {}", token.encode()), nonce)))
     })

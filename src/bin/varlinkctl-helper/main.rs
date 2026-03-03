@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::warn;
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
+use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVersion};
 use rustix::event::{PollFd, PollFlags, poll};
 use tungstenite::{Message, WebSocket};
 
@@ -24,6 +24,7 @@ use sshauth_client::maybe_add_auth_headers;
 fn maybe_add_auth_headers(
     _request: &mut tungstenite::http::Request<()>,
     _uri: &tungstenite::http::Uri,
+    _tls_channel_binding: Option<&str>,
 ) -> Result<()> {
     Ok(())
 }
@@ -74,6 +75,9 @@ fn ws_tcp_stream(ws: &Ws) -> &TcpStream {
 /// 3. `$CREDENTIALS_DIRECTORY` (systemd, see systemd.exec(5))
 fn build_ssl_connector() -> Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    // We need tls channel binding per RFC 9266 ("tls-exporter") which
+    // is only guaranteed unique with TLS 1.3.
+    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
 
     let maybe_credentials_dirs = [
         std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("varlink-http-bridge")),
@@ -139,6 +143,19 @@ fn connect_ws(url: &str) -> Result<Ws> {
             Stream::Plain(tcp)
         };
 
+    let tls_channel_binding = match &stream {
+        Stream::Tls(ssl_stream) => {
+            use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
+            let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
+            ssl_stream
+                .ssl()
+                .export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
+                .expect("export_keying_material must succeed after TLS 1.3 handshake");
+            Some(openssl::base64::encode_block(&buf))
+        }
+        Stream::Plain(_) => None,
+    };
+
     // Use into_client_request() here as it auto-generates standard WS upgrade headers,
     // then we add our auth headers too
     let mut request = ws_url
@@ -147,7 +164,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
 
     // this adds ssh auth headers if ssh-agent is available, once we have more auth methods
     // it may add more
-    maybe_add_auth_headers(&mut request, &uri)?;
+    maybe_add_auth_headers(&mut request, &uri, tls_channel_binding.as_deref())?;
 
     let ws_context = if use_tls {
         "WebSocket handshake failed: check client cert if server requires mTLS"

@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use axum::{
     Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -296,6 +296,37 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+#[derive(Clone)]
+struct TlsConnectionInfo {
+    tls_channel_binding: String,
+}
+
+use axum::extract::connect_info::Connected;
+use axum::serve::IncomingStream;
+
+impl Connected<IncomingStream<'_, TlsListener>> for TlsConnectionInfo {
+    fn connect_info(target: IncomingStream<'_, TlsListener>) -> Self {
+        use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
+
+        let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
+        target
+            .io()
+            .ssl()
+            .export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
+            // Cannot fail: load_tls_acceptor enforces TLS 1.3 minimum.
+            .expect("export_keying_material must succeed with TLS 1.3");
+        // extra paranoia to ensure we always have a valid channel binding
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "TLS channel binding must not be all zeros"
+        );
+        let tls_channel_binding = openssl::base64::encode_block(&buf);
+        TlsConnectionInfo {
+            tls_channel_binding,
+        }
+    }
+}
+
 fn load_tls_acceptor(
     cert_path: &str,
     key_path: &str,
@@ -304,6 +335,9 @@ fn load_tls_acceptor(
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
+    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
+    // (export_keying_material requires TLS 1.3).
+    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
     builder.set_certificate_chain_file(cert_path)?;
     builder.set_private_key_file(key_path, SslFiletype::PEM)?;
     builder.check_private_key()?;
@@ -355,6 +389,7 @@ trait Authenticator: Send + Sync {
         path: &str,
         auth_header: &str,
         nonce: Option<&str>,
+        channel_binding: Option<&str>,
     ) -> anyhow::Result<()>;
 }
 
@@ -389,6 +424,11 @@ async fn auth_middleware(
 
     let nonce = extract_nonce(request.headers());
 
+    let tls_channel_binding: Option<String> = request
+        .extensions()
+        .get::<ConnectInfo<TlsConnectionInfo>>()
+        .map(|ci| ci.0.tls_channel_binding.clone());
+
     let method = request.method().as_str().to_string();
     let path = request
         .uri()
@@ -398,7 +438,13 @@ async fn auth_middleware(
 
     let mut errors = Vec::new();
     for authenticator in state.authenticators.iter() {
-        match authenticator.check_request(&method, &path, &auth_header, nonce.as_deref()) {
+        match authenticator.check_request(
+            &method,
+            &path,
+            &auth_header,
+            nonce.as_deref(),
+            tls_channel_binding.as_deref(),
+        ) {
             Ok(()) => return next.run(request).await,
             Err(e) => errors.push(e.to_string()),
         }
@@ -687,9 +733,12 @@ async fn run_server(
             inner: listener,
             acceptor,
         };
-        axum::serve(tls_listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        axum::serve(
+            tls_listener,
+            app.into_make_service_with_connect_info::<TlsConnectionInfo>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     } else {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())

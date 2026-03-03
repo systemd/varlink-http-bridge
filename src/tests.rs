@@ -769,6 +769,14 @@ async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+    run_test_tls_server_with_auth(varlink_sockets_path, tls_acceptor, Vec::new()).await
+}
+
+async fn run_test_tls_server_with_auth(
+    varlink_sockets_path: &str,
+    tls_acceptor: openssl::ssl::SslAcceptor,
+    authenticators: Vec<Box<dyn Authenticator>>,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
@@ -782,7 +790,7 @@ async fn run_test_tls_server(
             &varlink_sockets_path,
             listener,
             Some(tls_acceptor),
-            Vec::new(),
+            authenticators,
         )
         .await
         .expect("server failed")
@@ -1176,7 +1184,7 @@ mod sshauth_tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
+        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
         assert!(result.is_err(), "expired token should be rejected");
     }
 
@@ -1193,15 +1201,7 @@ mod sshauth_tests {
 
         // Key B: NOT in authorized_keys
         let tmpdir_b = tempfile::tempdir().unwrap();
-        let key_path_b = tmpdir_b.path().join("key_b");
-        let status = std::process::Command::new("ssh-keygen")
-            .args(["-t", "ed25519", "-f"])
-            .arg(&key_path_b)
-            .args(["-N", "", "-q"])
-            .status()
-            .unwrap();
-        assert!(status.success());
-
+        let (_, key_path_b) = generate_ed25519_keypair(tmpdir_b.path());
         let privkey_b_pem = std::fs::read_to_string(&key_path_b).unwrap();
         let privkey_b = ssh_key::PrivateKey::from_openssh(&privkey_b_pem).unwrap();
 
@@ -1217,7 +1217,7 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
+        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
         assert!(result.is_err());
         assert!(
             result
@@ -1245,14 +1245,17 @@ mod sshauth_tests {
         let signer = builder.build().unwrap();
 
         let nonce = "test-nonce-verify12345";
+        let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
-            .action("nonce", nonce);
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb);
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", &header, Some(nonce))
+        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
             .expect("valid ed25519 token should pass");
     }
 
@@ -1334,6 +1337,7 @@ mod sshauth_tests {
             _path: &str,
             _auth_header: &str,
             _nonce: Option<&str>,
+            _channel_binding: Option<&str>,
         ) -> anyhow::Result<()> {
             anyhow::bail!("{}", self.0)
         }
@@ -1431,19 +1435,22 @@ mod sshauth_tests {
         let signer = builder.build().unwrap();
 
         let nonce = "replay-me12345678";
+        let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
-            .action("nonce", nonce);
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb);
         let token = tb.sign().await.unwrap();
         let header = format!("Bearer {}", token.encode());
 
         // First use should succeed
-        auth.check_request("GET", "/sockets", &header, Some(nonce))
+        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
             .expect("first use of nonce should pass");
 
         // Replay with the same nonce should fail
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
+        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb));
         assert!(result.is_err(), "replayed nonce should be rejected");
         assert!(
             result
@@ -1477,9 +1484,77 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // Without a nonce, the request should be rejected
-        let result = auth.check_request("GET", "/sockets", &header, None);
+        let result = auth.check_request("GET", "/sockets", &header, None, None);
         assert!(result.is_err(), "request without nonce should be rejected");
         assert!(result.unwrap_err().to_string().contains("missing nonce"));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_auth_channel_binding_mismatch_rejected() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
+
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let auth = maybe_create_ssh_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+
+        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+        let signer = builder.build().unwrap();
+
+        let nonce = "cb-mismatch-test12345";
+        let cb_signer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let cb_verifier = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+
+        let mut tb = signer.sign_for();
+        tb.action("method", "GET")
+            .action("path", "/sockets")
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb_signer);
+        let token = tb.sign().await.unwrap();
+
+        let header = format!("Bearer {}", token.encode());
+        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb_verifier));
+        assert!(
+            result.is_err(),
+            "mismatched channel binding should be rejected (relay attack)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_auth_channel_binding_match_accepted() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
+
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let auth = maybe_create_ssh_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+
+        let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+        let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+        let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+        builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+        let signer = builder.build().unwrap();
+
+        let nonce = "cb-match-test-123456";
+        let cb = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+        let mut tb = signer.sign_for();
+        tb.action("method", "GET")
+            .action("path", "/sockets")
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb);
+        let token = tb.sign().await.unwrap();
+
+        let header = format!("Bearer {}", token.encode());
+        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
+            .expect("matching channel binding should pass");
     }
 
     #[test]
@@ -1578,5 +1653,69 @@ mod sshauth_tests {
             result.is_err(),
             "CLI path should be used, not /etc or credential"
         );
+    }
+
+    #[test_with::path(/usr/bin/varlinkctl)]
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
+    #[tokio::test]
+    async fn test_tls_ssh_e2e() {
+        let pki = make_test_pki();
+
+        let ssh_dir = tempfile::tempdir().unwrap();
+        let (pubkey_line, key_path) = generate_ed25519_keypair(ssh_dir.path());
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let auth = maybe_create_ssh_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+
+        let acceptor = load_tls_acceptor(
+            pki.server_cert_path.to_str().unwrap(),
+            pki.server_key_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let (server, local_addr) =
+            run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
+        defer! {
+            server.abort();
+        };
+
+        let fake_xdg_home = tempfile::tempdir().unwrap();
+        let tls_dir = fake_xdg_home.path().join("varlink-http-bridge");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
+
+        let bridge_url = format!(
+            "https://localhost:{}/ws/sockets/io.systemd.Hostname",
+            local_addr.port()
+        );
+
+        let output = tokio::process::Command::new("varlinkctl")
+            .args([
+                "call",
+                "--json=short",
+                &format!("exec:{}", helper_binary().display()),
+                "io.systemd.Hostname.Describe",
+                "{}",
+            ])
+            .env("VARLINK_BRIDGE_URL", &bridge_url)
+            .env("XDG_CONFIG_HOME", fake_xdg_home.path())
+            .env("VARLINK_SSH_KEY", &key_path)
+            .output()
+            .await
+            .expect("failed to run varlinkctl");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "varlinkctl with TLS + SSH auth failed (stderr: {stderr})"
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
+        let line = stdout.trim().trim_start_matches('\x1e');
+        let body: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
+        let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+        assert_eq!(body["Hostname"], expected_hostname);
     }
 } // mod sshauth_tests
