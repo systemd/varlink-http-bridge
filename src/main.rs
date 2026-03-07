@@ -13,6 +13,7 @@ use axum::{
 use listenfd::ListenFd;
 use log::{debug, error, warn};
 use regex_lite::Regex;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -22,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
-use varlink_parser::IDL;
+use zlink::varlink_service::Proxy;
 
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
@@ -65,19 +66,22 @@ impl IntoResponse for AppError {
     }
 }
 
-impl From<varlink::Error> for AppError {
-    fn from(e: varlink::Error) -> Self {
-        use varlink::error::ErrorKind::{
-            ConnectionClosed, InvalidParameter, Io, MethodNotFound, MethodNotImplemented,
-        };
-        let status = match e.kind() {
-            InvalidParameter { .. } => StatusCode::BAD_REQUEST,
-            MethodNotFound { .. } => StatusCode::NOT_FOUND,
-            MethodNotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
-            // TODO: implement something like NotExists or NotFound in the upstream
-            // varlink crate as IO error is extremly generic. Also add details upstream
-            // to the error string (like what socket)
-            ConnectionClosed | Io { .. } => StatusCode::BAD_GATEWAY,
+impl From<zlink::Error> for AppError {
+    fn from(e: zlink::Error) -> Self {
+        use zlink::varlink_service;
+        let status = match &e {
+            zlink::Error::SocketRead
+            | zlink::Error::SocketWrite
+            | zlink::Error::UnexpectedEof
+            | zlink::Error::Io(..) => StatusCode::BAD_GATEWAY,
+            zlink::Error::VarlinkService(owned) => match owned.inner() {
+                varlink_service::Error::InvalidParameter { .. }
+                | varlink_service::Error::ExpectedMore => StatusCode::BAD_REQUEST,
+                varlink_service::Error::MethodNotFound { .. }
+                | varlink_service::Error::InterfaceNotFound { .. } => StatusCode::NOT_FOUND,
+                varlink_service::Error::MethodNotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+                varlink_service::Error::PermissionDenied => StatusCode::FORBIDDEN,
+            },
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -92,6 +96,54 @@ impl From<std::io::Error> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(e: serde_json::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// Method call with dynamic method name and parameters for the POST `/call/{method}` route.
+#[derive(Debug, Serialize)]
+struct DynMethod<'m> {
+    method: &'m str,
+    parameters: Option<&'m HashMap<String, Value>>,
+}
+
+/// Successful reply parameters from a dynamic varlink call.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DynReply<'r>(#[serde(borrow)] Option<HashMap<&'r str, Value>>);
+
+impl IntoResponse for DynReply<'_> {
+    fn into_response(self) -> Response {
+        axum::Json(self.0).into_response()
+    }
+}
+
+/// Error reply from a dynamic varlink call (non-standard errors only; standard
+/// `org.varlink.service.*` errors are caught earlier by zlink).
+#[derive(Debug, serde::Deserialize)]
+struct DynReplyError<'e> {
+    error: &'e str,
+    #[serde(default)]
+    parameters: Option<HashMap<&'e str, Value>>,
+}
+
+impl From<DynReplyError<'_>> for AppError {
+    fn from(e: DynReplyError<'_>) -> Self {
+        let message = match e.parameters {
+            Some(params) => format!("{}: {params:?}", e.error),
+            None => e.error.to_string(),
+        };
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
         }
     }
 }
@@ -145,14 +197,14 @@ impl VarlinkSockets {
 
         match self {
             VarlinkSockets::SocketDir { dirfd } => {
-                Ok(format!("unix:/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
+                Ok(format!("/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
             }
             VarlinkSockets::SingleSocket {
                 dirfd,
                 name: expected,
             } => {
                 if name == expected {
-                    Ok(format!("unix:/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
+                    Ok(format!("/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
                 } else {
                     Err(AppError::bad_gateway(format!(
                         "socket '{name}' not available (only '{expected}' is available)"
@@ -195,11 +247,11 @@ impl VarlinkSockets {
 async fn get_varlink_connection_with_validate_socket(
     socket: &str,
     state: &AppState,
-) -> Result<Arc<varlink::AsyncConnection>, AppError> {
+) -> Result<zlink::unix::Connection, AppError> {
     let varlink_socket_path = state.varlink_sockets.resolve_socket_with_validate(socket)?;
     debug!("Creating varlink connection for: {varlink_socket_path}");
 
-    let connection = varlink::AsyncConnection::with_address(varlink_socket_path).await?;
+    let connection = zlink::unix::connect(&varlink_socket_path).await?;
     Ok(connection)
 }
 
@@ -376,15 +428,13 @@ async fn route_socket_get(
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET socket: {socket}");
-    let connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
+    let mut connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
 
-    let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
-        connection,
-        "org.varlink.service.GetInfo",
-        Value::Null,
-    );
-    let reply = call.call().await?;
-    Ok(axum::Json(reply))
+    let info = connection
+        .get_info()
+        .await?
+        .map_err(|e| AppError::bad_gateway(format!("service error: {e}")))?;
+    Ok(axum::Json(serde_json::to_value(info)?))
 }
 
 async fn route_socket_interface_get(
@@ -392,32 +442,27 @@ async fn route_socket_interface_get(
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET socket: {socket}, interface: {interface}");
-    let connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
+    let mut connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
 
-    let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
-        connection,
-        "org.varlink.service.GetInterfaceDescription",
-        json!({"interface": interface}),
-    );
-    let reply = call.call().await?;
+    let description = connection
+        .get_interface_description(&interface)
+        .await?
+        .map_err(|e| AppError::bad_gateway(format!("service error: {e}")))?;
 
-    let description = reply
-        .get("description")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::bad_gateway("upstream response missing 'description' field"))?;
-
-    let iface = IDL::try_from(description)
+    let iface = description
+        .parse()
         .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))?;
 
-    Ok(axum::Json(json!({"method_names": iface.method_keys})))
+    let method_names: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
+    Ok(axum::Json(json!({"method_names": method_names})))
 }
 
 async fn route_call_post(
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
-    axum::Json(call_args): axum::Json<Value>,
-) -> Result<axum::Json<Value>, AppError> {
+    axum::Json(call_args): axum::Json<HashMap<String, Value>>,
+) -> Result<Response, AppError> {
     debug!("POST call for method: {method}, params: {params:#?}");
 
     let socket = if let Some(socket) = params.get("socket") {
@@ -434,14 +479,18 @@ async fn route_call_post(
             .to_string()
     };
 
-    let connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
+    let mut connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
 
-    let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
-        connection, method, call_args,
-    );
-    let reply = call.call().await?;
-
-    Ok(axum::Json(reply))
+    let call = zlink::Call::new(DynMethod {
+        method: &method,
+        parameters: Some(&call_args),
+    });
+    connection
+        .call_method::<_, DynReply<'_>, DynReplyError<'_>>(&call, vec![])
+        .await?
+        .0
+        .map(|r| r.into_parameters().unwrap_or_default().into_response())
+        .map_err(Into::into)
 }
 
 async fn route_ws(
@@ -449,13 +498,12 @@ async fn route_ws(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    let varlink_addr = state
+    let unix_path = state
         .varlink_sockets
         .resolve_socket_with_validate(&varlink_socket)?;
-    let unix_path = varlink_addr.strip_prefix("unix:").unwrap_or(&varlink_addr);
 
-    // Connect eagerly so connection failures return proper HTTP errors
-    let varlink_stream = UnixStream::connect(unix_path)
+    // Connect eagerly so connection failures return proper HTTP errors.
+    let varlink_stream = UnixStream::connect(&unix_path)
         .await
         .map_err(|e| AppError::bad_gateway(format!("cannot connect to {unix_path}: {e}")))?;
 

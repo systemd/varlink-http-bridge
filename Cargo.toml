@@ -13,8 +13,9 @@ anyhow = "1.0.100"
 axum = { version = "0.8.8", features = ["ws"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }
-varlink = { version = "13.0", features = ["tokio"] }
-varlink_parser = "6.0.0"
+# not using default features as we don't need service/server/introspection
+zlink = { version = "0.4", default-features = false, features = ["tokio", "proxy", "idl-parse", "tracing"] }
+serde = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["color", "humantime"] }
 # not using clap here as its relatively heavy (500kb-1Mb depending on cfg)

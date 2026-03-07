@@ -261,8 +261,11 @@ async fn test_error_unknown_varlink_address() {
 
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     let body: Value = res.json().await.expect("error body invalid");
-    // TODO: see comment in impl From<varlink::Error>, would be great to improve this upstream
-    assert_eq!(body["error"], "IO error");
+    let error_msg = body["error"].as_str().expect("error field missing");
+    assert!(
+        error_msg.starts_with("I/O error:"),
+        "expected I/O error message, got: {error_msg}"
+    );
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
@@ -286,7 +289,7 @@ async fn test_error_404_for_missing_method() {
 
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let body: Value = res.json().await.expect("error body invalid");
-    assert_eq!(body["error"], "Method not found: 'com.missing.Call'");
+    assert_eq!(body["error"], "Method not found: com.missing.Call");
 }
 
 #[test_with::path(/run/systemd)]
