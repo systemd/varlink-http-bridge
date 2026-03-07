@@ -9,16 +9,31 @@ use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-/// Path to the varlinkctl-helper binary built by cargo alongside the test binary.
+/// Build (if needed) and return the path to the varlinkctl-helper binary.
 fn helper_binary() -> std::path::PathBuf {
+    static BUILD: std::sync::Once = std::sync::Once::new();
+
     let test_exe = std::env::current_exe().expect("failed to get test exe path");
     // test binary is in target/debug/deps/, helper is in target/debug/
-    test_exe
+    let helper = test_exe
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("varlinkctl-helper")
+        .join("varlinkctl-helper");
+
+    BUILD.call_once(|| {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--bin", "varlinkctl-helper"])
+            .status()
+            .expect("failed to run cargo build");
+        assert!(
+            status.success(),
+            "cargo build --bin varlinkctl-helper failed"
+        );
+    });
+
+    helper
 }
 
 async fn run_test_server(
@@ -773,6 +788,7 @@ async fn run_test_tls_server(
     (task_handle, local_addr)
 }
 
+#[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_tls_basic_connection() {
     let pki = make_test_pki();
@@ -806,6 +822,7 @@ async fn test_tls_basic_connection() {
     assert_eq!(res.status(), 200);
 }
 
+#[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_mtls_accepts_client_cert_and_rejects_without() {
     let pki = make_test_pki();
@@ -860,6 +877,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     assert_eq!(res.status(), 200);
 }
 
+#[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_tls_credentials_directory_fallback() {
     let pki = make_test_pki();
@@ -896,6 +914,7 @@ async fn test_tls_credentials_directory_fallback() {
     assert_eq!(res.status(), 200);
 }
 
+#[test_with::path(/usr/bin/openssl)]
 #[test_with::path(/usr/bin/varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
@@ -955,6 +974,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     assert_eq!(body["Hostname"], expected_hostname);
 }
 
+#[test_with::path(/usr/bin/openssl)]
 #[test_with::path(/usr/bin/varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
