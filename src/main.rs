@@ -774,7 +774,7 @@ fn print_help() {
 
         Positional arguments:
           VARLINK_SOCKETS_PATH  directory of sockets or a single socket
-                                (default: /run/systemd/registry)
+                                (default: /run/varlink/registry)
 
         Options:
           --bind=ADDR             address to bind HTTP server to (default: 0.0.0.0:1031)
@@ -810,7 +810,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 
     let mut bind = String::from("0.0.0.0:1031");
-    let mut varlink_sockets_path = String::from("/run/systemd/registry");
+    let mut varlink_sockets_path = String::from("/run/varlink/registry");
     let mut cert = None;
     let mut key = None;
     let mut trust = None;
