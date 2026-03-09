@@ -25,7 +25,7 @@ regex-lite = "0.1"
 listenfd = "1.0.2"
 tungstenite = "0.28"
 rustix = { version = "1.0", features = ["event", "process"] }
-signal-hook = "0.3"
+signal-hook = "0.4"
 # using opeenssl here to keep size small, rusttls adds ~1.8MB binary size
 # and nativetls does not support mTLS
 openssl = "0.10"
