@@ -111,6 +111,11 @@ $ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?socket=
   "version": "259 (259-1)"
 }
 
+# streaming methods use Accept: application/json-seq (RFC 7464)
+$ curl -s -H "Accept: application/json-seq" -H "Content-Type: application/json" \
+    http://localhost:1031/call/io.systemd.UserDatabase.GetUserRecord \
+    -d '{"service":"io.systemd.Multiplexer"}' | jq --seq
+
 ```
 
 ### Example (varlinkctl transparent bridge mode)

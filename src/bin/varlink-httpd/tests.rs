@@ -585,6 +585,101 @@ async fn test_ws_userdb_get_user_record_more() {
     );
 }
 
+/// Parse a JSON text sequence (RFC 7464) body into a Vec of JSON values.
+/// Each record is RS (0x1E) + JSON + LF.
+fn parse_json_seq(body: &[u8]) -> Vec<Value> {
+    body.split(|&b| b == 0x1e)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            let trimmed = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+            serde_json::from_slice(trimmed).expect("json-seq record is not valid JSON")
+        })
+        .collect()
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_jsonseq_hostname_describe() {
+    let (server, local_addr) = run_test_server("/run/systemd").await;
+    defer! {
+        server.abort();
+    };
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname.Describe",
+            local_addr,
+        ))
+        .header("Accept", "application/json-seq")
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json-seq")
+    );
+
+    let body = res.bytes().await.expect("failed to read body");
+    let records = parse_json_seq(&body);
+
+    // non-streaming method: exactly one record
+    assert_eq!(
+        records.len(),
+        1,
+        "expected 1 json-seq record, got {records:#?}"
+    );
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(records[0]["Hostname"], expected_hostname);
+}
+
+#[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
+#[tokio::test]
+async fn test_jsonseq_userdb_get_user_record_more() {
+    let (server, local_addr) = run_test_server("/run/systemd/userdb").await;
+    defer! {
+        server.abort();
+    };
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.UserDatabase.GetUserRecord?socket=io.systemd.Multiplexer",
+            local_addr,
+        ))
+        .header("Accept", "application/json-seq")
+        .json(&json!({"service": "io.systemd.Multiplexer"}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json-seq")
+    );
+
+    let body = res.bytes().await.expect("failed to read body");
+    let records = parse_json_seq(&body);
+
+    let users: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["record"]["userName"].as_str())
+        .collect();
+
+    // we expect at least root + current user
+    assert!(
+        users.len() >= 2,
+        "expected at least 2 user records, got {users:#?}"
+    );
+    assert!(users.contains(&"root"), "root user not found in {users:#?}");
+}
+
 #[test_with::path(/usr/bin/varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]

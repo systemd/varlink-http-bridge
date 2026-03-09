@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use anyhow::{Context, bail};
+use async_stream::stream;
 use axum::{
     Router,
+    body::Body,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
@@ -23,7 +25,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
-use zlink::{Reply, varlink_service::Proxy};
+use zlink::varlink_service::Proxy;
 
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
@@ -520,10 +522,51 @@ async fn route_socket_interface_get(
     Ok(axum::Json(json!({"method_names": method_names})))
 }
 
+/// Stream varlink `more` replies as a JSON text sequence (RFC 7464).
+///
+/// Each record is RS (0x1E) + JSON + LF.  The content-type is
+/// `application/json-seq`.
+fn varlink_call_to_jsonseq(mut conn: zlink::unix::Connection) -> Response {
+    let stream = stream! {
+        loop {
+            match conn.receive_reply::<Value, DynReplyError>().await {
+                Ok((reply, _fds)) => {
+                    let continues = reply.as_ref().is_ok_and(|r| r.continues().unwrap_or(false));
+                    let json_str = match reply {
+                        Ok(r) => serde_json::to_string(&r.into_parameters()).unwrap_or_default(),
+                        Err(e) => json!({"error": e.error, "parameters": e.parameters}).to_string(),
+                    };
+                    yield Ok::<_, std::convert::Infallible>(
+                        format!("\x1e{json_str}\n"),
+                    );
+                    if !continues {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let error_json = json!({"error": e.to_string()});
+                    yield Ok(format!("\x1e{error_json}\n"));
+                    break;
+                }
+            }
+        }
+    };
+    Response::builder()
+        .header("Content-Type", "application/json-seq")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Call a varlink method.
+///
+/// - Default: single JSON response via varlink `call`
+/// - `Accept: application/json-seq`: stream replies via varlink `more`
+///   as a JSON text sequence (RFC 7464)
 async fn route_call_post(
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(call_args): axum::Json<HashMap<String, Value>>,
 ) -> Result<Response, AppError> {
     debug!("POST call for method: {method}, params: {params:#?}");
@@ -544,16 +587,29 @@ async fn route_call_post(
 
     let mut connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
 
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
     let method_call = DynMethod {
         method: &method,
         parameters: Some(&call_args),
     };
-    connection
-        .call_method(&method_call.into(), vec![])
-        .await?
-        .0
-        .map(|r: Reply<DynReply>| r.into_parameters().unwrap_or_default().into_response())
-        .map_err(|e: DynReplyError| e.into())
+
+    if accept.contains("application/json-seq") {
+        connection
+            .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
+            .await?;
+        Ok(varlink_call_to_jsonseq(connection))
+    } else {
+        connection
+            .call_method::<_, DynReply, DynReplyError>(&method_call.into(), vec![])
+            .await?
+            .0
+            .map(|r| r.into_parameters().unwrap_or_default().into_response())
+            .map_err(AppError::from)
+    }
 }
 
 async fn route_ws(
