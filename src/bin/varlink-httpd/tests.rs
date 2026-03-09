@@ -585,6 +585,37 @@ async fn test_ws_userdb_get_user_record_more() {
     );
 }
 
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlink_conn_cache_reuses_connection() {
+    let sockets = Arc::new(VarlinkSockets::from_socket_dir("/run/systemd").unwrap());
+    let state = AppState {
+        varlink_sockets: sockets,
+        authenticators: Arc::new(Vec::new()),
+    };
+    let cache = VarlinkConnCache::new(None);
+
+    let conn1 = get_varlink_connection("io.systemd.Hostname", &state, &cache)
+        .await
+        .unwrap();
+    let conn2 = get_varlink_connection("io.systemd.Hostname", &state, &cache)
+        .await
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&conn1, &conn2),
+        "expected cached connection to be reused"
+    );
+
+    // different socket gets a different connection
+    let conn3 = get_varlink_connection("io.systemd.Manager", &state, &cache)
+        .await
+        .unwrap();
+    assert!(
+        !Arc::ptr_eq(&conn1, &conn3),
+        "different sockets should have different connections"
+    );
+}
+
 /// Parse a JSON text sequence (RFC 7464) body into a Vec of JSON values.
 /// Each record is RS (0x1E) + JSON + LF.
 fn parse_json_seq(body: &[u8]) -> Vec<Value> {
