@@ -15,7 +15,7 @@ use axum::{
     serve::IncomingStream,
 };
 use listenfd::ListenFd;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -273,7 +273,8 @@ impl VarlinkConnCache {
 }
 
 impl Connected<IncomingStream<'_, PlainListener>> for VarlinkConnCache {
-    fn connect_info(_: IncomingStream<'_, PlainListener>) -> Self {
+    fn connect_info(target: IncomingStream<'_, PlainListener>) -> Self {
+        info!("New connection from {}", target.remote_addr());
         Self::new(None)
     }
 }
@@ -316,6 +317,28 @@ async fn accept_and_configure(
     }
 }
 
+fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
+    cert.subject_name()
+        .entries()
+        .filter_map(|e| {
+            let obj = e.object().nid().short_name().ok()?;
+            let val = e.data().as_utf8().ok()?;
+            Some(format!("{obj}={val}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: std::net::SocketAddr) {
+    match ssl.peer_certificate() {
+        Some(cert) => {
+            let subject = format_x509_subject(&cert);
+            info!("New TLS connection from {addr}, client cert: {subject}");
+        }
+        None => info!("New TLS connection from {addr}, no client cert"),
+    }
+}
+
 struct TlsListener {
     inner: TcpListener,
     acceptor: openssl::ssl::SslAcceptor,
@@ -342,7 +365,10 @@ impl axum::serve::Listener for TlsListener {
             .await;
 
             match res {
-                Ok(conn) => return conn,
+                Ok((tls_stream, addr)) => {
+                    log_tls_connection(tls_stream.ssl(), addr);
+                    return (tls_stream, addr);
+                }
                 Err(e) => warn!("{e}"),
             }
         }

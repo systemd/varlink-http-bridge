@@ -9,7 +9,36 @@ use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-/// Build (if needed) and return the path to the varlinkctl-http binary.
+/// A simple log capture for tests.  Installed once (via `init_test_logger`)
+/// and accumulates all `info!` and above messages so tests can assert on them.
+struct TestLogger;
+
+static TEST_LOG_MESSAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+impl log::Log for TestLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        TEST_LOG_MESSAGES
+            .lock()
+            .unwrap()
+            .push(format!("[{}] {}", record.level(), record.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_test_logger() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&TestLogger).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+}
+
+/// Build (if needed) and return the path to the varlinkctl-helper binary.
 fn helper_binary() -> std::path::PathBuf {
     static BUILD: std::sync::Once = std::sync::Once::new();
 
@@ -959,6 +988,8 @@ async fn test_tls_basic_connection() {
 #[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_mtls_accepts_client_cert_and_rejects_without() {
+    init_test_logger();
+
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
@@ -1009,6 +1040,15 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
         .await
         .expect("mTLS connection with client cert failed");
     assert_eq!(res.status(), 200);
+
+    // Verify that the mTLS connection was logged with the client cert subject
+    let logs = TEST_LOG_MESSAGES.lock().unwrap();
+    assert!(
+        logs.iter()
+            .any(|msg| msg.contains("[INFO] New TLS connection from")
+                && msg.contains("client cert: CN=test-client")),
+        "expected mTLS connection log with client cert subject, got: {logs:?}"
+    );
 }
 
 #[test_with::path(/usr/bin/openssl)]
@@ -1171,6 +1211,42 @@ fn test_tls_credentials_directory_returns_none_without_creds() {
         result.is_none(),
         "empty credentials dir should yield no TLS"
     );
+}
+
+#[test_with::path(/usr/bin/openssl)]
+#[test]
+fn test_format_x509_subject() {
+    let pki = make_test_pki();
+    let pem = std::fs::read(&pki.client_cert_path).unwrap();
+    let cert = openssl::x509::X509::from_pem(&pem).unwrap();
+    let subject = format_x509_subject(&cert);
+    assert_eq!(subject, "CN=test-client");
+}
+
+#[test_with::path(/usr/bin/openssl)]
+#[test]
+fn test_format_x509_subject_multiple_fields() {
+    use std::process::Command;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let d = tmpdir.path();
+    let key_path = d.join("key.pem");
+    let cert_path = d.join("cert.pem");
+    #[rustfmt::skip]
+    let openssl_args = [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", key_path.to_str().unwrap(),
+        "-out",    cert_path.to_str().unwrap(),
+        "-subj",   "/O=TestOrg/CN=multi-field",
+        "-days",   "1",
+    ];
+    let out = Command::new("openssl").args(openssl_args).output().unwrap();
+    assert!(out.status.success());
+
+    let pem = std::fs::read(d.join("cert.pem")).unwrap();
+    let cert = openssl::x509::X509::from_pem(&pem).unwrap();
+    let subject = format_x509_subject(&cert);
+    assert_eq!(subject, "O=TestOrg, CN=multi-field");
 }
 
 // --- SSH key auth tests ---
