@@ -145,7 +145,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
 
     let tls_channel_binding = match &stream {
         Stream::Tls(ssl_stream) => {
-            use varlink_httpd::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
+            use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
             let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
             ssl_stream
                 .ssl()

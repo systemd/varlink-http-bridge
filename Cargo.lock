@@ -2446,7 +2446,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "varlink-httpd"
+name = "varlink-http-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",

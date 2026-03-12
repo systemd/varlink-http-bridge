@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use crate::Authenticator;
-use varlink_httpd::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
+use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
 
 struct KeyCache {
     keys: HashMap<String, PublicKey>,
