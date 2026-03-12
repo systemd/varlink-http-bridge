@@ -132,6 +132,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
 
     let tcp = TcpStream::connect((host, port))
         .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+    varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp).context("configure client socket")?;
 
     let stream =
         if use_tls {

@@ -20,3 +20,28 @@ pub const TLS_CHANNEL_BINDING_LABEL: &str = "EXPORTER-Channel-Binding";
 
 /// Output length (bytes) for TLS channel binding export.
 pub const TLS_CHANNEL_BINDING_LEN: usize = 32;
+
+/// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.
+///
+/// Keepalive timing uses the OS defaults. Tunable via
+/// `sysctl net.ipv4.tcp_keepalive_{time,intvl,probes}`
+///
+/// # Errors
+/// Returns an error if the underlying `setsockopt` calls fail.
+pub fn set_tcp_keepalive_and_nodelay(fd: &impl std::os::fd::AsFd) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // no way to do this directly yet, hence socket2, see
+    // https://github.com/rust-lang/rust/issues/69774
+    let sock = socket2::SockRef::from(fd);
+    sock.set_tcp_nodelay(true).context("set TCP_NODELAY")?;
+    // TODO: if we need more aggressive dead-peer detection, override the
+    // keepalive timing here with something like:
+    //   let keepalive = socket2::TcpKeepalive::new()
+    //      .with_time(std::time::Duration::from_secs(300))
+    //      .with_interval(std::time::Duration::from_secs(30))
+    //     .with_retries(5);
+    //   sock.set_tcp_keepalive(&keepalive)
+    sock.set_keepalive(true).context("set SO_KEEPALIVE")?;
+    Ok(())
+}

@@ -255,6 +255,23 @@ async fn get_varlink_connection_with_validate_socket(
     Ok(connection)
 }
 
+/// Accept a TCP connection, configure socket options, and retry on transient errors.
+async fn accept_and_configure(
+    listener: &TcpListener,
+) -> (tokio::net::TcpStream, std::net::SocketAddr) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                if let Err(e) = varlink_http_bridge::set_tcp_keepalive_and_nodelay(&stream) {
+                    warn!("on accept from {addr}: {e:#}");
+                }
+                return (stream, addr);
+            }
+            Err(e) => warn!("TCP accept failed: {e}"),
+        }
+    }
+}
+
 struct TlsListener {
     inner: TcpListener,
     acceptor: openssl::ssl::SslAcceptor,
@@ -266,20 +283,16 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let res: Result<_, Box<dyn std::error::Error>> = async {
-                let (stream, addr) = self
-                    .inner
-                    .accept()
-                    .await
-                    .map_err(|e| format!("TCP accept failed: {e}"))?;
-                let ssl = openssl::ssl::Ssl::new(self.acceptor.context())
-                    .map_err(|e| format!("SSL context error: {e}"))?;
+            let (stream, addr) = accept_and_configure(&self.inner).await;
+            let res: anyhow::Result<_> = async {
+                let ssl =
+                    openssl::ssl::Ssl::new(self.acceptor.context()).context("SSL context error")?;
                 let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)
-                    .map_err(|e| format!("SSL stream creation failed: {e}"))?;
+                    .context("SSL stream creation failed")?;
                 std::pin::Pin::new(&mut tls_stream)
                     .accept()
                     .await
-                    .map_err(|e| format!("TLS handshake failed: {e}"))?;
+                    .context("TLS handshake failed")?;
                 Ok((tls_stream, addr))
             }
             .await;
@@ -289,6 +302,23 @@ impl axum::serve::Listener for TlsListener {
                 Err(e) => warn!("{e}"),
             }
         }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+struct PlainListener {
+    inner: TcpListener,
+}
+
+impl axum::serve::Listener for PlainListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        accept_and_configure(&self.inner).await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
@@ -740,7 +770,8 @@ async fn run_server(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     } else {
-        axum::serve(listener, app)
+        let plain_listener = PlainListener { inner: listener };
+        axum::serve(plain_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
     }
