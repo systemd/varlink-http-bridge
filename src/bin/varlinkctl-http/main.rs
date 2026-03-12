@@ -145,15 +145,9 @@ fn connect_ws(url: &str) -> Result<Ws> {
         };
 
     let tls_channel_binding = match &stream {
-        Stream::Tls(ssl_stream) => {
-            use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
-            let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
-            ssl_stream
-                .ssl()
-                .export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
-                .expect("export_keying_material must succeed after TLS 1.3 handshake");
-            Some(openssl::base64::encode_block(&buf))
-        }
+        Stream::Tls(ssl_stream) => Some(varlink_http_bridge::export_tls_channel_binding(
+            ssl_stream.ssl(),
+        )),
         Stream::Plain(_) => None,
     };
 

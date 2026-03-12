@@ -336,21 +336,8 @@ use axum::serve::IncomingStream;
 
 impl Connected<IncomingStream<'_, TlsListener>> for TlsConnectionInfo {
     fn connect_info(target: IncomingStream<'_, TlsListener>) -> Self {
-        use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
-
-        let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
-        target
-            .io()
-            .ssl()
-            .export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
-            // Cannot fail: load_tls_acceptor enforces TLS 1.3 minimum.
-            .expect("export_keying_material must succeed with TLS 1.3");
-        // extra paranoia to ensure we always have a valid channel binding
-        assert!(
-            buf.iter().any(|&b| b != 0),
-            "TLS channel binding must not be all zeros"
-        );
-        let tls_channel_binding = openssl::base64::encode_block(&buf);
+        let tls_channel_binding =
+            varlink_http_bridge::export_tls_channel_binding(target.io().ssl());
         TlsConnectionInfo {
             tls_channel_binding,
         }

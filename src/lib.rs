@@ -21,6 +21,25 @@ pub const TLS_CHANNEL_BINDING_LABEL: &str = "EXPORTER-Channel-Binding";
 /// Output length (bytes) for TLS channel binding export.
 pub const TLS_CHANNEL_BINDING_LEN: usize = 32;
 
+/// Export the TLS channel binding value from an established TLS 1.3 session.
+///
+/// Returns the base64-encoded result of `export_keying_material` per RFC 9266.
+///
+/// # Panics
+/// Panics if `export_keying_material` fails (should never happen with
+/// TLS 1.3) or if the export does not work because of an underlying
+/// bug in openssl and returns only zeros (should also never happen).
+pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> String {
+    let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
+    ssl.export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
+        .expect("export_keying_material must succeed with TLS 1.3");
+    assert!(
+        buf.iter().any(|&b| b != 0),
+        "TLS channel binding must not be all zeros"
+    );
+    openssl::base64::encode_block(&buf)
+}
+
 /// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.
 ///
 /// Keepalive timing uses the OS defaults. Tunable via
