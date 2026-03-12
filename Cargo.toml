@@ -1,8 +1,16 @@
 [package]
-name = "varlink-httpd"
+name = "varlink-http-bridge"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
+
+[[bin]]
+name = "varlink-httpd"
+path = "src/bin/varlink-httpd/main.rs"
+
+[[bin]]
+name = "varlinkctl-http"
+path = "src/bin/varlinkctl-http/main.rs"
 
 [features]
 default = ["sshauth"]

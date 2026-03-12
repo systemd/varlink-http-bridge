@@ -306,7 +306,7 @@ use axum::serve::IncomingStream;
 
 impl Connected<IncomingStream<'_, TlsListener>> for TlsConnectionInfo {
     fn connect_info(target: IncomingStream<'_, TlsListener>) -> Self {
-        use varlink_httpd::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
+        use varlink_http_bridge::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN};
 
         let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
         target
