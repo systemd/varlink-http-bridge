@@ -43,14 +43,14 @@ indoc = "2.0.7"
 ssh-key = { version = "0.6", optional = true }
 sshauth = { version = "0.1", optional = true }
 ureq = { version = "3", optional = true, default-features = false, features = ["native-tls"] }
-tempfile = { version = "3.10", optional = true }
+tempfile = { version = "3.27", optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.15", default-features = false, features = ["runtime"] }
 scopeguard = "1.2"
 gethostname = "1.1.0"
-tempfile = "3.10"
+tempfile = "3.27"
 tokio-tungstenite = "0.28"
 futures-util = { version = "0.3" }
 tower = { version = "0.5", features = ["util"] }
