@@ -1108,7 +1108,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     };
 
     let fake_xdg_home = tempfile::tempdir().unwrap();
-    let tls_dir = fake_xdg_home.path().join("varlink-httpd");
+    let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
     std::fs::copy(&pki.client_cert_path, tls_dir.join("client-cert-file")).unwrap();
     std::fs::copy(&pki.client_key_path, tls_dir.join("client-key-file")).unwrap();
@@ -1169,7 +1169,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
 
     // Provide the server CA (so the client trusts the server) but NO client cert/key
     let fake_xdg_home = tempfile::tempdir().unwrap();
-    let tls_dir = fake_xdg_home.path().join("varlink-httpd");
+    let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
     std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
 
@@ -1822,7 +1822,7 @@ mod sshauth_tests {
         };
 
         let fake_xdg_home = tempfile::tempdir().unwrap();
-        let tls_dir = fake_xdg_home.path().join("varlink-httpd");
+        let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
         std::fs::create_dir_all(&tls_dir).unwrap();
         std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
 
