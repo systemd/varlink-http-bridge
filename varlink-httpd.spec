@@ -3,7 +3,7 @@
 
 Name:           varlink-httpd
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        %autorelease
 Summary:        HTTP bridge for local varlink services
 
 License:        LGPL-2.1-or-later
@@ -18,27 +18,23 @@ BuildRequires:  pkgconfig
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
 
-Requires(post): systemd
-Requires(preun): systemd
-Requires(postun): systemd
-
 %description
-An HTTP bridge that makes local varlink services available over HTTP
-and WebSocket. The main use case is systemd, so only the subset of
-varlink that systemd needs is supported right now.
+An HTTP bridge that makes local varlink services available over HTTP and
+WebSocket. The main use case is systemd, so only the subset of varlink that
+systemd needs is supported right now.
 
-It takes a directory with varlink sockets as the argument and serves
-whatever it finds there. Sockets can be added or removed dynamically.
+It takes a directory with varlink sockets as the argument and serves whatever
+it finds there. Sockets can be added or removed dynamically.
 
 %package -n varlinkctl-http
 Summary:        HTTP/WebSocket transport helper for varlinkctl
 Requires:       systemd >= 260~
 
 %description -n varlinkctl-http
-A bridge helper that lets varlinkctl talk to varlink services over
-HTTP and WebSocket (http://, https://, ws://, wss:// URLs). Install
-into /usr/lib/systemd/varlink-bridges/ so that varlinkctl discovers
-it automatically.
+A bridge helper that lets varlinkctl talk to varlink services over HTTP and
+WebSocket (http://, https://, ws://, wss:// URLs). Install into
+/usr/lib/systemd/varlink-bridges/ so that varlinkctl discovers it
+automatically.
 
 %prep
 %autosetup
@@ -70,5 +66,4 @@ DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 %{_prefix}/lib/systemd/varlink-bridges/wss
 
 %changelog
-* Mon Mar 02 2026 Michael Vogt <michael@amutable.com> - 0.1.0-1
-- Initial release
+%autochangelog
