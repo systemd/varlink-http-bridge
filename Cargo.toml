@@ -53,7 +53,7 @@ test-with = { version = "0.15", default-features = false, features = ["runtime"]
 scopeguard = "1.2"
 gethostname = "1.1.0"
 tempfile = "3.27"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 futures-util = { version = "0.3" }
 tower = { version = "0.5", features = ["util"] }
 
