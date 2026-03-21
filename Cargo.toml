@@ -33,7 +33,7 @@ lexopt = "0.3"
 # not using full regex as it adds more bloat and our requirements are minimal
 regex-lite = "0.1"
 listenfd = "1.0.2"
-tungstenite = "0.28"
+tungstenite = "0.29"
 rustix = { version = "1.0", features = ["event", "process"] }
 signal-hook = "0.4"
 socket2 = "0.6"
