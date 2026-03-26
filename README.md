@@ -193,6 +193,49 @@ $ varlink --bridge "websocat --binary ws://localhost:1031/ws/sockets/io.systemd.
 
 ```
 
+## vsock transport
+
+The bridge supports AF_VSOCK as an alternative to TCP, allowing
+host-to-guest communication without a network.
+
+### Server
+
+```console
+# Listen on vsock with default port (1031):
+$ varlink-httpd --bind=vsock --insecure
+
+# Listen on a specific port:
+$ varlink-httpd --bind=vsock::5000 --insecure
+
+# Socket activation (systemd auto-detects AF_VSOCK):
+# [Socket]
+# ListenStream=vsock::1031
+```
+
+### Client
+
+```console
+# Connect to host (CID 2) on default port:
+$ varlinkctl call vsock://2/io.systemd.Hostname/Describe '{}'
+
+# Connect with explicit port:
+$ varlinkctl call vsock://3:5000/io.systemd.Hostname/Describe '{}'
+```
+
+CID 2 is always the host. Guest CIDs (3+) are assigned by the VMM.
+
+### systemd socket activation
+
+A socket-activated unit is provided for VMs. Enable it inside the guest:
+
+```console
+# systemctl enable --now varlink-httpd-vsock.socket
+```
+
+The socket unit uses `ConditionVirtualization=vm`, so it only activates
+inside a VM. On bare metal or the host it is silently skipped. The
+daemon starts on demand when the first vsock connection arrives.
+
 ## TLS / mTLS
 
 TLS flag names follow the systemd convention.
