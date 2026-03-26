@@ -11,12 +11,15 @@ install_server: (build "release")
 	install -Dm755 {{srv_binary}} {{destdir}}{{bindir}}/varlink-httpd
 	install -dm755 {{destdir}}{{unitdir}}
 	sed 's|@bindir@|{{bindir}}|g' data/varlink-httpd.service.in > {{destdir}}{{unitdir}}/varlink-httpd.service
+	sed 's|@bindir@|{{bindir}}|g' data/varlink-httpd-vsock.service.in > {{destdir}}{{unitdir}}/varlink-httpd-vsock.service
+	install -m644 data/varlink-httpd-vsock.socket {{destdir}}{{unitdir}}/varlink-httpd-vsock.socket
 
 install_client: (build "release")
 	install -Dm755 {{helper_binary}} {{destdir}}{{bridgedir}}/http
 	ln -sf http {{destdir}}{{bridgedir}}/https
 	ln -sf http {{destdir}}{{bridgedir}}/ws
 	ln -sf http {{destdir}}{{bridgedir}}/wss
+	ln -sf http {{destdir}}{{bridgedir}}/vsock
 
 install_config:
 	install -dm755 {{destdir}}{{sysconfdir}}/varlink-httpd

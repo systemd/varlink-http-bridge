@@ -46,17 +46,19 @@ just build release
 DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 
 %post
-%systemd_post varlink-httpd.service
+%systemd_post varlink-httpd.service varlink-httpd-vsock.socket varlink-httpd-vsock.service
 
 %preun
-%systemd_preun varlink-httpd.service
+%systemd_preun varlink-httpd.service varlink-httpd-vsock.socket varlink-httpd-vsock.service
 
 %postun
-%systemd_postun_with_restart varlink-httpd.service
+%systemd_postun_with_restart varlink-httpd.service varlink-httpd-vsock.socket varlink-httpd-vsock.service
 
 %files
 %{_bindir}/varlink-httpd
 %{_unitdir}/varlink-httpd.service
+%{_unitdir}/varlink-httpd-vsock.service
+%{_unitdir}/varlink-httpd-vsock.socket
 %dir %{_sysconfdir}/varlink-httpd
 
 %files -n varlinkctl-http
@@ -64,6 +66,7 @@ DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 %{_prefix}/lib/systemd/varlink-bridges/https
 %{_prefix}/lib/systemd/varlink-bridges/ws
 %{_prefix}/lib/systemd/varlink-bridges/wss
+%{_prefix}/lib/systemd/varlink-bridges/vsock
 
 %changelog
 %autochangelog

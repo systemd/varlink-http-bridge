@@ -20,13 +20,14 @@ use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
+use tokio_vsock::VsockListener;
 use zlink::varlink_service::Proxy;
 
 #[cfg(feature = "sshauth")]
@@ -442,6 +443,14 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkC
         log_tls_connection(ssl, target.remote_addr());
         let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
         Self::new(Some(tls_channel_binding))
+    }
+}
+
+impl Connected<IncomingStream<'_, VsockListener>> for VarlinkConnCache {
+    fn connect_info(target: IncomingStream<'_, VsockListener>) -> Self {
+        let peer = target.remote_addr();
+        info!("New vsock connection from CID {}", peer.cid());
+        Self::new(None)
     }
 }
 
@@ -899,25 +908,112 @@ async fn shutdown_signal() {
     println!("Shutdown signal received, stopping server...");
 }
 
-async fn run_server(
-    varlink_sockets_path: &str,
-    listener: TcpListener,
+enum Transport {
+    Tcp(TcpListener),
+    Vsock(VsockListener),
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Tcp(l) => {
+                let addr = l.local_addr().map_err(|_| std::fmt::Error)?;
+                write!(f, "{addr}")
+            }
+            Transport::Vsock(l) => {
+                let addr = l.local_addr().map_err(|_| std::fmt::Error)?;
+                write!(f, "vsock:{}:{}", addr.cid(), addr.port())
+            }
+        }
+    }
+}
+
+/// Create a [`Transport`] from a socket-activated file descriptor.
+fn listener_from_activated_fd(
+    fd: OwnedFd,
     tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+) -> anyhow::Result<(Transport, Option<openssl::ssl::SslAcceptor>)> {
+    let addr = rustix::net::getsockname(fd.as_fd())?;
+    match addr.address_family() {
+        rustix::net::AddressFamily::VSOCK => {
+            if tls_acceptor.is_some() {
+                bail!("TLS over vsock is not yet supported");
+            }
+            // TODO: use VsockListener::from(fd) once tokio-vsock has From<OwnedFd>
+            // c.f. https://github.com/rust-vsock/tokio-vsock/pull/72
+            let listener = unsafe { VsockListener::from_raw_fd(fd.into_raw_fd()) };
+            Ok((Transport::Vsock(listener), None))
+        }
+        rustix::net::AddressFamily::INET | rustix::net::AddressFamily::INET6 => {
+            let std_listener = std::net::TcpListener::from(fd);
+            // needed or tokio panics, see https://github.com/mitsuhiko/listenfd/pull/23
+            std_listener.set_nonblocking(true)?;
+            Ok((
+                Transport::Tcp(TcpListener::from_std(std_listener)?),
+                tls_acceptor,
+            ))
+        }
+        family => bail!("unsupported socket family from socket activation: {family:?}"),
+    }
+}
+
+/// Create a [`Transport`] from an explicit `--bind` address.
+async fn listener_from_bind_addr(
+    bind: BindAddr,
+    tls_acceptor: Option<&openssl::ssl::SslAcceptor>,
+) -> anyhow::Result<Transport> {
+    match bind {
+        BindAddr::Vsock { cid, port } => {
+            if tls_acceptor.is_some() {
+                bail!("TLS over vsock is not yet supported");
+            }
+            let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(cid, port))
+                .with_context(|| format!("vsock bind to CID {cid}, port {port}"))?;
+            Ok(Transport::Vsock(listener))
+        }
+        BindAddr::Tcp(ref addr) => {
+            let listener = TcpListener::bind(addr).await?;
+            Ok(Transport::Tcp(listener))
+        }
+    }
+}
+
+async fn start_server(
+    listener: Transport,
+    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+    varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> anyhow::Result<()> {
+    let scheme = if tls_acceptor.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
+    eprintln!("Forwarding {scheme} {listener} -> Varlink: {varlink_sockets_path}");
+
     let app = create_router(varlink_sockets_path, authenticators)?;
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
-    if let Some(acceptor) = tls_acceptor {
-        let plain = PlainListener { inner: listener };
-        axum::serve(AsyncTlsListener::new(plain, acceptor)?, make_svc)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
-    } else {
-        let plain_listener = PlainListener { inner: listener };
-        axum::serve(plain_listener, make_svc)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+    match (listener, tls_acceptor) {
+        (Transport::Vsock(_), Some(_)) => {
+            bail!("TLS over vsock is not yet supported");
+        }
+        (Transport::Vsock(l), None) => {
+            axum::serve(l, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        (Transport::Tcp(l), Some(acceptor)) => {
+            let plain = PlainListener { inner: l };
+            axum::serve(AsyncTlsListener::new(plain, acceptor)?, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        (Transport::Tcp(l), None) => {
+            axum::serve(PlainListener { inner: l }, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
     }
 
     Ok(())
@@ -930,9 +1026,84 @@ enum Command {
     ImportSsh(import_ssh::ImportSsh),
 }
 
+use varlink_http_bridge::DEFAULT_PORT;
+
+#[derive(Debug)]
+enum BindAddr {
+    Tcp(String),
+    Vsock { cid: u32, port: u32 },
+}
+
+/// Parse a bind address string.
+///
+/// Strings starting with `vsock` are parsed as vsock addresses
+/// (matching systemd's `ListenStream=` syntax):
+/// - `vsock`          -> `CID_ANY`, default port
+/// - `vsock:`         -> `CID_ANY`, default port
+/// - `vsock::PORT`    -> `CID_ANY`, explicit port
+/// - `vsock:CID:PORT` -> explicit CID and port
+///
+/// Everything else is treated as a TCP address.
+impl std::str::FromStr for BindAddr {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let Some(rest) = s.strip_prefix("vsock") else {
+            return Ok(BindAddr::Tcp(s.to_string()));
+        };
+        // "vsock" or "vsock:" with nothing after
+        if rest.is_empty() || rest == ":" {
+            return Ok(BindAddr::Vsock {
+                cid: vsock::VMADDR_CID_ANY,
+                port: DEFAULT_PORT,
+            });
+        }
+        // must start with ':'
+        let rest = rest
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid vsock bind address: {s}"))?;
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        match parts.as_slice() {
+            // "vsock::PORT"
+            ["", port] => Ok(BindAddr::Vsock {
+                cid: vsock::VMADDR_CID_ANY,
+                port: port
+                    .parse()
+                    .with_context(|| format!("invalid vsock port: {port}"))?,
+            }),
+            // "vsock:CID:PORT"
+            [cid, port] => Ok(BindAddr::Vsock {
+                cid: cid
+                    .parse()
+                    .with_context(|| format!("invalid vsock CID: {cid}"))?,
+                port: port
+                    .parse()
+                    .with_context(|| format!("invalid vsock port: {port}"))?,
+            }),
+            // "vsock:PORT" (single number = port, CID_ANY)
+            [port_or_empty] => {
+                if port_or_empty.is_empty() {
+                    Ok(BindAddr::Vsock {
+                        cid: vsock::VMADDR_CID_ANY,
+                        port: DEFAULT_PORT,
+                    })
+                } else {
+                    Ok(BindAddr::Vsock {
+                        cid: vsock::VMADDR_CID_ANY,
+                        port: port_or_empty
+                            .parse()
+                            .with_context(|| format!("invalid vsock port: {port_or_empty}"))?,
+                    })
+                }
+            }
+            _ => bail!("invalid vsock bind address: {s}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BridgeCli {
-    bind: String,
+    bind: BindAddr,
     varlink_sockets_path: String,
     cert: Option<String>,
     key: Option<String>,
@@ -942,7 +1113,9 @@ struct BridgeCli {
 }
 
 fn print_help() {
-    eprint!(indoc::indoc! {"
+    eprint!(
+        "{}",
+        indoc::formatdoc! {"
         Usage: varlink-httpd [bridge] [OPTIONS] [VARLINK_SOCKETS_PATH]
                varlink-httpd import-ssh SOURCE [OUTPUT]
 
@@ -955,14 +1128,16 @@ fn print_help() {
         Bridge options:
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
                                             (default: /run/varlink/registry)
-          --bind=ADDR                       address to bind to (default: 0.0.0.0:1031)
+          --bind=ADDR                       address to bind to (default: 0.0.0.0:{DEFAULT_PORT})
+                                            use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
           --cert=PATH                       TLS certificate PEM file
           --key=PATH                        TLS private key PEM file
           --trust=PATH                      CA certificate PEM for client verification (mTLS)
           --authorized-keys=PATH            authorized SSH public keys file
           --insecure                        run without any authentication (DANGEROUS)
           --help                            display this help and exit
-    "});
+    "}
+    );
 }
 
 #[cfg(feature = "sshauth")]
@@ -984,7 +1159,7 @@ fn print_import_ssh_help() {
 fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 
-    let mut bind = String::from("0.0.0.0:1031");
+    let mut bind_str = format!("0.0.0.0:{DEFAULT_PORT}");
     let mut varlink_sockets_path = String::from("/run/varlink/registry");
     let mut cert = None;
     let mut key = None;
@@ -996,7 +1171,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
         match arg {
-            Long("bind") => bind = parser.value()?.parse()?,
+            Long("bind") => bind_str = parser.value()?.parse()?,
             Long("cert") => cert = Some(parser.value()?.parse()?),
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
@@ -1021,6 +1196,8 @@ fn parse_cli() -> anyhow::Result<Command> {
             _ => return Err(arg.unexpected().into()),
         }
     }
+
+    let bind: BindAddr = bind_str.parse()?;
 
     Ok(Command::Bridge(BridgeCli {
         bind,
@@ -1070,16 +1247,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Bridge(cli) => cli,
     };
 
-    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
-    let mut listenfd = ListenFd::from_env();
-    let listener = if let Some(std_listener) = listenfd.take_tcp_listener(0)? {
-        // needed or tokio panics, see https://github.com/mitsuhiko/listenfd/pull/23
-        std_listener.set_nonblocking(true)?;
-        TcpListener::from_std(std_listener)?
-    } else {
-        TcpListener::bind(&cli.bind).await?
-    };
-
     let creds_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
 
     // Resolve mTLS: remember if trust was provided before consuming the options
@@ -1111,22 +1278,32 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("WARNING: running without authentication - all routes are open");
     }
 
-    let local_addr = listener.local_addr()?;
-    let scheme = if tls_acceptor.is_some() {
-        "HTTPS"
-    } else {
-        "HTTP"
-    };
+    // Socket activation: detect fd type (TCP vs vsock) or fall back to explicit --bind
+    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
+    let mut listenfd = ListenFd::from_env();
 
+    // Check for socket-activated fd first
+    if let Some(raw_fd) = listenfd.take_raw_fd(0)? {
+        // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let (listener, tls_acceptor) = listener_from_activated_fd(fd, tls_acceptor)?;
+        eprintln!("Varlink proxy started (socket-activated)");
+        return start_server(
+            listener,
+            tls_acceptor,
+            &cli.varlink_sockets_path,
+            authenticators,
+        )
+        .await;
+    }
+
+    // No socket activation: bind explicitly based on --bind (or default)
+    let listener = listener_from_bind_addr(cli.bind, tls_acceptor.as_ref()).await?;
     eprintln!("Varlink proxy started");
-    eprintln!(
-        "Forwarding {scheme} {local_addr} -> Varlink: {varlink_sockets_path}",
-        varlink_sockets_path = &cli.varlink_sockets_path
-    );
-    run_server(
-        &cli.varlink_sockets_path,
+    start_server(
         listener,
         tls_acceptor,
+        &cli.varlink_sockets_path,
         authenticators,
     )
     .await
