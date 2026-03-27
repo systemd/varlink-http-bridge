@@ -20,6 +20,7 @@ install_client: (build "release")
 	ln -sf http {{destdir}}{{bridgedir}}/ws
 	ln -sf http {{destdir}}{{bridgedir}}/wss
 	ln -sf http {{destdir}}{{bridgedir}}/vsock
+	ln -sf http {{destdir}}{{bridgedir}}/vsock+tls
 
 install_config:
 	install -dm755 {{destdir}}{{sysconfdir}}/varlink-httpd

@@ -196,33 +196,44 @@ $ varlink --bridge "websocat --binary ws://localhost:1031/ws/sockets/io.systemd.
 ## vsock transport
 
 The bridge supports AF_VSOCK as an alternative to TCP, allowing
-host-to-guest communication without a network.
+host-to-guest communication without a network. vsock traffic cannot
+be sniffed on the network, but any process on the host can connect
+to a guest's vsock port, so authentication is still required (mTLS
+or SSH key auth).
 
-### Server
+### SSH key auth over vsock
 
-```console
-# Listen on vsock with default port (1031):
-$ varlink-httpd --bind=vsock --insecure
-
-# Listen on a specific port:
-$ varlink-httpd --bind=vsock::5000 --insecure
-
-# Socket activation (systemd auto-detects AF_VSOCK):
-# [Socket]
-# ListenStream=vsock::1031
-```
-
-### Client
+vsock with SSH key auth works without TLS - the transport is not
+sniffable so the lack of encryption is acceptable:
 
 ```console
-# Connect to host (CID 2) on default port:
-$ varlinkctl call vsock://2/io.systemd.Hostname/Describe '{}'
+# Server (inside the guest):
+$ varlink-httpd --bind=vsock --authorized-keys=~/.ssh/authorized_keys
 
-# Connect with explicit port:
-$ varlinkctl call vsock://3:5000/io.systemd.Hostname/Describe '{}'
+# Client (on the host):
+$ varlinkctl call vsock://3/ws/sockets/io.systemd.Hostname \
+    io.systemd.Hostname.Describe '{}'
 ```
 
-CID 2 is always the host. Guest CIDs (3+) are assigned by the VMM.
+### mTLS over vsock
+
+Server (inside the guest):
+
+```console
+$ varlink-httpd --bind=vsock \
+    --cert=server.pem --key=server-key.pem --trust=ca.pem
+```
+
+Client (on the host), using `vsock+tls://`:
+
+```console
+$ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
+    io.systemd.Hostname.Describe '{}'
+```
+
+The client looks for its certificate and key in the same config
+directories as for TCP (see [Client (varlinkctl-http)](#client-varlinkctl-http)
+below). CID 3+ are guests; CID 2 is the host.
 
 ### systemd socket activation
 
