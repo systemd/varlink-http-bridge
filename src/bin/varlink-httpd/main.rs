@@ -462,6 +462,16 @@ impl Connected<IncomingStream<'_, VsockListener>> for VarlinkConnCache {
     }
 }
 
+impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkConnCache {
+    fn connect_info(target: IncomingStream<'_, AsyncTlsListener<VsockListener>>) -> Self {
+        let ssl = target.io().ssl();
+        let peer = target.remote_addr();
+        info!("New TLS vsock connection from CID {}", peer.cid());
+        let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
+        Self::new(Some(tls_channel_binding))
+    }
+}
+
 fn load_tls_acceptor(
     cert_path: &str,
     key_path: &str,
@@ -957,13 +967,10 @@ fn listener_from_activated_fd(
     let addr = rustix::net::getsockname(fd.as_fd())?;
     match addr.address_family() {
         rustix::net::AddressFamily::VSOCK => {
-            if tls_acceptor.is_some() {
-                bail!("TLS over vsock is not yet supported");
-            }
             // TODO: use VsockListener::from(fd) once tokio-vsock has From<OwnedFd>
             // c.f. https://github.com/rust-vsock/tokio-vsock/pull/72
             let listener = unsafe { VsockListener::from_raw_fd(fd.into_raw_fd()) };
-            Ok((Transport::Vsock(listener), None))
+            Ok((Transport::Vsock(listener), tls_acceptor))
         }
         rustix::net::AddressFamily::INET | rustix::net::AddressFamily::INET6 => {
             let std_listener = std::net::TcpListener::from(fd);
@@ -979,15 +986,9 @@ fn listener_from_activated_fd(
 }
 
 /// Create a [`Transport`] from an explicit `--bind` address.
-async fn listener_from_bind_addr(
-    bind: BindAddr,
-    tls_acceptor: Option<&openssl::ssl::SslAcceptor>,
-) -> anyhow::Result<Transport> {
+async fn listener_from_bind_addr(bind: BindAddr) -> anyhow::Result<Transport> {
     match bind {
         BindAddr::Vsock { cid, port } => {
-            if tls_acceptor.is_some() {
-                bail!("TLS over vsock is not yet supported");
-            }
             let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(cid, port))
                 .with_context(|| format!("vsock bind to CID {cid}, port {port}"))?;
             Ok(Transport::Vsock(listener))
@@ -1007,8 +1008,10 @@ async fn serve_listener(
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
     match (listener, tls_acceptor) {
-        (Transport::Vsock(_), Some(_)) => {
-            bail!("TLS over vsock is not yet supported");
+        (Transport::Vsock(l), Some(acceptor)) => {
+            axum::serve(AsyncTlsListener::new(l, acceptor)?, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
         }
         (Transport::Vsock(l), None) => {
             axum::serve(l, make_svc)
