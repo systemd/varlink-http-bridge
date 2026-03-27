@@ -329,7 +329,7 @@ fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
         .join(", ")
 }
 
-fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: std::net::SocketAddr) {
+fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &std::net::SocketAddr) {
     match ssl.peer_certificate() {
         Some(cert) => {
             let subject = format_x509_subject(&cert);
@@ -366,7 +366,6 @@ impl axum::serve::Listener for TlsListener {
 
             match res {
                 Ok((tls_stream, addr)) => {
-                    log_tls_connection(tls_stream.ssl(), addr);
                     return (tls_stream, addr);
                 }
                 Err(e) => warn!("{e}"),
@@ -398,8 +397,9 @@ impl axum::serve::Listener for PlainListener {
 
 impl Connected<IncomingStream<'_, TlsListener>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, TlsListener>) -> Self {
-        let tls_channel_binding =
-            varlink_http_bridge::export_tls_channel_binding(target.io().ssl());
+        let ssl = target.io().ssl();
+        log_tls_connection(ssl, target.remote_addr());
+        let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
         Self::new(Some(tls_channel_binding))
     }
 }
