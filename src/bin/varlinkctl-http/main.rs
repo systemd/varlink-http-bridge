@@ -33,6 +33,7 @@ enum Stream {
     Plain(TcpStream),
     Tls(openssl::ssl::SslStream<TcpStream>),
     Vsock(vsock::VsockStream),
+    TlsVsock(openssl::ssl::SslStream<vsock::VsockStream>),
 }
 
 impl Read for Stream {
@@ -41,6 +42,7 @@ impl Read for Stream {
             Stream::Plain(s) => s.read(buf),
             Stream::Tls(s) => s.read(buf),
             Stream::Vsock(s) => s.read(buf),
+            Stream::TlsVsock(s) => s.read(buf),
         }
     }
 }
@@ -51,6 +53,7 @@ impl Write for Stream {
             Stream::Plain(s) => s.write(buf),
             Stream::Tls(s) => s.write(buf),
             Stream::Vsock(s) => s.write(buf),
+            Stream::TlsVsock(s) => s.write(buf),
         }
     }
 
@@ -59,6 +62,7 @@ impl Write for Stream {
             Stream::Plain(s) => s.flush(),
             Stream::Tls(s) => s.flush(),
             Stream::Vsock(s) => s.flush(),
+            Stream::TlsVsock(s) => s.flush(),
         }
     }
 }
@@ -69,6 +73,7 @@ impl Stream {
             Stream::Plain(s) => s.set_nonblocking(nonblocking),
             Stream::Tls(s) => s.get_ref().set_nonblocking(nonblocking),
             Stream::Vsock(s) => s.set_nonblocking(nonblocking),
+            Stream::TlsVsock(s) => s.get_ref().set_nonblocking(nonblocking),
         }
     }
 
@@ -77,6 +82,7 @@ impl Stream {
             Stream::Plain(s) => s.set_read_timeout(dur),
             Stream::Tls(s) => s.get_ref().set_read_timeout(dur),
             Stream::Vsock(s) => s.set_read_timeout(dur),
+            Stream::TlsVsock(s) => s.get_ref().set_read_timeout(dur),
         }
     }
 
@@ -85,6 +91,7 @@ impl Stream {
             Stream::Plain(s) => s.set_write_timeout(dur),
             Stream::Tls(s) => s.get_ref().set_write_timeout(dur),
             Stream::Vsock(s) => s.set_write_timeout(dur),
+            Stream::TlsVsock(s) => s.get_ref().set_write_timeout(dur),
         }
     }
 }
@@ -95,6 +102,7 @@ impl std::os::fd::AsFd for Stream {
             Stream::Plain(s) => s.as_fd(),
             Stream::Tls(s) => s.get_ref().as_fd(),
             Stream::Vsock(s) => s.as_fd(),
+            Stream::TlsVsock(s) => s.get_ref().as_fd(),
         }
     }
 }
@@ -163,12 +171,29 @@ fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
     Ok((cid, port, path.to_string()))
 }
 
-fn connect_vsock(url: &str) -> Result<(Stream, String, Option<String>)> {
+fn connect_vsock(url: &str, use_tls: bool) -> Result<(Stream, String, Option<String>)> {
     let (cid, port, path) = parse_vsock_url(url)?;
-    let stream = vsock::VsockStream::connect_with_cid_port(cid, port)
+    let raw_stream = vsock::VsockStream::connect_with_cid_port(cid, port)
         .with_context(|| format!("vsock connect to CID {cid}:{port} failed"))?;
-    let ws_url = format!("ws://vsock{path}");
-    Ok((Stream::Vsock(stream), ws_url, None))
+
+    if use_tls {
+        let connector = build_ssl_connector()?;
+        // vsock has no hostnames - skip hostname verification but still
+        // verify the peer certificate against the CA chain
+        let mut config = connector.configure().context("SSL configure for vsock")?;
+        config.set_verify_hostname(false);
+        let tls_stream = config.connect("vsock", raw_stream).context(
+            "TLS handshake over vsock failed: check client cert if server requires mTLS",
+        )?;
+        let tls_channel_binding = Some(varlink_http_bridge::export_tls_channel_binding(
+            tls_stream.ssl(),
+        ));
+        let ws_url = format!("wss://vsock{path}");
+        Ok((Stream::TlsVsock(tls_stream), ws_url, tls_channel_binding))
+    } else {
+        let ws_url = format!("ws://vsock{path}");
+        Ok((Stream::Vsock(raw_stream), ws_url, None))
+    }
 }
 
 fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
@@ -211,8 +236,11 @@ fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
 fn connect_ws(url: &str) -> Result<Ws> {
     use tungstenite::client::IntoClientRequest;
 
-    let (stream, ws_url, tls_channel_binding) = if url.starts_with("vsock://") {
-        connect_vsock(url)?
+    let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")
+    {
+        connect_vsock(&format!("vsock://{rest}"), true)?
+    } else if url.starts_with("vsock://") {
+        connect_vsock(url, false)?
     } else {
         connect_tcp(url)?
     };

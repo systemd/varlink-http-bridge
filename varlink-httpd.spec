@@ -67,6 +67,7 @@ DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 %{_prefix}/lib/systemd/varlink-bridges/ws
 %{_prefix}/lib/systemd/varlink-bridges/wss
 %{_prefix}/lib/systemd/varlink-bridges/vsock
+%{_prefix}/lib/systemd/varlink-bridges/vsock+tls
 
 %changelog
 %autochangelog
