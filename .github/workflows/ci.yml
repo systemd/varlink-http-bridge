@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: systemd/mkosi@56d5ed4247deb3d0b11f7a6aec5a1a9f580ccde5
+      - uses: systemd/mkosi@854881dffca6b8ee53c3ccd57c1401f7b3101a88
       - name: Build RPM
         run: mkosi
       - name: Verify RPM contents
