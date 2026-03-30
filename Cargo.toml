@@ -35,7 +35,9 @@ regex-lite = "0.1"
 listenfd = "1.0.2"
 tungstenite = "0.29"
 rustix = { version = "1.0", features = ["event", "net", "process"] }
-tokio-vsock = { version = "0.7", features = ["axum08"] }
+# TODO: switch back to crates.io once tokio-vsock releases a version with
+# From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
+tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086", features = ["axum08"] }
 vsock = "0.5"
 signal-hook = "0.4"
 socket2 = "0.6"

@@ -20,7 +20,7 @@ use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -967,9 +967,7 @@ fn listener_from_activated_fd(
     let addr = rustix::net::getsockname(fd.as_fd())?;
     match addr.address_family() {
         rustix::net::AddressFamily::VSOCK => {
-            // TODO: use VsockListener::from(fd) once tokio-vsock has From<OwnedFd>
-            // c.f. https://github.com/rust-vsock/tokio-vsock/pull/72
-            let listener = unsafe { VsockListener::from_raw_fd(fd.into_raw_fd()) };
+            let listener = VsockListener::from(fd);
             Ok((Transport::Vsock(listener), tls_acceptor))
         }
         rustix::net::AddressFamily::INET | rustix::net::AddressFamily::INET6 => {
