@@ -193,6 +193,60 @@ $ varlink --bridge "websocat --binary ws://localhost:1031/ws/sockets/io.systemd.
 
 ```
 
+## vsock transport
+
+The bridge supports AF_VSOCK as an alternative to TCP, allowing
+host-to-guest communication without a network. vsock traffic cannot
+be sniffed on the network, but any process on the host can connect
+to a guest's vsock port, so authentication is still required (mTLS
+or SSH key auth).
+
+### SSH key auth over vsock
+
+vsock with SSH key auth works without TLS - the transport is not
+sniffable so the lack of encryption is acceptable:
+
+```console
+# Server (inside the guest):
+$ varlink-httpd --bind=vsock --authorized-keys=~/.ssh/authorized_keys
+
+# Client (on the host):
+$ varlinkctl call vsock://3/ws/sockets/io.systemd.Hostname \
+    io.systemd.Hostname.Describe '{}'
+```
+
+### mTLS over vsock
+
+Server (inside the guest):
+
+```console
+$ varlink-httpd --bind=vsock \
+    --cert=server.pem --key=server-key.pem --trust=ca.pem
+```
+
+Client (on the host), using `vsock+tls://`:
+
+```console
+$ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
+    io.systemd.Hostname.Describe '{}'
+```
+
+The client looks for its certificate and key in the same config
+directories as for TCP (see [Client (varlinkctl-http)](#client-varlinkctl-http)
+below). CID 3+ are guests; CID 2 is the host.
+
+### systemd socket activation
+
+A socket-activated unit is provided for VMs. Enable it inside the guest:
+
+```console
+# systemctl enable --now varlink-httpd-vsock.socket
+```
+
+The socket unit uses `ConditionVirtualization=vm`, so it only activates
+inside a VM. On bare metal or the host it is silently skipped. The
+daemon starts on demand when the first vsock connection arrives.
+
 ## TLS / mTLS
 
 TLS flag names follow the systemd convention.

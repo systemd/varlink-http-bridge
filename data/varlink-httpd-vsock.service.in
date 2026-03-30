@@ -1,0 +1,16 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of varlink-http-bridge.
+
+[Unit]
+Description=Varlink HTTP Bridge (vsock)
+DefaultDependencies=no
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=@bindir@/varlink-httpd
+
+# SSH authorized keys (see systemd.system-credentials(7))
+ImportCredential=ssh.authorized_keys.root
+ImportCredential=ssh.ephemeral-authorized_keys-all
