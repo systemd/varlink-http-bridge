@@ -329,7 +329,7 @@ fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
         .join(", ")
 }
 
-fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: std::net::SocketAddr) {
+fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &std::net::SocketAddr) {
     match ssl.peer_certificate() {
         Some(cert) => {
             let subject = format_x509_subject(&cert);
@@ -339,43 +339,83 @@ fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: std::net::SocketAddr) {
     }
 }
 
-struct TlsListener {
-    inner: TcpListener,
-    acceptor: openssl::ssl::SslAcceptor,
+/// Perform a TLS handshake on an already-accepted stream.
+async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    acceptor: &openssl::ssl::SslAcceptor,
+    stream: S,
+) -> anyhow::Result<tokio_openssl::SslStream<S>> {
+    let ssl = openssl::ssl::Ssl::new(acceptor.context()).context("SSL context error")?;
+    let mut tls_stream =
+        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
+    std::pin::Pin::new(&mut tls_stream)
+        .accept()
+        .await
+        .context("TLS handshake failed")?;
+    Ok(tls_stream)
 }
 
-impl axum::serve::Listener for TlsListener {
-    type Io = tokio_openssl::SslStream<tokio::net::TcpStream>;
-    type Addr = std::net::SocketAddr;
+/// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
+/// so a slow or stalled client cannot block other connections. A background task
+/// accepts raw connections and spawns a task per handshake; completed TLS streams
+/// are delivered through an mpsc channel.
+struct AsyncTlsListener<L: axum::serve::Listener> {
+    local_addr: L::Addr,
+    receiver: tokio::sync::mpsc::Receiver<(tokio_openssl::SslStream<L::Io>, L::Addr)>,
+}
+
+impl<L> AsyncTlsListener<L>
+where
+    L: axum::serve::Listener + Send + 'static,
+    L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    L::Addr: Clone + Send + std::fmt::Display + 'static,
+{
+    fn new(mut inner: L, acceptor: openssl::ssl::SslAcceptor) -> std::io::Result<Self> {
+        let local_addr = inner.local_addr()?;
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, addr) = inner.accept().await;
+                let tx = tx.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match tls_accept(&acceptor, stream).await {
+                        Ok(tls_stream) => {
+                            if tx.send((tls_stream, addr)).await.is_err() {
+                                warn!("TLS listener receiver dropped");
+                            }
+                        }
+                        Err(e) => warn!("TLS handshake from {addr}: {e:#}"),
+                    }
+                });
+            }
+        });
+
+        Ok(Self {
+            local_addr,
+            receiver: rx,
+        })
+    }
+}
+
+impl<L> axum::serve::Listener for AsyncTlsListener<L>
+where
+    L: axum::serve::Listener + Send + 'static,
+    L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    L::Addr: Clone + Send + 'static,
+{
+    type Io = tokio_openssl::SslStream<L::Io>;
+    type Addr = L::Addr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, addr) = accept_and_configure(&self.inner).await;
-            let res: anyhow::Result<_> = async {
-                let ssl =
-                    openssl::ssl::Ssl::new(self.acceptor.context()).context("SSL context error")?;
-                let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)
-                    .context("SSL stream creation failed")?;
-                std::pin::Pin::new(&mut tls_stream)
-                    .accept()
-                    .await
-                    .context("TLS handshake failed")?;
-                Ok((tls_stream, addr))
-            }
-            .await;
-
-            match res {
-                Ok((tls_stream, addr)) => {
-                    log_tls_connection(tls_stream.ssl(), addr);
-                    return (tls_stream, addr);
-                }
-                Err(e) => warn!("{e}"),
-            }
-        }
+        self.receiver
+            .recv()
+            .await
+            .expect("TLS accept loop terminated unexpectedly")
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
+        Ok(self.local_addr.clone())
     }
 }
 
@@ -396,10 +436,11 @@ impl axum::serve::Listener for PlainListener {
     }
 }
 
-impl Connected<IncomingStream<'_, TlsListener>> for VarlinkConnCache {
-    fn connect_info(target: IncomingStream<'_, TlsListener>) -> Self {
-        let tls_channel_binding =
-            varlink_http_bridge::export_tls_channel_binding(target.io().ssl());
+impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkConnCache {
+    fn connect_info(target: IncomingStream<'_, AsyncTlsListener<PlainListener>>) -> Self {
+        let ssl = target.io().ssl();
+        log_tls_connection(ssl, target.remote_addr());
+        let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
         Self::new(Some(tls_channel_binding))
     }
 }
@@ -868,11 +909,8 @@ async fn run_server(
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
     if let Some(acceptor) = tls_acceptor {
-        let tls_listener = TlsListener {
-            inner: listener,
-            acceptor,
-        };
-        axum::serve(tls_listener, make_svc)
+        let plain = PlainListener { inner: listener };
+        axum::serve(AsyncTlsListener::new(plain, acceptor)?, make_svc)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
     } else {
