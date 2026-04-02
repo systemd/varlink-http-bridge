@@ -73,14 +73,22 @@ impl IntoResponse for AppError {
 impl From<zlink::Error> for AppError {
     fn from(e: zlink::Error) -> Self {
         use zlink::varlink_service;
+        let mut message = None;
         let status = match &e {
             zlink::Error::SocketRead
             | zlink::Error::SocketWrite
             | zlink::Error::UnexpectedEof
             | zlink::Error::Io(..) => StatusCode::BAD_GATEWAY,
             zlink::Error::VarlinkService(owned) => match owned.inner() {
-                varlink_service::Error::InvalidParameter { .. }
-                | varlink_service::Error::ExpectedMore => StatusCode::BAD_REQUEST,
+                varlink_service::Error::InvalidParameter { .. } => StatusCode::BAD_REQUEST,
+                varlink_service::Error::ExpectedMore => {
+                    message = Some(
+                        "This method requires the varlink 'more' flag. \
+                         Use Accept: application/json-seq to enable streaming."
+                            .to_string(),
+                    );
+                    StatusCode::BAD_REQUEST
+                }
                 varlink_service::Error::MethodNotFound { .. }
                 | varlink_service::Error::InterfaceNotFound { .. } => StatusCode::NOT_FOUND,
                 varlink_service::Error::MethodNotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -90,7 +98,7 @@ impl From<zlink::Error> for AppError {
         };
         Self {
             status,
-            message: e.to_string(),
+            message: message.unwrap_or(e.to_string()),
         }
     }
 }
