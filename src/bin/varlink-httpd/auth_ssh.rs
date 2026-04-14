@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use log::{debug, info, warn};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
 
 struct KeyCache {
     keys: HashMap<String, PublicKey>,
-    mtime: SystemTime,
+    mtimes: HashMap<String, SystemTime>,
 }
 
 /// Tracks recently seen nonces to prevent replay attacks.
@@ -65,32 +65,27 @@ impl NonceStore {
 }
 
 pub(crate) struct SshKeyAuthenticator {
-    path: String,
+    paths: Vec<String>,
     max_skew: u64,
     authorized_keys: Mutex<KeyCache>,
     nonces: Mutex<NonceStore>,
 }
 
 impl SshKeyAuthenticator {
-    pub(crate) fn new(path: &str) -> anyhow::Result<Self> {
-        let keys = Self::load_keys(path)?;
-        // XXX: should we make it a warning only? the file can dynamically
-        // get updated so it could be okay to start empty. OTOH ppl might
-        // be surprised by it.
+    pub(crate) fn new(paths: Vec<String>) -> anyhow::Result<Self> {
+        let (keys, mtimes) = Self::load_all_keys(&paths)?;
         if keys.is_empty() {
-            bail!(
-                "no supported SSH public keys in {path} (note: RSA is not supported, use Ed25519 or ECDSA)"
+            warn!(
+                "no supported SSH public keys in {} (note: RSA is not supported, use Ed25519 or ECDSA); SSH auth will reject all requests until keys appear",
+                paths.join(", "),
             );
         }
-        let mtime = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .with_context(|| format!("failed to stat {path}"))?;
 
         let max_skew = 60;
         Ok(Self {
-            path: path.to_string(),
+            paths,
             max_skew,
-            authorized_keys: Mutex::new(KeyCache { keys, mtime }),
+            authorized_keys: Mutex::new(KeyCache { keys, mtimes }),
             nonces: Mutex::new(NonceStore::new(max_skew)),
         })
     }
@@ -132,50 +127,108 @@ impl SshKeyAuthenticator {
         Ok(keys)
     }
 
-    /// Reload the `authorized_keys` file if its mtime has changed.
-    fn maybe_reload(&self) {
-        let current_mtime = match std::fs::metadata(&self.path).and_then(|m| m.modified()) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "cannot stat {path}: {e}, keeping cached keys",
-                    path = self.path
-                );
-                return;
-            }
-        };
+    /// Load and merge keys from all paths, returning the merged key map
+    /// and a path->mtime map.  Files that do not (yet) exist are silently
+    /// skipped; they will be picked up by `maybe_reload` once they appear.
+    fn load_all_keys(
+        paths: &[String],
+    ) -> anyhow::Result<(HashMap<String, PublicKey>, HashMap<String, SystemTime>)> {
+        let mut all_keys = HashMap::new();
+        let mut mtimes = HashMap::new();
 
+        for path in paths {
+            let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    info!("authorized keys file {path} does not exist yet, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!("failed to stat {path}")));
+                }
+            };
+            let keys = Self::load_keys(path)?;
+            all_keys.extend(keys);
+            mtimes.insert(path.clone(), mtime);
+        }
+
+        Ok((all_keys, mtimes))
+    }
+
+    /// Stat a path, folding `NotFound` into `Ok(None)` so missing files are
+    /// treated as "tracked absence" rather than a hard error.
+    fn stat_mtime(path: &str) -> std::io::Result<Option<SystemTime>> {
+        match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ok(true) if any tracked path's mtime differs from the cache;
+    /// Err carries the path that failed a transient stat so the caller can log it.
+    fn any_mtime_changed(
+        &self,
+        cached: &HashMap<String, SystemTime>,
+    ) -> Result<bool, (String, std::io::Error)> {
+        for path in &self.paths {
+            let mtime = Self::stat_mtime(path).map_err(|e| (path.clone(), e))?;
+            if mtime.as_ref() != cached.get(path) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reload authorized key files whose mtime has changed.
+    fn maybe_reload(&self) {
         // note that we could use an RWLock here but its probably not worth it
         let mut ak = self.authorized_keys.lock().unwrap();
-        if ak.mtime == current_mtime {
-            return;
+
+        match self.any_mtime_changed(&ak.mtimes) {
+            Ok(false) => {}
+            Ok(true) => self.reload_keys(&mut ak),
+            Err((path, e)) => {
+                // Transient error (permissions, IO): skip this reload cycle
+                // rather than risk dropping valid keys. Retry next request.
+                warn!("cannot stat {path}: {e}, skipping reload (keeping cached keys)");
+            }
+        }
+    }
+
+    /// Reload all tracked paths into `ak`, replacing its cached keys and mtimes.
+    fn reload_keys(&self, ak: &mut KeyCache) {
+        let mut merged_keys = HashMap::new();
+        let mut new_mtimes = HashMap::new();
+        for path in &self.paths {
+            let Ok(Some(mtime)) = Self::stat_mtime(path) else {
+                continue; // file is gone or unreadable; drop its cached keys
+            };
+            match Self::load_keys(path) {
+                Ok(keys) => {
+                    info!(
+                        "reloaded {count} SSH key(s) from {path} (file changed)",
+                        count = keys.len(),
+                    );
+                    merged_keys.extend(keys);
+                }
+                Err(e) => {
+                    warn!("failed to reload {path}: {e:#}, skipping this source");
+                }
+            }
+            new_mtimes.insert(path.clone(), mtime);
         }
 
-        match Self::load_keys(&self.path) {
-            Ok(keys) => {
-                info!(
-                    "reloaded {count} SSH key(s) from {path} (file changed)",
-                    count = keys.len(),
-                    path = self.path,
-                );
-                if keys.is_empty() {
-                    warn!(
-                        "authorized keys file {path} is empty, SSH auth will reject all requests",
-                        path = self.path,
-                    );
-                }
-                ak.keys = keys;
-                ak.mtime = current_mtime;
-            }
-            Err(e) => {
-                warn!(
-                    "failed to reload {path}: {e:#}, clearing keys (fail closed)",
-                    path = self.path,
-                );
-                ak.keys.clear();
-                ak.mtime = current_mtime;
-            }
+        if merged_keys.is_empty() {
+            warn!("all authorized key sources are empty, SSH auth will reject all requests");
         }
+        ak.keys = merged_keys;
+        ak.mtimes = new_mtimes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_for_test(&self) {
+        self.maybe_reload();
     }
 }
 
@@ -184,7 +237,7 @@ impl std::fmt::Debug for SshKeyAuthenticator {
         let ak = self.authorized_keys.lock().unwrap();
         let fingerprints: Vec<&str> = ak.keys.keys().map(String::as_str).collect();
         f.debug_struct("SshKeyAuthenticator")
-            .field("path", &self.path)
+            .field("paths", &self.paths)
             .field("max_skew", &self.max_skew)
             .field("fingerprints", &fingerprints)
             .finish_non_exhaustive()
@@ -207,36 +260,38 @@ const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
     "ssh.ephemeral-authorized_keys-all",
 ];
 
-pub(crate) fn maybe_create_ssh_authenticator(
+pub(crate) fn create_ssh_authenticator(
     cli_authorized_keys: Option<String>,
     creds_dir: Option<&std::path::Path>,
     root: &std::path::Path,
-) -> anyhow::Result<Option<SshKeyAuthenticator>> {
-    fn exists(p: &std::path::Path) -> Option<String> {
-        p.exists().then(|| p.to_string_lossy().to_string())
-    }
-
-    // Priority: explicit CLI > /etc config > $CREDENTIALS_DIRECTORY
-    // (ImportCredential= in the unit file handles system-wide credentials)
-    let authorized_keys_path = cli_authorized_keys
-        .or_else(|| exists(&root.join("etc/varlink-httpd/authorized_keys")))
-        .or_else(|| {
-            creds_dir.and_then(|d| {
-                SSH_AUTHORIZED_KEYS_CREDENTIALS
-                    .iter()
-                    .find_map(|name| exists(&d.join(name)))
-            })
-        });
-
-    let Some(ak_path) = authorized_keys_path else {
-        return Ok(None);
+) -> anyhow::Result<SshKeyAuthenticator> {
+    let paths: Vec<String> = if let Some(cli_path) = cli_authorized_keys {
+        // Explicit CLI path overrides all auto-discovery
+        vec![cli_path]
+    } else {
+        // Register all well-known sources; files that don't exist yet
+        // will be picked up by maybe_reload() once they appear.
+        let mut paths = Vec::new();
+        paths.push(
+            root.join("etc/varlink-httpd/authorized_keys")
+                .to_string_lossy()
+                .to_string(),
+        );
+        if let Some(d) = creds_dir {
+            for name in SSH_AUTHORIZED_KEYS_CREDENTIALS {
+                paths.push(d.join(name).to_string_lossy().to_string());
+            }
+        }
+        paths
     };
-    let ssh_auth = SshKeyAuthenticator::new(&ak_path)?;
+
+    let ssh_auth = SshKeyAuthenticator::new(paths.clone())?;
     info!(
-        "Authenticator: adding SSH authorized keys ({count} keys from {ak_path})",
-        count = ssh_auth.key_count()
+        "Authenticator: adding SSH authorized keys ({count} keys from {sources})",
+        count = ssh_auth.key_count(),
+        sources = paths.join(", "),
     );
-    Ok(Some(ssh_auth))
+    Ok(ssh_auth)
 }
 
 impl Authenticator for SshKeyAuthenticator {
