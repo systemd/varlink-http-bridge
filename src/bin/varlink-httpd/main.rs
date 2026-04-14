@@ -1066,11 +1066,11 @@ async fn main() -> anyhow::Result<()> {
         authenticators.push(Box::new(ssh_auth));
     }
 
-    if authenticators.is_empty() && !has_mtls && !cli.insecure {
-        bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
-    }
-    if cli.insecure && authenticators.is_empty() && !has_mtls {
+    if cli.insecure {
+        authenticators.clear();
         eprintln!("WARNING: running without authentication - all routes are open");
+    } else if authenticators.is_empty() && !has_mtls {
+        bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
     }
 
     let local_addr = listener.local_addr()?;
