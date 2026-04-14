@@ -476,6 +476,7 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     if state.authenticators.is_empty() {
+        debug!("auth: no authenticators configured, allowing request");
         return next.run(request).await;
     }
 
@@ -483,6 +484,7 @@ async fn auth_middleware(
         Some(val) => match val.to_str() {
             Ok(s) => s.to_string(),
             Err(_) => {
+                debug!("auth: invalid Authorization header encoding");
                 return (
                     StatusCode::BAD_REQUEST,
                     axum::Json(json!({"error": "invalid Authorization header encoding"})),
@@ -491,6 +493,10 @@ async fn auth_middleware(
             }
         },
         None => {
+            debug!(
+                "auth: no Authorization header in request to {}",
+                request.uri()
+            );
             return (
                 StatusCode::UNAUTHORIZED,
                 axum::Json(json!({"error": "missing Authorization header"})),
@@ -513,6 +519,8 @@ async fn auth_middleware(
         .map_or(request.uri().path(), axum::http::uri::PathAndQuery::as_str)
         .to_string();
 
+    debug!("auth: checking {method} {path} (nonce={nonce:?}, tls_cb={tls_channel_binding:?})");
+
     let mut errors = Vec::new();
     for authenticator in state.authenticators.iter() {
         match authenticator.check_request(
@@ -522,14 +530,19 @@ async fn auth_middleware(
             nonce.as_deref(),
             tls_channel_binding.as_deref(),
         ) {
-            Ok(()) => return next.run(request).await,
+            Ok(()) => {
+                debug!("auth: accepted {method} {path}");
+                return next.run(request).await;
+            }
             Err(e) => errors.push(e.to_string()),
         }
     }
 
+    let joined = errors.join("; ");
+    debug!("auth: rejected {method} {path}: {joined}");
     (
         StatusCode::UNAUTHORIZED,
-        axum::Json(json!({"error": errors.join("; ")})),
+        axum::Json(json!({"error": joined})),
     )
         .into_response()
 }

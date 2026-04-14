@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use anyhow::{Context, bail};
-use log::{info, warn};
+use log::{debug, info, warn};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -122,6 +122,10 @@ impl SshKeyAuthenticator {
                 continue;
             }
             let fp = key.fingerprint(HashAlg::Sha256).to_string();
+            debug!(
+                "  authorized key: {fp} ({comment})",
+                comment = key.comment()
+            );
             keys.insert(fp, key);
         }
 
