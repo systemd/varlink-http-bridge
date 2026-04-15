@@ -1,0 +1,14 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of varlink-http-bridge.
+
+[Unit]
+Description=Varlink HTTP Bridge (TCP)
+
+[Socket]
+ListenStream=0.0.0.0:1031
+FileDescriptorName=tcp
+Service=varlink-httpd.service
+
+[Install]
+WantedBy=sockets.target
