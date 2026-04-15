@@ -226,15 +226,23 @@ CID 2 is always the host. Guest CIDs (3+) are assigned by the VMM.
 
 ### systemd socket activation
 
-A socket-activated unit is provided for VMs. Enable it inside the guest:
+Two socket units are shipped, both backed by the same
+`varlink-httpd.service`:
+
+- `varlink-httpd.socket` listens on TCP `0.0.0.0:1031`.
+- `varlink-httpd-vsock.socket` listens on `vsock::1031` and has
+  `ConditionVirtualization=vm`, so it only activates inside a VM. On
+  bare metal or the host it is silently skipped, which makes it safe
+  to enable unconditionally.
+
+Enable whichever sockets you want; if both are enabled, systemd passes
+both listening fds to the service on activation, so the daemon listens
+on both transports regardless of which connection arrives first. The
+daemon starts on demand when the first connection arrives.
 
 ```console
-# systemctl enable --now varlink-httpd-vsock.socket
+# systemctl enable --now varlink-httpd.socket varlink-httpd-vsock.socket
 ```
-
-The socket unit uses `ConditionVirtualization=vm`, so it only activates
-inside a VM. On bare metal or the host it is silently skipped. The
-daemon starts on demand when the first vsock connection arrives.
 
 ## TLS / mTLS
 

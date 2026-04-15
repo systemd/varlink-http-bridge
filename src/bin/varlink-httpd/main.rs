@@ -999,20 +999,11 @@ async fn listener_from_bind_addr(
     }
 }
 
-async fn start_server(
+async fn serve_listener(
     listener: Transport,
     tls_acceptor: Option<openssl::ssl::SslAcceptor>,
-    varlink_sockets_path: &str,
-    authenticators: Vec<Box<dyn Authenticator>>,
+    app: Router,
 ) -> anyhow::Result<()> {
-    let scheme = if tls_acceptor.is_some() {
-        "HTTPS"
-    } else {
-        "HTTP"
-    };
-    eprintln!("Forwarding {scheme} {listener} -> Varlink: {varlink_sockets_path}");
-
-    let app = create_router(varlink_sockets_path, authenticators)?;
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
     match (listener, tls_acceptor) {
@@ -1038,6 +1029,17 @@ async fn start_server(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+async fn start_server(
+    listener: Transport,
+    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+    varlink_sockets_path: &str,
+    authenticators: Vec<Box<dyn Authenticator>>,
+) -> anyhow::Result<()> {
+    let app = create_router(varlink_sockets_path, authenticators)?;
+    serve_listener(listener, tls_acceptor, app).await
 }
 
 #[derive(Debug)]
@@ -1124,7 +1126,7 @@ impl std::str::FromStr for BindAddr {
 
 #[derive(Debug)]
 struct BridgeCli {
-    bind: BindAddr,
+    binds: Vec<BindAddr>,
     varlink_sockets_path: String,
     cert: Option<String>,
     key: Option<String>,
@@ -1149,7 +1151,8 @@ fn print_help() {
         Bridge options:
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
                                             (default: /run/varlink/registry)
-          --bind=ADDR                       address to bind to (default: 0.0.0.0:{DEFAULT_PORT})
+          --bind=ADDR                       address to bind to (repeatable;
+                                            default: 0.0.0.0:{DEFAULT_PORT})
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
           --cert=PATH                       TLS certificate PEM file
           --key=PATH                        TLS private key PEM file
@@ -1180,7 +1183,7 @@ fn print_import_ssh_help() {
 fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 
-    let mut bind_str = format!("0.0.0.0:{DEFAULT_PORT}");
+    let mut bind_strs: Vec<String> = Vec::new();
     let mut varlink_sockets_path = String::from("/run/varlink/registry");
     let mut cert = None;
     let mut key = None;
@@ -1192,7 +1195,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
         match arg {
-            Long("bind") => bind_str = parser.value()?.parse()?,
+            Long("bind") => bind_strs.push(parser.value()?.parse()?),
             Long("cert") => cert = Some(parser.value()?.parse()?),
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
@@ -1218,10 +1221,16 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
-    let bind: BindAddr = bind_str.parse()?;
+    if bind_strs.is_empty() {
+        bind_strs.push(format!("0.0.0.0:{DEFAULT_PORT}"));
+    }
+    let binds: Vec<BindAddr> = bind_strs
+        .iter()
+        .map(|s| s.parse())
+        .collect::<Result<_, _>>()?;
 
     Ok(Command::Bridge(BridgeCli {
-        bind,
+        binds,
         varlink_sockets_path,
         cert,
         key,
@@ -1299,35 +1308,61 @@ async fn main() -> anyhow::Result<()> {
         bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
     }
 
-    // Socket activation: detect fd type (TCP vs vsock) or fall back to explicit --bind
-    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
-    let mut listenfd = ListenFd::from_env();
+    let app = create_router(&cli.varlink_sockets_path, authenticators)?;
 
-    // Check for socket-activated fd first
-    if let Some(raw_fd) = listenfd.take_raw_fd(0)? {
-        // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        let (listener, tls_acceptor) = listener_from_activated_fd(fd, tls_acceptor)?;
-        eprintln!("Varlink proxy started (socket-activated)");
-        return start_server(
-            listener,
-            tls_acceptor,
-            &cli.varlink_sockets_path,
-            authenticators,
-        )
-        .await;
+    let scheme = if tls_acceptor.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
+
+    // Socket activation: consume all activated fds, or fall back to explicit --bind
+    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
+    let mut listeners: Vec<(Transport, Option<openssl::ssl::SslAcceptor>)> = Vec::new();
+    let mut listenfd = ListenFd::from_env();
+    for idx in 0..listenfd.len() {
+        if let Some(raw_fd) = listenfd.take_raw_fd(idx)? {
+            // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            listeners.push(listener_from_activated_fd(fd, tls_acceptor.clone())?);
+        }
     }
 
-    // No socket activation: bind explicitly based on --bind (or default)
-    let listener = listener_from_bind_addr(cli.bind).await?;
-    eprintln!("Varlink proxy started");
-    start_server(
-        listener,
-        tls_acceptor,
-        &cli.varlink_sockets_path,
-        authenticators,
-    )
-    .await
+    if listeners.is_empty() {
+        // No socket activation: bind explicitly based on --bind (or default)
+        for bind in cli.binds {
+            let listener = listener_from_bind_addr(bind).await?;
+            listeners.push((listener, tls_acceptor.clone()));
+        }
+    } else {
+        eprintln!("Varlink proxy started (socket-activated)");
+    }
+
+    if listeners.len() == 1 {
+        let (listener, tls) = listeners.pop().expect("checked len");
+        eprintln!(
+            "Forwarding {scheme} {listener} -> Varlink: {}",
+            cli.varlink_sockets_path
+        );
+        return serve_listener(listener, tls, app).await;
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (listener, tls) in listeners {
+        eprintln!(
+            "Forwarding {scheme} {listener} -> Varlink: {}",
+            cli.varlink_sockets_path
+        );
+        let app_clone = app.clone();
+        join_set.spawn(async move { serve_listener(listener, tls, app_clone).await });
+    }
+
+    // Wait for all listeners; propagate the first error
+    while let Some(result) = join_set.join_next().await {
+        result??;
+    }
+
+    Ok(())
 }
 #[cfg(test)]
 mod tests;
