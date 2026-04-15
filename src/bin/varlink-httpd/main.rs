@@ -519,6 +519,16 @@ trait Authenticator: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// Extract the Authorization header value, if present and valid UTF-8.
+fn extract_auth_header(request: &axum::http::Request<Body>) -> Option<String> {
+    request
+        .headers()
+        .get("authorization")?
+        .to_str()
+        .ok()
+        .map(String::from)
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
@@ -529,29 +539,16 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let auth_header = match request.headers().get("authorization") {
-        Some(val) => match val.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("auth: invalid Authorization header encoding");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({"error": "invalid Authorization header encoding"})),
-                )
-                    .into_response();
-            }
-        },
-        None => {
-            debug!(
-                "auth: no Authorization header in request to {}",
-                request.uri()
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(json!({"error": "missing Authorization header"})),
-            )
-                .into_response();
-        }
+    let Some(auth_header) = extract_auth_header(&request) else {
+        debug!(
+            "auth: missing or invalid Authorization header in request to {}",
+            request.uri()
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": "missing Authorization header"})),
+        )
+            .into_response();
     };
 
     let nonce = extract_nonce(request.headers());
