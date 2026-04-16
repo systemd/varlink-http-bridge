@@ -32,6 +32,8 @@ fn maybe_add_auth_headers(
 enum Stream {
     Plain(TcpStream),
     Tls(openssl::ssl::SslStream<TcpStream>),
+    Vsock(vsock::VsockStream),
+    TlsVsock(openssl::ssl::SslStream<vsock::VsockStream>),
 }
 
 impl Read for Stream {
@@ -39,6 +41,8 @@ impl Read for Stream {
         match self {
             Stream::Plain(s) => s.read(buf),
             Stream::Tls(s) => s.read(buf),
+            Stream::Vsock(s) => s.read(buf),
+            Stream::TlsVsock(s) => s.read(buf),
         }
     }
 }
@@ -48,6 +52,8 @@ impl Write for Stream {
         match self {
             Stream::Plain(s) => s.write(buf),
             Stream::Tls(s) => s.write(buf),
+            Stream::Vsock(s) => s.write(buf),
+            Stream::TlsVsock(s) => s.write(buf),
         }
     }
 
@@ -55,18 +61,53 @@ impl Write for Stream {
         match self {
             Stream::Plain(s) => s.flush(),
             Stream::Tls(s) => s.flush(),
+            Stream::Vsock(s) => s.flush(),
+            Stream::TlsVsock(s) => s.flush(),
+        }
+    }
+}
+
+impl Stream {
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.set_nonblocking(nonblocking),
+            Stream::Tls(s) => s.get_ref().set_nonblocking(nonblocking),
+            Stream::Vsock(s) => s.set_nonblocking(nonblocking),
+            Stream::TlsVsock(s) => s.get_ref().set_nonblocking(nonblocking),
+        }
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.set_read_timeout(dur),
+            Stream::Tls(s) => s.get_ref().set_read_timeout(dur),
+            Stream::Vsock(s) => s.set_read_timeout(dur),
+            Stream::TlsVsock(s) => s.get_ref().set_read_timeout(dur),
+        }
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.set_write_timeout(dur),
+            Stream::Tls(s) => s.get_ref().set_write_timeout(dur),
+            Stream::Vsock(s) => s.set_write_timeout(dur),
+            Stream::TlsVsock(s) => s.get_ref().set_write_timeout(dur),
+        }
+    }
+}
+
+impl std::os::fd::AsFd for Stream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            Stream::Plain(s) => s.as_fd(),
+            Stream::Tls(s) => s.get_ref().as_fd(),
+            Stream::Vsock(s) => s.as_fd(),
+            Stream::TlsVsock(s) => s.get_ref().as_fd(),
         }
     }
 }
 
 type Ws = WebSocket<Stream>;
-
-fn ws_tcp_stream(ws: &Ws) -> &TcpStream {
-    match ws.get_ref() {
-        Stream::Plain(s) => s,
-        Stream::Tls(s) => s.get_ref(),
-    }
-}
 
 /// Build an `SslConnector` with client certs and a custom CA loaded from the
 /// first existing directory:
@@ -112,9 +153,50 @@ fn build_ssl_connector() -> Result<SslConnector> {
     Ok(builder.build())
 }
 
-fn connect_ws(url: &str) -> Result<Ws> {
-    use tungstenite::client::IntoClientRequest;
+/// Parse a `vsock://CID:PORT/path` URL.
+///
+/// The port defaults to [`varlink_http_bridge::DEFAULT_PORT`] if omitted (`vsock://CID/path`).
+fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
+    let rest = url
+        .strip_prefix("vsock://")
+        .ok_or_else(|| anyhow::anyhow!("not a vsock:// URL"))?;
 
+    // Split authority from path
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+
+    let (cid, port) = varlink_http_bridge::parse_vsock_cid_port(authority)?;
+    Ok((cid, port, path.to_string()))
+}
+
+fn connect_vsock(url: &str, use_tls: bool) -> Result<(Stream, String, Option<String>)> {
+    let (cid, port, path) = parse_vsock_url(url)?;
+    let raw_stream = vsock::VsockStream::connect_with_cid_port(cid, port)
+        .with_context(|| format!("vsock connect to CID {cid}:{port} failed"))?;
+
+    if use_tls {
+        let connector = build_ssl_connector()?;
+        // vsock has no hostnames - skip hostname verification but still
+        // verify the peer certificate against the CA chain
+        let mut config = connector.configure().context("SSL configure for vsock")?;
+        config.set_verify_hostname(false);
+        let tls_stream = config.connect("vsock", raw_stream).context(
+            "TLS handshake over vsock failed: check client cert if server requires mTLS",
+        )?;
+        let tls_channel_binding = Some(varlink_http_bridge::export_tls_channel_binding(
+            tls_stream.ssl(),
+        ));
+        let ws_url = format!("wss://vsock{path}");
+        Ok((Stream::TlsVsock(tls_stream), ws_url, tls_channel_binding))
+    } else {
+        let ws_url = format!("ws://vsock{path}");
+        Ok((Stream::Vsock(raw_stream), ws_url, None))
+    }
+}
+
+fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
     let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -145,23 +227,37 @@ fn connect_ws(url: &str) -> Result<Ws> {
         Stream::Tls(ssl_stream) => Some(varlink_http_bridge::export_tls_channel_binding(
             ssl_stream.ssl(),
         )),
-        Stream::Plain(_) => None,
+        _ => None,
+    };
+
+    Ok((stream, ws_url, tls_channel_binding))
+}
+
+fn connect_ws(url: &str) -> Result<Ws> {
+    use tungstenite::client::IntoClientRequest;
+
+    let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")
+    {
+        connect_vsock(&format!("vsock://{rest}"), true)?
+    } else if url.starts_with("vsock://") {
+        connect_vsock(url, false)?
+    } else {
+        connect_tcp(url)?
     };
 
     // Use into_client_request() here as it auto-generates standard WS upgrade headers,
     // then we add our auth headers too
+    let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
     let mut request = ws_url
         .into_client_request()
         .context("building WS request")?;
-
     // this adds ssh auth headers if ssh-agent is available, once we have more auth methods
     // it may add more
     maybe_add_auth_headers(&mut request, &uri, tls_channel_binding.as_deref())?;
 
-    let ws_context = if use_tls {
-        "WebSocket handshake failed: check client cert if server requires mTLS"
-    } else {
-        "WebSocket handshake failed"
+    let ws_context = match &stream {
+        Stream::Tls(_) => "WebSocket handshake failed: check client cert if server requires mTLS",
+        _ => "WebSocket handshake failed",
     };
     let (ws, _) = tungstenite::client(request, stream).context(ws_context)?;
     Ok(ws)
@@ -185,10 +281,10 @@ fn forward_ws_until_would_block(ws: &mut Ws, fd3: &mut UnixStream) -> Result<boo
 }
 
 fn graceful_close(ws: &mut Ws) -> Result<()> {
-    let tcp = ws_tcp_stream(ws);
-    tcp.set_nonblocking(false)?;
-    tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let stream = ws.get_ref();
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     // close and wait up to aboves timeout
     ws.close(None)?;
@@ -233,7 +329,7 @@ fn main() -> Result<()> {
     // Set non-blocking so that we deal with incomplete websocket
     // frames in ws.read() - they return WouldBlock now and we can
     // continue when waking up from PollFd next time.
-    ws_tcp_stream(&ws).set_nonblocking(true)?;
+    ws.get_ref().set_nonblocking(true)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
@@ -247,7 +343,7 @@ fn main() -> Result<()> {
 
         let mut pollfds = [
             PollFd::new(&fd3, PollFlags::IN),
-            PollFd::new(ws_tcp_stream(&ws), PollFlags::IN),
+            PollFd::new(ws.get_ref(), PollFlags::IN),
         ];
         match poll(&mut pollfds, None) {
             // signal interrupted poll: continue to re-check shutdown flag
@@ -281,4 +377,41 @@ fn main() -> Result<()> {
         warn!("WebSocket close failed: {e:#}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_vsock_url_cid_and_port() {
+        let (cid, port, path) =
+            parse_vsock_url("vsock://2:1031/io.systemd.Manager/Describe").unwrap();
+        assert_eq!(cid, 2);
+        assert_eq!(port, 1031);
+        assert_eq!(path, "/io.systemd.Manager/Describe");
+    }
+
+    #[test]
+    fn test_parse_vsock_url_default_port() {
+        let (cid, port, path) = parse_vsock_url("vsock://2/io.systemd.Manager/Describe").unwrap();
+        assert_eq!(cid, 2);
+        assert_eq!(port, varlink_http_bridge::DEFAULT_PORT);
+        assert_eq!(path, "/io.systemd.Manager/Describe");
+    }
+
+    #[test]
+    fn test_parse_vsock_url_no_path() {
+        let (cid, port, path) = parse_vsock_url("vsock://3:5000").unwrap();
+        assert_eq!(cid, 3);
+        assert_eq!(port, 5000);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn test_parse_vsock_url_errors() {
+        assert!(parse_vsock_url("http://localhost").is_err());
+        assert!(parse_vsock_url("vsock://notanumber:1031/path").is_err());
+        assert!(parse_vsock_url("vsock://2:notaport/path").is_err());
+    }
 }

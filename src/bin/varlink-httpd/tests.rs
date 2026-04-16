@@ -81,9 +81,14 @@ async fn run_test_server_with_auth(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener, None, authenticators)
-            .await
-            .expect("server failed")
+        start_server(
+            Transport::Tcp(listener),
+            None,
+            &varlink_sockets_path,
+            authenticators,
+        )
+        .await
+        .expect("server failed")
     });
 
     (task_handle, local_addr)
@@ -423,7 +428,13 @@ async fn test_varlink_sockets_dir_or_file_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir_or_file, listener, None, Vec::new()).await;
+    let res = start_server(
+        Transport::Tcp(listener),
+        None,
+        &varlink_sockets_dir_or_file,
+        Vec::new(),
+    )
+    .await;
 
     assert!(res.is_err());
     assert!(
@@ -938,10 +949,10 @@ async fn run_test_tls_server_with_auth(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(
-            &varlink_sockets_path,
-            listener,
+        start_server(
+            Transport::Tcp(listener),
             Some(tls_acceptor),
+            &varlink_sockets_path,
             authenticators,
         )
         .await
@@ -1247,6 +1258,195 @@ fn test_format_x509_subject_multiple_fields() {
     let cert = openssl::x509::X509::from_pem(&pem).unwrap();
     let subject = format_x509_subject(&cert);
     assert_eq!(subject, "O=TestOrg, CN=multi-field");
+}
+
+// --- bind address parsing tests ---
+
+#[test]
+fn test_bind_addr_parse_defaults() {
+    // "vsock" and "vsock:" both mean CID_ANY + default port
+    for input in ["vsock", "vsock:"] {
+        let bind: BindAddr = input.parse().unwrap();
+        match bind {
+            BindAddr::Vsock { cid, port } => {
+                assert_eq!(cid, vsock::VMADDR_CID_ANY, "input: {input}");
+                assert_eq!(port, DEFAULT_PORT, "input: {input}");
+            }
+            _ => panic!("expected Vsock, got {bind:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_port_only() {
+    // "vsock::2000" -> CID_ANY, port 2000
+    let bind: BindAddr = "vsock::2000".parse().unwrap();
+    match bind {
+        BindAddr::Vsock { cid, port } => {
+            assert_eq!(cid, vsock::VMADDR_CID_ANY);
+            assert_eq!(port, 2000);
+        }
+        _ => panic!("expected Vsock"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_cid_and_port() {
+    // "vsock:5:3333" -> CID 5, port 3333
+    let bind: BindAddr = "vsock:5:3333".parse().unwrap();
+    match bind {
+        BindAddr::Vsock { cid, port } => {
+            assert_eq!(cid, 5);
+            assert_eq!(port, 3333);
+        }
+        _ => panic!("expected Vsock"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_tcp() {
+    let bind: BindAddr = "0.0.0.0:1031".parse().unwrap();
+    match bind {
+        BindAddr::Tcp(addr) => assert_eq!(addr, "0.0.0.0:1031"),
+        _ => panic!("expected Tcp"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_errors() {
+    assert!("vsock::notaport".parse::<BindAddr>().is_err());
+    assert!("vsock:abc:1031".parse::<BindAddr>().is_err());
+}
+
+// --- vsock integration tests ---
+
+/// Check if vsock loopback (CID 1) is functional.
+/// Returns false if the vsock_loopback module is not loaded.
+fn vsock_loopback_available() -> bool {
+    use std::io::Read;
+
+    let listener = match vsock::VsockListener::bind_with_cid_port(vsock::VMADDR_CID_ANY, 0) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return false,
+    };
+
+    // Spawn a thread to accept one connection so we can test connect
+    let handle = std::thread::spawn(move || {
+        listener
+            .set_nonblocking(false)
+            .expect("set_nonblocking failed");
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                let mut buf = [0u8; 1];
+                let _ = conn.read(&mut buf);
+            }
+            Err(_) => {}
+        }
+    });
+
+    let ok = vsock::VsockStream::connect_with_cid_port(1, port).is_ok();
+    // Clean up: connect success wakes the accept, connect failure means thread is stuck
+    // on accept -- drop the listener (which is moved into the thread) to unblock it
+    let _ = handle.join();
+    ok
+}
+
+async fn run_test_vsock_server(varlink_sockets_path: &str) -> (tokio::task::JoinHandle<()>, u32) {
+    // Use port 0 to get an ephemeral port
+    let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(vsock::VMADDR_CID_ANY, 0))
+        .expect("vsock bind failed");
+    let port = listener.local_addr().expect("local_addr failed").port();
+
+    let varlink_sockets_path = varlink_sockets_path.to_string();
+    let task_handle = tokio::spawn(async move {
+        start_server(
+            Transport::Vsock(listener),
+            None,
+            &varlink_sockets_path,
+            Vec::new(),
+        )
+        .await
+        .expect("vsock server failed")
+    });
+
+    (task_handle, port)
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_vsock_health_endpoint() {
+    if !vsock_loopback_available() {
+        eprintln!("SKIP: vsock loopback not available (vsock_loopback module not loaded?)");
+        return;
+    }
+
+    let (server, port) = run_test_vsock_server("/run/systemd").await;
+    defer! {
+        server.abort();
+    };
+
+    // Connect over vsock loopback (CID 1) and do a raw HTTP GET /health
+    let mut stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(1, port))
+        .await
+        .expect("vsock connect failed");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: vsock\r\n\r\n")
+        .await
+        .expect("write failed");
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 OK, got: {response}"
+    );
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlinkctl_helper_vsock_hostname_describe() {
+    if !vsock_loopback_available() {
+        eprintln!("SKIP: vsock loopback not available (vsock_loopback module not loaded?)");
+        return;
+    }
+
+    let (server, port) = run_test_vsock_server("/run/systemd").await;
+    defer! {
+        server.abort();
+    };
+
+    let bridge_url = format!("vsock://1:{port}/ws/sockets/io.systemd.Hostname");
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.Hostname.Describe",
+            "{}",
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "varlinkctl over vsock failed (stderr: {stderr})"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
+    let line = stdout.trim().trim_start_matches('\x1e');
+    let body: Value = serde_json::from_str(line).expect("invalid JSON from varlinkctl");
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(body["Hostname"], expected_hostname);
 }
 
 // --- SSH key auth tests ---

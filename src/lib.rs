@@ -11,6 +11,37 @@ pub const SSHAUTH_MAGIC_PREFIX: [u8; 8] = *b"vhbridge";
 /// token payload to prevent replay attacks.
 pub const SSHAUTH_NONCE_HEADER: &str = "x-auth-nonce";
 
+/// Default port for the HTTP bridge when listening on or connecting via vsock.
+pub const DEFAULT_PORT: u32 = 1031;
+
+/// Parse a `CID:PORT` or bare `CID` string into `(cid, port)`.
+///
+/// If only a single number is given it is treated as the CID and
+/// [`DEFAULT_PORT`] is used.
+///
+/// # Errors
+///
+/// Returns an error if the CID or port cannot be parsed as `u32`.
+pub fn parse_vsock_cid_port(authority: &str) -> anyhow::Result<(u32, u32)> {
+    use anyhow::Context;
+    match authority.split_once(':') {
+        Some((cid_str, port_str)) => Ok((
+            cid_str
+                .parse::<u32>()
+                .with_context(|| format!("invalid vsock CID: {cid_str}"))?,
+            port_str
+                .parse::<u32>()
+                .with_context(|| format!("invalid vsock port: {port_str}"))?,
+        )),
+        None => Ok((
+            authority
+                .parse::<u32>()
+                .with_context(|| format!("invalid vsock CID: {authority}"))?,
+            DEFAULT_PORT,
+        )),
+    }
+}
+
 /// TLS channel binding label per RFC 9266 (`tls-exporter`).
 ///
 /// Both client and server call `export_keying_material()` with this label
