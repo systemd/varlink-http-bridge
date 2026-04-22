@@ -54,7 +54,6 @@ tempfile = { version = "3.27", optional = true }
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.16", default-features = false, features = ["runtime"] }
-scopeguard = "1.2"
 gethostname = "1.1.0"
 tempfile = "3.27"
 tokio-tungstenite = "0.29"
