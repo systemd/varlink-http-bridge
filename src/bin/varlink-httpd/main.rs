@@ -33,6 +33,7 @@ use zlink::varlink_service::Proxy;
 mod auth_ssh;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
+mod openapi;
 
 #[cfg(feature = "sshauth")]
 use auth_ssh::{extract_nonce, maybe_create_ssh_authenticator};
@@ -602,6 +603,27 @@ struct AppState {
     authenticators: Arc<Vec<Box<dyn Authenticator>>>,
 }
 
+async fn route_openapi_get(
+    ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
+    Path((socket, interface)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    debug!("GET openapi for socket: {socket}, interface: {interface}");
+    let conn_arc = get_varlink_connection(&socket, &state, &conn_cache).await?;
+    let mut connection = conn_arc.lock().await;
+
+    let description = connection
+        .get_interface_description(&interface)
+        .await?
+        .map_err(|e| AppError::bad_gateway(format!("service error: {e}")))?;
+
+    let iface: zlink::idl::Interface = description
+        .parse()
+        .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))?;
+
+    Ok(axum::Json(openapi::idl_to_openapi(&socket, &iface)))
+}
+
 async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
     debug!("GET sockets");
     let all_sockets = state.varlink_sockets.list_sockets().await?;
@@ -892,6 +914,7 @@ fn create_router(
             "/sockets/{socket}/{interface}",
             get(route_socket_interface_get),
         )
+        .route("/openapi/{socket}/{interface}", get(route_openapi_get))
         .route("/call/{method}", post(route_call_post))
         .route("/ws/sockets/{socket}", get(route_ws))
         .layer(axum::middleware::from_fn_with_state(
