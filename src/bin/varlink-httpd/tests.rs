@@ -4,10 +4,23 @@ use super::*;
 use futures_util::{SinkExt, StreamExt};
 use gethostname::gethostname;
 use reqwest::Client;
-use scopeguard::defer;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+/// Bundles a spawned test server task with its bound address.
+/// Dropping aborts the task, so each test's server is cleaned up
+/// at end of scope.
+struct TestServer<A> {
+    handle: tokio::task::JoinHandle<()>,
+    addr: A,
+}
+
+impl<A> Drop for TestServer<A> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 /// A simple log capture for tests.  Installed once (via `init_test_logger`)
 /// and accumulates all `info!` and above messages so tests can assert on them.
@@ -62,46 +75,45 @@ fn helper_binary() -> std::path::PathBuf {
     helper
 }
 
-async fn run_test_server(
-    varlink_sockets_path: &str,
-) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
     run_test_server_with_auth(varlink_sockets_path, Vec::new()).await
 }
 
 async fn run_test_server_with_auth(
     varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
-) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+) -> TestServer<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let local_addr = listener
+    let addr = listener
         .local_addr()
         .expect("failed to extract local address");
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
-    let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener, None, authenticators)
-            .await
-            .expect("server failed")
+    let handle = tokio::spawn(async move {
+        start_server(
+            Transport::Tcp(listener),
+            None,
+            &varlink_sockets_path,
+            authenticators,
+        )
+        .await
+        .expect("server failed")
     });
 
-    (task_handle, local_addr)
+    TestServer { handle, addr }
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_hostname_post() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.Hostname.Describe",
-            local_addr,
+            server.addr,
         ))
         .json(&json!({}))
         .send()
@@ -115,14 +127,13 @@ async fn test_integration_real_systemd_hostname_post() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_get() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
-        .get(format!("http://{}/sockets/io.systemd.Hostname", local_addr,))
+        .get(format!(
+            "http://{}/sockets/io.systemd.Hostname",
+            server.addr,
+        ))
         .send()
         .await
         .expect("failed to get from test server");
@@ -134,14 +145,10 @@ async fn test_integration_real_systemd_socket_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_sockets_get() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
-        .get(format!("http://{}/sockets", local_addr,))
+        .get(format!("http://{}/sockets", server.addr,))
         .send()
         .await
         .expect("failed to get from test server");
@@ -158,16 +165,12 @@ async fn test_integration_real_systemd_sockets_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_interface_get() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
         .get(format!(
             "http://{}/sockets/io.systemd.Hostname/io.systemd.Hostname",
-            local_addr,
+            server.addr,
         ))
         .send()
         .await
@@ -180,12 +183,8 @@ async fn test_integration_real_systemd_socket_interface_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_hostname_parallel() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
-    let url = format!("http://{}/call/io.systemd.Hostname.Describe", local_addr);
+    let server = run_test_server("/run/systemd").await;
+    let url = format!("http://{}/call/io.systemd.Hostname.Describe", server.addr);
 
     const NUM_TASKS: u32 = 10;
     let mut set = JoinSet::new();
@@ -222,16 +221,12 @@ async fn test_integration_real_systemd_hostname_parallel() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_query_param() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/org.varlink.service.GetInfo?socket=io.systemd.Hostname",
-            local_addr,
+            server.addr,
         ))
         .json(&json!({}))
         .send()
@@ -245,16 +240,13 @@ async fn test_integration_real_systemd_socket_query_param() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_on_malformed_json() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
         .post(format!(
             "http://{}/call/org.varlink.service.GetInfo",
-            local_addr,
+            server.addr,
         ))
         .body("this is NOT valid json")
         .header("Content-Type", "application/json")
@@ -268,16 +260,13 @@ async fn test_error_bad_request_on_malformed_json() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_unknown_varlink_address() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
         .post(format!(
             "http://{}/call/no.such.address.SomeMethod",
-            local_addr,
+            server.addr,
         ))
         .body("{}")
         .header("Content-Type", "application/json")
@@ -297,16 +286,13 @@ async fn test_error_unknown_varlink_address() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_error_404_for_missing_method() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
         .post(format!(
             "http://{}/call/com.missing.Call?socket=io.systemd.Hostname",
-            local_addr
+            server.addr
         ))
         .json(&json!({}))
         .send()
@@ -321,17 +307,14 @@ async fn test_error_404_for_missing_method() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_unclean_address() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
         .post(format!(
             // %2f is url encoding for "/" so socket param is ../io.systemd.Hostname
             "http://{}/call/com.missing.Call?socket=..%2fio.systemd.Hostname",
-            local_addr
+            server.addr
         ))
         .json(&json!({}))
         .send()
@@ -349,17 +332,14 @@ async fn test_error_bad_request_for_unclean_address() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_invalid_chars_in_address() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
         .post(format!(
             // %0A is \n
             "http://{}/call/com.missing.Call?socket=io.systemd.Hostname%0Abad-msg",
-            local_addr
+            server.addr
         ))
         .json(&json!({}))
         .send()
@@ -377,14 +357,11 @@ async fn test_error_bad_request_for_invalid_chars_in_address() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_method_without_dots() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
 
     let res = client
-        .post(format!("http://{}/call/NoDots", local_addr))
+        .post(format!("http://{}/call/NoDots", server.addr))
         .json(&json!({}))
         .send()
         .await
@@ -401,14 +378,10 @@ async fn test_error_bad_request_for_method_without_dots() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_health_endpoint() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
-        .get(format!("http://{}/health", local_addr))
+        .get(format!("http://{}/health", server.addr))
         .send()
         .await
         .expect("failed to get health endpoint");
@@ -423,7 +396,13 @@ async fn test_varlink_sockets_dir_or_file_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir_or_file, listener, None, Vec::new()).await;
+    let res = start_server(
+        Transport::Tcp(listener),
+        None,
+        &varlink_sockets_dir_or_file,
+        Vec::new(),
+    )
+    .await;
 
     assert!(res.is_err());
     assert!(
@@ -436,16 +415,12 @@ async fn test_varlink_sockets_dir_or_file_missing() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_single_socket_post() {
-    let (server, local_addr) = run_test_server("/run/systemd/io.systemd.Hostname").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd/io.systemd.Hostname").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.Hostname.Describe",
-            local_addr,
+            server.addr,
         ))
         .json(&json!({}))
         .send()
@@ -459,16 +434,12 @@ async fn test_single_socket_post() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_single_socket_rejects_wrong_name() {
-    let (server, local_addr) = run_test_server("/run/systemd/io.systemd.Hostname").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd/io.systemd.Hostname").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.Wrong.Describe",
-            local_addr,
+            server.addr,
         ))
         .json(&json!({}))
         .send()
@@ -521,12 +492,8 @@ async fn test_varlink_unix_sockets_in_skips_dangling_symlinks() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_ws_hostname_describe() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
-    let url = format!("ws://{local_addr}/ws/sockets/io.systemd.Hostname");
+    let server = run_test_server("/run/systemd").await;
+    let url = format!("ws://{}/ws/sockets/io.systemd.Hostname", server.addr);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect failed");
@@ -555,12 +522,8 @@ async fn test_ws_hostname_describe() {
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_ws_userdb_get_user_record_more() {
-    let (server, local_addr) = run_test_server("/run/systemd/userdb").await;
-    defer! {
-        server.abort();
-    };
-
-    let url = format!("ws://{local_addr}/ws/sockets/io.systemd.Multiplexer");
+    let server = run_test_server("/run/systemd/userdb").await;
+    let url = format!("ws://{}/ws/sockets/io.systemd.Multiplexer", server.addr);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect failed");
@@ -660,16 +623,12 @@ fn parse_json_seq(body: &[u8]) -> Vec<Value> {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_jsonseq_hostname_describe() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.Hostname.Describe",
-            local_addr,
+            server.addr,
         ))
         .header("Accept", "application/json-seq")
         .json(&json!({}))
@@ -700,16 +659,12 @@ async fn test_jsonseq_hostname_describe() {
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_jsonseq_userdb_get_user_record_more() {
-    let (server, local_addr) = run_test_server("/run/systemd/userdb").await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_server("/run/systemd/userdb").await;
     let client = Client::new();
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.UserDatabase.GetUserRecord?socket=io.systemd.Multiplexer",
-            local_addr,
+            server.addr,
         ))
         .header("Accept", "application/json-seq")
         .json(&json!({"service": "io.systemd.Multiplexer"}))
@@ -744,12 +699,8 @@ async fn test_jsonseq_userdb_get_user_record_more() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_hostname_describe() {
-    let (server, local_addr) = run_test_server("/run/systemd").await;
-    defer! {
-        server.abort();
-    };
-
-    let bridge_url = format!("http://{local_addr}/ws/sockets/io.systemd.Hostname");
+    let server = run_test_server("/run/systemd").await;
+    let bridge_url = format!("http://{}/ws/sockets/io.systemd.Hostname", server.addr);
     let output = tokio::process::Command::new("varlinkctl")
         .args([
             "call",
@@ -782,12 +733,8 @@ async fn test_varlinkctl_helper_hostname_describe() {
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_varlinkctl_helper_userdb_get_user_record() {
-    let (server, local_addr) = run_test_server("/run/systemd/userdb").await;
-    defer! {
-        server.abort();
-    };
-
-    let bridge_url = format!("http://{local_addr}/ws/sockets/io.systemd.Multiplexer");
+    let server = run_test_server("/run/systemd/userdb").await;
+    let bridge_url = format!("http://{}/ws/sockets/io.systemd.Multiplexer", server.addr);
     let output = tokio::process::Command::new("varlinkctl")
         .args([
             "call",
@@ -920,7 +867,7 @@ fn make_test_pki() -> TestPki {
 async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
-) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+) -> TestServer<std::net::SocketAddr> {
     run_test_tls_server_with_auth(varlink_sockets_path, tls_acceptor, Vec::new()).await
 }
 
@@ -928,27 +875,27 @@ async fn run_test_tls_server_with_auth(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
     authenticators: Vec<Box<dyn Authenticator>>,
-) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+) -> TestServer<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let local_addr = listener
+    let addr = listener
         .local_addr()
         .expect("failed to extract local address");
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
-    let task_handle = tokio::spawn(async move {
-        run_server(
-            &varlink_sockets_path,
-            listener,
+    let handle = tokio::spawn(async move {
+        start_server(
+            Transport::Tcp(listener),
             Some(tls_acceptor),
+            &varlink_sockets_path,
             authenticators,
         )
         .await
         .expect("server failed")
     });
 
-    (task_handle, local_addr)
+    TestServer { handle, addr }
 }
 
 #[test_with::path(/usr/bin/openssl)]
@@ -964,21 +911,16 @@ async fn test_tls_basic_connection() {
     )
     .unwrap();
 
-    let (server, local_addr) =
-        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
-        .resolve("localhost", local_addr)
+        .resolve("localhost", server.addr)
         .build()
         .unwrap();
 
     let res = client
-        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .get(format!("https://localhost:{}/health", server.addr.port()))
         .send()
         .await
         .expect("TLS connection failed");
@@ -1000,22 +942,17 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     )
     .unwrap();
 
-    let (server, local_addr) =
-        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
     // Without a client certificate the TLS handshake is rejected
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client_no_cert = Client::builder()
         .add_root_certificate(ca_cert)
-        .resolve("localhost", local_addr)
+        .resolve("localhost", server.addr)
         .build()
         .unwrap();
 
     let result = client_no_cert
-        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .get(format!("https://localhost:{}/health", server.addr.port()))
         .send()
         .await;
     assert!(
@@ -1030,12 +967,12 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     let client_with_cert = Client::builder()
         .add_root_certificate(ca_cert)
         .identity(identity)
-        .resolve("localhost", local_addr)
+        .resolve("localhost", server.addr)
         .build()
         .unwrap();
 
     let res = client_with_cert
-        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .get(format!("https://localhost:{}/health", server.addr.port()))
         .send()
         .await
         .expect("mTLS connection with client cert failed");
@@ -1067,21 +1004,16 @@ async fn test_tls_credentials_directory_fallback() {
         .expect("expected Some(acceptor) from credentials directory");
 
     let varlink_dir = tempfile::tempdir().unwrap();
-    let (server, local_addr) =
-        run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
-        .resolve("localhost", local_addr)
+        .resolve("localhost", server.addr)
         .build()
         .unwrap();
 
     let res = client
-        .get(format!("https://localhost:{}/health", local_addr.port()))
+        .get(format!("https://localhost:{}/health", server.addr.port()))
         .send()
         .await
         .expect("TLS via credentials directory failed");
@@ -1102,11 +1034,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     )
     .unwrap();
 
-    let (server, local_addr) = run_test_tls_server("/run/systemd", acceptor).await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_tls_server("/run/systemd", acceptor).await;
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
@@ -1116,7 +1044,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
 
     let bridge_url = format!(
         "https://localhost:{}/ws/sockets/io.systemd.Hostname",
-        local_addr.port()
+        server.addr.port()
     );
 
     let output = tokio::process::Command::new("varlinkctl")
@@ -1162,11 +1090,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
     )
     .unwrap();
 
-    let (server, local_addr) = run_test_tls_server("/run/systemd", acceptor).await;
-    defer! {
-        server.abort();
-    };
-
+    let server = run_test_tls_server("/run/systemd", acceptor).await;
     // Provide the server CA (so the client trusts the server) but NO client cert/key
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
@@ -1175,7 +1099,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
 
     let bridge_url = format!(
         "https://localhost:{}/ws/sockets/io.systemd.Hostname",
-        local_addr.port()
+        server.addr.port()
     );
 
     let output = tokio::process::Command::new("varlinkctl")
@@ -1247,6 +1171,187 @@ fn test_format_x509_subject_multiple_fields() {
     let cert = openssl::x509::X509::from_pem(&pem).unwrap();
     let subject = format_x509_subject(&cert);
     assert_eq!(subject, "O=TestOrg, CN=multi-field");
+}
+
+// --- bind address parsing tests ---
+
+#[test]
+fn test_bind_addr_parse_defaults() {
+    // "vsock" and "vsock:" both mean CID_ANY + default port
+    for input in ["vsock", "vsock:"] {
+        let bind: BindAddr = input.parse().unwrap();
+        match bind {
+            BindAddr::Vsock { cid, port } => {
+                assert_eq!(cid, vsock::VMADDR_CID_ANY, "input: {input}");
+                assert_eq!(port, DEFAULT_PORT, "input: {input}");
+            }
+            _ => panic!("expected Vsock, got {bind:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_port_only() {
+    // "vsock::2000" -> CID_ANY, port 2000
+    let bind: BindAddr = "vsock::2000".parse().unwrap();
+    match bind {
+        BindAddr::Vsock { cid, port } => {
+            assert_eq!(cid, vsock::VMADDR_CID_ANY);
+            assert_eq!(port, 2000);
+        }
+        _ => panic!("expected Vsock"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_cid_and_port() {
+    // "vsock:5:3333" -> CID 5, port 3333
+    let bind: BindAddr = "vsock:5:3333".parse().unwrap();
+    match bind {
+        BindAddr::Vsock { cid, port } => {
+            assert_eq!(cid, 5);
+            assert_eq!(port, 3333);
+        }
+        _ => panic!("expected Vsock"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_tcp() {
+    let bind: BindAddr = "0.0.0.0:1031".parse().unwrap();
+    match bind {
+        BindAddr::Tcp(addr) => assert_eq!(addr, "0.0.0.0:1031"),
+        _ => panic!("expected Tcp"),
+    }
+}
+
+#[test]
+fn test_bind_addr_parse_errors() {
+    assert!("vsock::notaport".parse::<BindAddr>().is_err());
+    assert!("vsock:abc:1031".parse::<BindAddr>().is_err());
+}
+
+// --- vsock integration tests ---
+
+/// Check if vsock loopback (CID 1) is functional.
+/// Returns false if the vsock_loopback module is not loaded.
+fn vsock_loopback_available() -> bool {
+    use std::io::Read;
+
+    let listener = match vsock::VsockListener::bind_with_cid_port(vsock::VMADDR_CID_ANY, 0) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return false,
+    };
+
+    // Spawn a thread to accept one connection so we can test connect
+    let handle = std::thread::spawn(move || {
+        listener
+            .set_nonblocking(false)
+            .expect("set_nonblocking failed");
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                let mut buf = [0u8; 1];
+                let _ = conn.read(&mut buf);
+            }
+            Err(_) => {}
+        }
+    });
+
+    let ok = vsock::VsockStream::connect_with_cid_port(1, port).is_ok();
+    // Clean up: connect success wakes the accept, connect failure means thread is stuck
+    // on accept -- drop the listener (which is moved into the thread) to unblock it
+    let _ = handle.join();
+    ok
+}
+
+async fn run_test_vsock_server(varlink_sockets_path: &str) -> TestServer<u32> {
+    // Use port 0 to get an ephemeral port
+    let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(vsock::VMADDR_CID_ANY, 0))
+        .expect("vsock bind failed");
+    let addr = listener.local_addr().expect("local_addr failed").port();
+
+    let varlink_sockets_path = varlink_sockets_path.to_string();
+    let handle = tokio::spawn(async move {
+        start_server(
+            Transport::Vsock(listener),
+            None,
+            &varlink_sockets_path,
+            Vec::new(),
+        )
+        .await
+        .expect("vsock server failed")
+    });
+
+    TestServer { handle, addr }
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_vsock_health_endpoint() {
+    if !vsock_loopback_available() {
+        eprintln!("SKIP: vsock loopback not available (vsock_loopback module not loaded?)");
+        return;
+    }
+
+    let server = run_test_vsock_server("/run/systemd").await;
+    // Connect over vsock loopback (CID 1) and do a raw HTTP GET /health
+    let mut stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(1, server.addr))
+        .await
+        .expect("vsock connect failed");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: vsock\r\n\r\n")
+        .await
+        .expect("write failed");
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 OK, got: {response}"
+    );
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlinkctl_helper_vsock_hostname_describe() {
+    if !vsock_loopback_available() {
+        eprintln!("SKIP: vsock loopback not available (vsock_loopback module not loaded?)");
+        return;
+    }
+
+    let server = run_test_vsock_server("/run/systemd").await;
+    let bridge_url = format!("vsock://1:{}/ws/sockets/io.systemd.Hostname", server.addr);
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.Hostname.Describe",
+            "{}",
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "varlinkctl over vsock failed (stderr: {stderr})"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
+    let line = stdout.trim().trim_start_matches('\x1e');
+    let body: Value = serde_json::from_str(line).expect("invalid JSON from varlinkctl");
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(body["Hostname"], expected_hostname);
 }
 
 // --- SSH key auth tests ---
@@ -1771,12 +1876,8 @@ mod sshauth_tests {
         )
         .unwrap();
 
-        let (server, local_addr) =
+        let server =
             run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
-        defer! {
-            server.abort();
-        };
-
         let fake_xdg_home = tempfile::tempdir().unwrap();
         let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
         std::fs::create_dir_all(&tls_dir).unwrap();
@@ -1784,7 +1885,7 @@ mod sshauth_tests {
 
         let bridge_url = format!(
             "https://localhost:{}/ws/sockets/io.systemd.Hostname",
-            local_addr.port()
+            server.addr.port()
         );
 
         let output = tokio::process::Command::new("varlinkctl")

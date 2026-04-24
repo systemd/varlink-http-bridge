@@ -15,9 +15,25 @@ Conflicts=shutdown.target
 
 [Service]
 Type=simple
-ExecStart=@bindir@/varlink-httpd --bind 0.0.0.0:1031
+ExecStart=@bindir@/varlink-httpd
 Restart=on-failure
 RestartSec=5
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_VSOCK
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+NoNewPrivileges=yes
 
 # TLS credentials: well-known names from the credstore, renamed to the
 # short names the service expects in $CREDENTIALS_DIRECTORY.

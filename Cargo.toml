@@ -34,7 +34,11 @@ lexopt = "0.3"
 regex-lite = "0.1"
 listenfd = "1.0.2"
 tungstenite = "0.29"
-rustix = { version = "1.0", features = ["event", "process"] }
+rustix = { version = "1.0", features = ["event", "net", "process"] }
+# TODO: switch back to crates.io once tokio-vsock releases a version with
+# From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
+tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086", features = ["axum08"] }
+vsock = "0.5"
 signal-hook = "0.4"
 socket2 = "0.6"
 # using opeenssl here to keep size small, rusttls adds ~1.8MB binary size
@@ -50,7 +54,6 @@ tempfile = { version = "3.27", optional = true }
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.16", default-features = false, features = ["runtime"] }
-scopeguard = "1.2"
 gethostname = "1.1.0"
 tempfile = "3.27"
 tokio-tungstenite = "0.29"
