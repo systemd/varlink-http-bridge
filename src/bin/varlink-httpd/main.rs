@@ -35,7 +35,7 @@ mod auth_ssh;
 mod import_ssh;
 
 #[cfg(feature = "sshauth")]
-use auth_ssh::{extract_nonce, maybe_create_ssh_authenticator};
+use auth_ssh::{create_ssh_authenticator, extract_nonce};
 #[cfg(not(feature = "sshauth"))]
 fn extract_nonce(_headers: &axum::http::HeaderMap) -> Option<String> {
     None
@@ -1029,7 +1029,7 @@ fn parse_cli() -> anyhow::Result<Command> {
                 return parse_import_ssh_args(&mut parser);
             }
             Value(val) if !got_positional && val == "bridge" => {
-                // explicit "bridge" subcommand — just consume the keyword
+                // explicit "bridge" subcommand, just consume the keyword
                 got_positional = false;
             }
             Value(val) if !got_positional => {
@@ -1114,11 +1114,12 @@ async fn main() -> anyhow::Result<()> {
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
 
     #[cfg(feature = "sshauth")]
-    if let Some(ssh_auth) = maybe_create_ssh_authenticator(
-        cli.authorized_keys,
-        creds_dir.as_deref(),
-        std::path::Path::new("/"),
-    )? {
+    {
+        let ssh_auth = create_ssh_authenticator(
+            cli.authorized_keys,
+            creds_dir.as_deref(),
+            std::path::Path::new("/"),
+        )?;
         authenticators.push(Box::new(ssh_auth));
     }
 
@@ -1126,7 +1127,10 @@ async fn main() -> anyhow::Result<()> {
         authenticators.clear();
         eprintln!("WARNING: running without authentication - all routes are open");
     } else if authenticators.is_empty() && !has_mtls {
-        bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
+        #[cfg(not(feature = "sshauth"))]
+        bail!(
+            "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
+        );
     }
 
     let local_addr = listener.local_addr()?;

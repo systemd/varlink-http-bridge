@@ -1061,7 +1061,7 @@ async fn test_tls_credentials_directory_fallback() {
     std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
-    // No CLI flags — resolve_tls_acceptor should pick up creds from the directory
+    // No CLI flags; resolve_tls_acceptor should pick up creds from the directory
     let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()))
         .expect("credentials directory fallback failed")
         .expect("expected Some(acceptor) from credentials directory");
@@ -1254,7 +1254,7 @@ fn test_format_x509_subject_multiple_fields() {
 #[cfg(feature = "sshauth")]
 mod sshauth_tests {
     use super::*;
-    use crate::maybe_create_ssh_authenticator;
+    use crate::create_ssh_authenticator;
 
     /// Create a fake rootdir with an `etc/varlink-httpd/authorized_keys` file.
     fn make_test_rootdir_with_keys(pubkeys: &[&str]) -> tempfile::TempDir {
@@ -1291,9 +1291,7 @@ mod sshauth_tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
         let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
+        let auth = create_ssh_authenticator(None, None, root.path()).unwrap();
         // Leak both tempdirs so they live for the test duration.
         // (The keypair dir and the rootdir with authorized_keys.)
         std::mem::forget(tmpdir);
@@ -1339,27 +1337,58 @@ mod sshauth_tests {
 
         let pub_key_content = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
         let root = make_test_rootdir_with_keys(&[pub_key_content.trim()]);
-        let result = maybe_create_ssh_authenticator(None, None, root.path());
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("RSA is not supported"),
-            "RSA-only authorized_keys should fail with clear message"
+        let auth = create_ssh_authenticator(None, None, root.path()).unwrap();
+        assert_eq!(
+            auth.key_count(),
+            0,
+            "RSA-only authorized_keys should have 0 usable keys"
         );
     }
 
     #[test]
-    fn test_ssh_auth_rejects_garbage() {
+    fn test_ssh_auth_accepts_garbage() {
         let root = make_test_rootdir_with_keys(&["not-a-real-key line", "# comment"]);
-        let result = maybe_create_ssh_authenticator(None, None, root.path());
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no supported SSH public keys")
+        let auth = create_ssh_authenticator(None, None, root.path()).unwrap();
+        assert_eq!(
+            auth.key_count(),
+            0,
+            "garbage authorized_keys should have 0 usable keys"
+        );
+    }
+
+    #[test]
+    fn test_ssh_auth_drops_keys_when_file_removed() {
+        let keydir_a = tempfile::tempdir().unwrap();
+        let keydir_b = tempfile::tempdir().unwrap();
+        let (pubkey_a, _) = generate_ed25519_keypair(keydir_a.path());
+        let (pubkey_b, _) = generate_ed25519_keypair(keydir_b.path());
+
+        let file_a = keydir_a.path().join("authorized_keys");
+        let file_b = keydir_b.path().join("authorized_keys");
+        std::fs::write(&file_a, pubkey_a.as_bytes()).unwrap();
+        std::fs::write(&file_b, pubkey_b.as_bytes()).unwrap();
+
+        let auth = crate::auth_ssh::SshKeyAuthenticator::new(vec![
+            file_a.to_string_lossy().into_owned(),
+            file_b.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(auth.key_count(), 2);
+
+        std::fs::remove_file(&file_b).unwrap();
+        auth.reload_for_test();
+        assert_eq!(
+            auth.key_count(),
+            1,
+            "key from removed file should be dropped"
+        );
+
+        std::fs::remove_file(&file_a).unwrap();
+        auth.reload_for_test();
+        assert_eq!(
+            auth.key_count(),
+            0,
+            "all keys should be dropped when every source is removed"
         );
     }
 
@@ -1389,7 +1418,7 @@ mod sshauth_tests {
         // Key A: in authorized_keys
         let (auth, _) = make_test_ssh_auth();
 
-        // Key B: NOT in authorized_keys — sign with this one
+        // Key B: NOT in authorized_keys; sign with this one
         let tmpdir_b = tempfile::tempdir().unwrap();
         let (_, key_path_b) = generate_ed25519_keypair(tmpdir_b.path());
         let signer = make_test_token_signer(&key_path_b);
@@ -1657,16 +1686,14 @@ mod sshauth_tests {
         let keygen_dir_b2 = tempfile::tempdir().unwrap();
         let (pubkey_b2, _) = generate_ed25519_keypair(keygen_dir_b2.path());
 
-        // 1. Empty rootdir + no creds_dir → None
+        // 1. Empty rootdir + no creds_dir → authenticator with 0 keys (waiting for files)
         let empty_root = tempfile::tempdir().unwrap();
-        let result = maybe_create_ssh_authenticator(None, None, empty_root.path()).unwrap();
-        assert!(result.is_none(), "empty rootdir should yield None");
+        let auth = create_ssh_authenticator(None, None, empty_root.path()).unwrap();
+        assert_eq!(auth.key_count(), 0, "empty rootdir should yield 0 keys");
 
         // 2. rootdir/etc/varlink-httpd/authorized_keys exists → found
         let root = make_test_rootdir_with_keys(&[pubkey_a.trim()]);
-        let auth = maybe_create_ssh_authenticator(None, None, root.path())
-            .unwrap()
-            .unwrap();
+        let auth = create_ssh_authenticator(None, None, root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from /etc path");
 
         // 3. $CREDENTIALS_DIRECTORY/ssh.authorized_keys.root exists → found
@@ -1676,12 +1703,11 @@ mod sshauth_tests {
             pubkey_a.as_bytes(),
         )
         .unwrap();
-        let auth = maybe_create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path())
-            .unwrap()
-            .unwrap();
+        let auth =
+            create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from creds_dir");
 
-        // 4. Both /etc and $CREDENTIALS_DIRECTORY exist → /etc takes priority
+        // 4. Both /etc and $CREDENTIALS_DIRECTORY exist → keys are merged
         let root_both = tempfile::tempdir().unwrap();
         let etc_dir = root_both.path().join("etc/varlink-httpd");
         std::fs::create_dir_all(&etc_dir).unwrap();
@@ -1692,13 +1718,12 @@ mod sshauth_tests {
         writeln!(creds_file, "{}", pubkey_b1.trim()).unwrap();
         writeln!(creds_file, "{}", pubkey_b2.trim()).unwrap();
         drop(creds_file);
-        let auth = maybe_create_ssh_authenticator(None, Some(creds_dir_b.path()), root_both.path())
-            .unwrap()
-            .unwrap();
+        let auth =
+            create_ssh_authenticator(None, Some(creds_dir_b.path()), root_both.path()).unwrap();
         assert_eq!(
             auth.key_count(),
-            1,
-            "/etc (1 key) should take priority over creds_dir (2 keys)"
+            3,
+            "/etc (1 key) + creds_dir (2 keys) should be merged"
         );
 
         // 5b. ssh.ephemeral-authorized_keys-all is used when .root is absent (creds_dir)
@@ -1711,12 +1736,10 @@ mod sshauth_tests {
         )
         .unwrap();
         let auth =
-            maybe_create_ssh_authenticator(None, Some(creds_dir_all.path()), empty_root.path())
-                .unwrap()
-                .unwrap();
+            create_ssh_authenticator(None, Some(creds_dir_all.path()), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from .all credential");
 
-        // 5c. ssh.authorized_keys.root takes priority over .all (creds_dir)
+        // 5c. Both .root and .all credentials exist → keys are merged
         let creds_dir_both = tempfile::tempdir().unwrap();
         std::fs::write(
             creds_dir_both.path().join("ssh.authorized_keys.root"),
@@ -1733,27 +1756,27 @@ mod sshauth_tests {
         writeln!(all_file, "{}", pubkey_b2.trim()).unwrap();
         drop(all_file);
         let auth =
-            maybe_create_ssh_authenticator(None, Some(creds_dir_both.path()), empty_root.path())
-                .unwrap()
-                .unwrap();
+            create_ssh_authenticator(None, Some(creds_dir_both.path()), empty_root.path()).unwrap();
         assert_eq!(
             auth.key_count(),
-            1,
-            ".root (1 key) should take priority over .all (2 keys)"
+            3,
+            ".root (1 key) + .all (2 keys) should be merged"
         );
 
-        // 6. CLI path overrides everything
+        // 6. CLI path overrides everything (only CLI path is used)
         let cli_root = make_test_rootdir_with_keys(&[pubkey_a.trim()]);
         let cli_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(cli_file.path(), "not-a-real-key garbage\n").unwrap();
-        let result = maybe_create_ssh_authenticator(
+        std::fs::write(cli_file.path(), format!("{}\n", pubkey_b1.trim())).unwrap();
+        let auth = create_ssh_authenticator(
             Some(cli_file.path().to_str().unwrap().to_string()),
             Some(creds_dir.path()),
             cli_root.path(),
-        );
-        assert!(
-            result.is_err(),
-            "CLI path should be used, not /etc or credential"
+        )
+        .unwrap();
+        assert_eq!(
+            auth.key_count(),
+            1,
+            "CLI path should be used exclusively, not /etc or credential"
         );
     }
 
