@@ -347,7 +347,7 @@ impl Authenticator for SshKeyAuthenticator {
         &self,
         method: &str,
         path: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         nonce: Option<&str>,
         tls_channel_binding: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -356,6 +356,7 @@ impl Authenticator for SshKeyAuthenticator {
             .unwrap()
             .maybe_reload(&self.paths);
 
+        let auth_header = auth_header.context("missing Authorization header")?;
         let nonce = nonce.context("missing nonce header (x-auth-nonce)")?;
 
         let token_str = auth_header

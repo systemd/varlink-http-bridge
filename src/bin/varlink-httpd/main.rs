@@ -532,10 +532,36 @@ trait Authenticator: Send + Sync {
         &self,
         method: &str,
         path: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         nonce: Option<&str>,
         channel_binding: Option<&str>,
     ) -> anyhow::Result<()>;
+}
+
+/// Authenticator that accepts every request.
+///
+/// Pushed explicitly when authentication is delegated to a lower layer
+/// (mTLS verified during the TLS handshake) or deliberately disabled
+/// (`--insecure`). Making this an explicit authenticator keeps the
+/// middleware fail-closed: an empty `authenticators` list always rejects,
+/// so no future code path can accidentally turn into open access by
+/// failing to push a real authenticator.
+struct AllowAllAuthenticator {
+    reason: &'static str,
+}
+
+impl Authenticator for AllowAllAuthenticator {
+    fn check_request(
+        &self,
+        method: &str,
+        path: &str,
+        _auth_header: Option<&str>,
+        _nonce: Option<&str>,
+        _channel_binding: Option<&str>,
+    ) -> anyhow::Result<()> {
+        debug!("auth: allowing {method} {path} ({})", self.reason);
+        Ok(())
+    }
 }
 
 /// Extract the Authorization header value, if present and valid UTF-8.
@@ -553,23 +579,7 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if state.authenticators.is_empty() {
-        debug!("auth: no authenticators configured, allowing request");
-        return next.run(request).await;
-    }
-
-    let Some(auth_header) = extract_auth_header(&request) else {
-        debug!(
-            "auth: missing or invalid Authorization header in request to {}",
-            request.uri()
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"error": "missing Authorization header"})),
-        )
-            .into_response();
-    };
-
+    let auth_header = extract_auth_header(&request);
     let nonce = extract_nonce(request.headers());
 
     let tls_channel_binding: Option<String> = request
@@ -591,7 +601,7 @@ async fn auth_middleware(
         match authenticator.check_request(
             &method,
             &path,
-            &auth_header,
+            auth_header.as_deref(),
             nonce.as_deref(),
             tls_channel_binding.as_deref(),
         ) {
@@ -603,7 +613,11 @@ async fn auth_middleware(
         }
     }
 
-    let joined = errors.join("; ");
+    let joined = if errors.is_empty() {
+        "no authenticators configured".to_string()
+    } else {
+        errors.join("; ")
+    };
     debug!("auth: rejected {method} {path}: {joined}");
     (
         StatusCode::UNAUTHORIZED,
@@ -1302,12 +1316,23 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.insecure {
         authenticators.clear();
+        authenticators.push(Box::new(AllowAllAuthenticator {
+            reason: "--insecure",
+        }));
         eprintln!("WARNING: running without authentication - all routes are open");
-    } else if authenticators.is_empty() && !has_mtls {
-        #[cfg(not(feature = "sshauth"))]
-        bail!(
-            "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
-        );
+    } else if authenticators.is_empty() {
+        if has_mtls {
+            // mTLS verifies the client during the TLS handshake; no
+            // additional per-request HTTP authentication is needed.
+            authenticators.push(Box::new(AllowAllAuthenticator {
+                reason: "mTLS verified at TLS layer",
+            }));
+        } else {
+            #[cfg(not(feature = "sshauth"))]
+            bail!(
+                "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
+            );
+        }
     }
 
     let app = create_router(&cli.varlink_sockets_path, authenticators)?;

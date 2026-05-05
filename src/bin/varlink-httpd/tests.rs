@@ -76,7 +76,11 @@ fn helper_binary() -> std::path::PathBuf {
 }
 
 async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
-    run_test_server_with_auth(varlink_sockets_path, Vec::new()).await
+    run_test_server_with_auth(
+        varlink_sockets_path,
+        vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
+    )
+    .await
 }
 
 async fn run_test_server_with_auth(
@@ -1514,7 +1518,7 @@ mod sshauth_tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
+        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), None);
         assert!(result.is_err(), "expired token should be rejected");
     }
 
@@ -1536,7 +1540,7 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
+        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), None);
         assert!(result.is_err());
         assert!(
             result
@@ -1562,7 +1566,7 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
+        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(cb))
             .expect("valid ed25519 token should pass");
     }
 
@@ -1620,7 +1624,7 @@ mod sshauth_tests {
             &self,
             _method: &str,
             _path: &str,
-            _auth_header: &str,
+            _auth_header: Option<&str>,
             _nonce: Option<&str>,
             _channel_binding: Option<&str>,
         ) -> anyhow::Result<()> {
@@ -1672,17 +1676,36 @@ mod sshauth_tests {
     }
 
     #[tokio::test]
-    async fn test_ssh_auth_no_authenticators_allows_all() {
+    async fn test_no_authenticators_rejects_all() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
+        // An empty authenticator list must fail closed: open access is
+        // only allowed when an explicit AllowAllAuthenticator is pushed.
         let app = make_auth_test_router(Vec::new());
         let response = app
             .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // No authenticators = open access
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_allow_all_authenticator_passes_unauthed_requests() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = make_auth_test_router(vec![Box::new(crate::AllowAllAuthenticator {
+            reason: "test",
+        })]);
+        // Request has no Authorization header at all - must still be allowed
+        // through the auth middleware to the (empty) /sockets handler.
+        let response = app
+            .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1703,11 +1726,11 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // First use should succeed
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
+        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(cb))
             .expect("first use of nonce should pass");
 
         // Replay with the same nonce should fail
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb));
+        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(cb));
         assert!(result.is_err(), "replayed nonce should be rejected");
         assert!(
             result
@@ -1729,7 +1752,7 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // Without a nonce, the request should be rejected
-        let result = auth.check_request("GET", "/sockets", &header, None, None);
+        let result = auth.check_request("GET", "/sockets", Some(&header), None, None);
         assert!(result.is_err(), "request without nonce should be rejected");
         assert!(result.unwrap_err().to_string().contains("missing nonce"));
     }
@@ -1751,7 +1774,13 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb_verifier));
+        let result = auth.check_request(
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(cb_verifier),
+        );
         assert!(
             result.is_err(),
             "mismatched channel binding should be rejected (relay attack)"
@@ -1774,7 +1803,7 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
+        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(cb))
             .expect("matching channel binding should pass");
     }
 
