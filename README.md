@@ -5,7 +5,7 @@ http. The main use case is systemd, so only the subset of varlink that
 systemd needs is supported right now.
 
 It takes a directory with varlink sockets (or symlinks to varlink
-sockets) like /run/varlink/registry as the argument and will serve
+sockets) like `/run/varlink/registry` as the argument and will serve
 whatever it finds in there. Sockets can be added or removed dynamically
 in the dir as needed.
 
@@ -38,7 +38,7 @@ The websocket endpoint is a transparent proxy that forwards raw bytes
 between the websocket and the varlink unix socket in both directions.
 Clients are expected to speak raw varlink wire protocol.
 
-This makes the bridge compatible with libvarlink `varlink --brige`
+This makes the bridge compatible with libvarlink `varlink --bridge`
 via `websocat --binary`, enabling full varlink features (including
 `--more`) over the network.
 
@@ -49,7 +49,7 @@ bridge needs a ship, and this one discovers your varlink services.
 
 ## Examples (curl)
 
-Using curl for direct calls is usually more convenient/ergonimic than
+Using curl for direct calls is usually more convenient/ergonomic than
 using the websocket endpoint.
 
 ```console
@@ -118,7 +118,7 @@ $ curl -s -H "Accept: application/json-seq" -H "Content-Type: application/json" 
 
 ```
 
-### Example (varlinkctl transparent bridge mode)
+## Example (varlinkctl transparent bridge mode)
 
 Systemd version v260+ supports pluggable protocols for varlink, with that the bridge
 becomes even nicer.
@@ -136,7 +136,7 @@ $ varlinkctl call http://localhost:1031/ws/sockets/io.systemd.Hostname io.system
 ...
 ```
 
-### Examples (websocket)
+## Examples (websocket)
 
 The examples use websocat because curl for websockets support is relatively new and
 still a bit cumbersome to use.
@@ -385,7 +385,6 @@ Using `VARLINK_SSH_KEY` is useful in environments without an SSH agent
 [Service]
 Environment=VARLINK_SSH_KEY=/my/private/bridge_key
 ```
-
 
 ### Combining with TLS
 
