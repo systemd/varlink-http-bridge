@@ -331,7 +331,7 @@ fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
         .entries()
         .filter_map(|e| {
             let obj = e.object().nid().short_name().ok()?;
-            let val = e.data().as_utf8().ok()?;
+            let val = e.data().to_string().ok()?;
             Some(format!("{obj}={val}"))
         })
         .collect::<Vec<_>>()
