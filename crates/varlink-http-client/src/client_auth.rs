@@ -8,6 +8,8 @@
 
 use anyhow::Result;
 use futures_util::future::LocalBoxFuture;
+#[cfg(any(feature = "sshauth", feature = "jwtauth"))]
+use tokio_tungstenite::tungstenite;
 
 use crate::WebSocket;
 
@@ -35,4 +37,10 @@ pub(crate) trait ClientAuth {
             self.name()
         )
     }
+}
+
+#[cfg(any(feature = "sshauth", feature = "jwtauth"))]
+pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tungstenite::Error>()
+        .is_some_and(|e| matches!(e, tungstenite::Error::Http(r) if r.status() == 401))
 }

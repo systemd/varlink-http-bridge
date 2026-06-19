@@ -46,10 +46,12 @@
 //! # Features
 //!
 //! * `sshauth` (default): the SSH signature auth method.
+//! * `jwtauth`: the JWT bearer auth method.
 
 mod api_key_client;
 mod client;
 mod client_auth;
+mod jwt_client;
 mod sshauth_client;
 mod transport;
 

@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use super::VARLINK_SSH_KEY_ENV;
 use crate::WebSocket;
-use crate::client_auth::ClientAuth;
+use crate::client_auth::{ClientAuth, is_http_unauthorized};
 use crate::transport::Transport;
 
 /// The ssh-agent socket, the same variable ssh itself uses.
@@ -221,11 +221,6 @@ impl fmt::Display for SigningFailed {
 
 fn is_signing_failure(err: &anyhow::Error) -> bool {
     err.is::<SigningFailed>()
-}
-
-pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<tungstenite::Error>()
-        .is_some_and(|e| matches!(e, tungstenite::Error::Http(r) if r.status() == 401))
 }
 
 /// Displays the algorithm and fingerprint of a key, and its comment if it has
