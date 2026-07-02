@@ -112,7 +112,7 @@ fn assert_hostname_reply(output: &std::process::Output) {
     );
 
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
-    let line = stdout.trim().trim_start_matches('\x1e');
+    let line = stdout.trim_start_matches('\x1e');
     let body: Value = serde_json::from_str(line).expect("varlinkctl output not valid JSON");
     let expected_hostname = gethostname().into_string().expect("failed to get hostname");
     assert_eq!(body["Hostname"], expected_hostname);
