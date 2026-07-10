@@ -195,7 +195,7 @@ async fn test_integration_real_systemd_sockets_get() {
     let server = run_test_server("/run/systemd").await;
     let client = Client::new();
     let res = client
-        .get(format!("http://{}/sockets", server.addr,))
+        .get(format!("http://{}/sockets", server.addr))
         .send()
         .await
         .expect("failed to get from test server");
