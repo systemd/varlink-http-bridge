@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::BoxFuture;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
 use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
+
+use crate::client_auth::ClientAuth;
 
 struct Signer {
     builder: sshauth::signer::TokenSignerBuilder,
@@ -13,32 +16,48 @@ struct Signer {
     source: String,
 }
 
-pub(crate) async fn maybe_add_auth_headers(
-    request: &mut tungstenite::http::Request<()>,
-    tls_channel_binding: Option<&str>,
-) -> Result<()> {
-    // to_string: ends the borrow of `request` before headers_mut() below
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or(request.uri().path(), |pq| pq.as_str())
-        .to_string();
+pub(crate) struct SshSignature;
 
-    let (bearer, nonce) = match build_auth_token("GET", &path_and_query, tls_channel_binding).await
-    {
-        Ok(Some((bearer, nonce))) => (bearer, nonce),
-        Ok(None) => return Ok(()),
-        Err(e) => return Err(e).context("auth token generation failed"),
-    };
-    request.headers_mut().insert(
-        "Authorization",
-        bearer.parse().context("invalid auth header value")?,
-    );
-    request.headers_mut().insert(
-        varlink_http_bridge::SSHAUTH_NONCE_HEADER,
-        nonce.parse().context("invalid nonce header value")?,
-    );
-    Ok(())
+impl ClientAuth for SshSignature {
+    fn name(&self) -> &'static str {
+        "SSH signature auth (VARLINK_SSH_KEY or ssh-agent)"
+    }
+
+    fn configured(&self) -> bool {
+        std::env::var_os("VARLINK_SSH_KEY").is_some()
+    }
+
+    /// Sign the request with an SSH key; `Ok(false)` when no key is available.
+    fn add_credentials<'a>(
+        &'a self,
+        request: &'a mut tungstenite::http::Request<()>,
+        tls_channel_binding: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            // to_string: ends the borrow of `request` before headers_mut() below
+            let path_and_query = request
+                .uri()
+                .path_and_query()
+                .map_or(request.uri().path(), |pq| pq.as_str())
+                .to_string();
+
+            let (bearer, nonce) =
+                match build_auth_token("GET", &path_and_query, tls_channel_binding).await {
+                    Ok(Some((bearer, nonce))) => (bearer, nonce),
+                    Ok(None) => return Ok(false),
+                    Err(e) => return Err(e).context("auth token generation failed"),
+                };
+            request.headers_mut().insert(
+                "Authorization",
+                bearer.parse().context("invalid auth header value")?,
+            );
+            request.headers_mut().insert(
+                varlink_http_bridge::SSHAUTH_NONCE_HEADER,
+                nonce.parse().context("invalid nonce header value")?,
+            );
+            Ok(true)
+        })
+    }
 }
 
 /// Build an SSH auth token for the given HTTP method and path.

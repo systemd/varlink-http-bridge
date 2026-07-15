@@ -30,6 +30,7 @@ use tokio::signal;
 use tokio_vsock::VsockListener;
 use zlink::varlink_service::Proxy;
 
+mod auth_api_key;
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
 #[cfg(feature = "sshauth")]
@@ -1059,6 +1060,7 @@ enum Command {
     Bridge(BridgeCli),
     #[cfg(feature = "sshauth")]
     ImportSsh(import_ssh::ImportSsh),
+    GenApiKey(auth_api_key::GenApiKey),
 }
 
 use varlink_http_bridge::DEFAULT_PORT;
@@ -1144,6 +1146,7 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     authorized_keys: Option<String>,
+    api_keys: Option<String>,
     insecure: bool,
 }
 
@@ -1153,12 +1156,14 @@ fn print_help() {
         indoc::formatdoc! {"
         Usage: varlink-httpd [bridge] [OPTIONS] [VARLINK_SOCKETS_PATH]
                varlink-httpd import-ssh SOURCE [OUTPUT]
+               varlink-httpd gen-api-key [--name=NAME] [OUTPUT]
 
         A HTTP/WebSocket daemon for varlink sockets.
 
         Subcommands:
           bridge (default)                  start the HTTP/WebSocket server
           import-ssh SOURCE [OUTPUT]        download SSH authorized keys from a URL
+          gen-api-key [OUTPUT]              generate an API key and store its hash
 
         Bridge options:
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
@@ -1170,6 +1175,7 @@ fn print_help() {
           --key=PATH                        TLS private key PEM file
           --trust=PATH                      CA certificate PEM for client verification (mTLS)
           --authorized-keys=PATH            authorized SSH public keys file
+          --api-keys=PATH                   API key hashes file (see gen-api-key)
           --insecure                        run without any authentication (DANGEROUS)
           --help                            display this help and exit
     "}
@@ -1201,6 +1207,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut key = None;
     let mut trust = None;
     let mut authorized_keys = None;
+    let mut api_keys = None;
     let mut insecure = false;
     let mut got_positional = false;
 
@@ -1212,6 +1219,7 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1220,6 +1228,9 @@ fn parse_cli() -> anyhow::Result<Command> {
             #[cfg(feature = "sshauth")]
             Value(val) if !got_positional && val == "import-ssh" => {
                 return parse_import_ssh_args(&mut parser);
+            }
+            Value(val) if !got_positional && val == "gen-api-key" => {
+                return parse_gen_api_key_args(&mut parser);
             }
             Value(val) if !got_positional && val == "bridge" => {
                 // explicit "bridge" subcommand, just consume the keyword
@@ -1248,8 +1259,47 @@ fn parse_cli() -> anyhow::Result<Command> {
         key,
         trust,
         authorized_keys,
+        api_keys,
         insecure,
     }))
+}
+
+fn print_gen_api_key_help() {
+    eprint!(indoc::indoc! {"
+        Usage: varlink-httpd gen-api-key [--name=NAME] [OUTPUT]
+
+        Generate a random API key and append its SHA-256 hash to an
+        API keys file. The key itself is printed to stdout exactly once
+        and stored nowhere.
+
+        Positional arguments:
+          OUTPUT       API keys file path (default: auto-detected)
+
+        Options:
+          --name=NAME  name for the key in the file (default: derived from hash)
+          --help       display this help and exit
+    "});
+}
+
+fn parse_gen_api_key_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command> {
+    use lexopt::prelude::*;
+
+    let mut name = None;
+    let mut output = None;
+
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Long("name") => name = Some(parser.value()?.parse()?),
+            Long("help") => {
+                print_gen_api_key_help();
+                std::process::exit(0);
+            }
+            Value(val) if output.is_none() => output = Some(val.parse()?),
+            _ => return Err(arg.unexpected().into()),
+        }
+    }
+
+    Ok(Command::GenApiKey(auth_api_key::GenApiKey { name, output }))
 }
 
 #[cfg(feature = "sshauth")]
@@ -1286,6 +1336,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = match command {
         #[cfg(feature = "sshauth")]
         Command::ImportSsh(cmd) => return import_ssh::run(cmd),
+        Command::GenApiKey(cmd) => return auth_api_key::run_gen_api_key(cmd),
         Command::Bridge(cli) => cli,
     };
 
@@ -1303,6 +1354,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
+
+    // API key auth first: a hash lookup is much cheaper than an SSH
+    // signature verification and the middleware tries them in order.
+    if let Some(api_key_auth) = auth_api_key::create_api_key_authenticator(
+        cli.api_keys,
+        creds_dir.as_deref(),
+        std::path::Path::new("/"),
+    )? {
+        authenticators.push(Box::new(api_key_auth));
+    }
 
     #[cfg(feature = "sshauth")]
     {
@@ -1330,7 +1391,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             #[cfg(not(feature = "sshauth"))]
             bail!(
-                "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
+                "no authentication configured: use --api-keys= (see gen-api-key), --trust=, --insecure, or build with the 'sshauth' feature"
             );
         }
     }

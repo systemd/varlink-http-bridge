@@ -15,18 +15,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
 
+mod api_key_client;
+mod client_auth;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
-
-#[cfg(feature = "sshauth")]
-use sshauth_client::maybe_add_auth_headers;
-#[cfg(not(feature = "sshauth"))]
-async fn maybe_add_auth_headers(
-    _request: &mut tungstenite::http::Request<()>,
-    _tls_channel_binding: Option<&str>,
-) -> Result<()> {
-    Ok(())
-}
 
 /// One object-safe type for all transport combinations
 /// (TCP/vsock, with/without TLS).
@@ -214,25 +206,36 @@ async fn connect_ws(url: &str) -> Result<Ws> {
     let mut request = ws_url
         .into_client_request()
         .context("building WS request")?;
-    maybe_add_auth_headers(&mut request, tls_channel_binding.as_deref()).await?;
+    let chosen_auth =
+        client_auth::select_auth_method(&mut request, tls_channel_binding.as_deref()).await?;
 
     let (ws, _) = tokio_tungstenite::client_async(request, stream)
         .await
         .map_err(|e| {
-            let http_detail = match &e {
-                tungstenite::Error::Http(resp) => match resp_body_text(resp) {
-                    Some(body) => format!(": HTTP {}: {body}", resp.status()),
-                    None => format!(": HTTP {}", resp.status()),
-                },
-                _ => String::new(),
+            let (http_detail, auth_hint) = match &e {
+                tungstenite::Error::Http(resp) => {
+                    let detail = match resp_body_text(resp) {
+                        Some(body) => format!(": HTTP {}: {body}", resp.status()),
+                        None => format!(": HTTP {}", resp.status()),
+                    };
+                    let hint = match chosen_auth {
+                        Some(method) if matches!(resp.status().as_u16(), 401 | 403) => {
+                            method.rejected_hint()
+                        }
+                        _ => String::new(),
+                    };
+                    (detail, hint)
+                }
+                _ => (String::new(), String::new()),
             };
             let tls_hint = if is_tls {
                 " (check client cert if server requires mTLS)"
             } else {
                 ""
             };
-            anyhow::Error::new(e)
-                .context(format!("WebSocket handshake failed{http_detail}{tls_hint}"))
+            anyhow::Error::new(e).context(format!(
+                "WebSocket handshake failed{http_detail}{auth_hint}{tls_hint}"
+            ))
         })?;
     debug!("WebSocket established");
     Ok(ws)
