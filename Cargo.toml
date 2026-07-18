@@ -36,7 +36,7 @@ lexopt = "0.3"
 # not using full regex as it adds more bloat and our requirements are minimal
 regex-lite = "0.1"
 listenfd = "1.0.2"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = { version = "0.3" }
 bytes = "1"
 rustix = { version = "1.0", features = ["net", "process"] }
