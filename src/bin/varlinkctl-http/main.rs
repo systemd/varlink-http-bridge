@@ -16,6 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
 use varlink_http_bridge::TlsChannelBinding;
 
+mod api_key_client;
 mod client_auth;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;

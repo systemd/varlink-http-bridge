@@ -9,8 +9,10 @@
 use anyhow::Result;
 use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
+use tokio_tungstenite::tungstenite;
 
 pub(crate) trait ClientAuth {
+    /// Short name for logs and error hints.
     fn name(&self) -> &'static str;
 
     /// Explicit user intent (its env var is set), never ambient state like
@@ -25,6 +27,14 @@ pub(crate) trait ClientAuth {
     /// `current_thread` runtime and rustc cannot prove the SSH retry
     /// future `Send` anyway.
     fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<crate::Ws>>>;
+
+    /// Added to the connect error when the server rejected this method.
+    fn rejected_hint(&self) -> String {
+        format!(
+            "{} was rejected by the server; other auth methods were skipped",
+            self.name()
+        )
+    }
 }
 
 /// Always compiled, so a credential whose method is compiled out warns
@@ -35,9 +45,17 @@ const METHOD_FEATURES: &[(&str, &str, bool)] =
 /// In precedence order.
 fn methods() -> Vec<&'static dyn ClientAuth> {
     vec![
+        &crate::api_key_client::ApiKeyBearer,
         #[cfg(feature = "sshauth")]
         &crate::sshauth_client::SshSignature,
     ]
+}
+
+/// 403 counts too: the credential was understood and refused.
+fn is_http_rejection(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tungstenite::Error>().is_some_and(
+        |e| matches!(e, tungstenite::Error::Http(r) if matches!(r.status().as_u16(), 401 | 403)),
+    )
 }
 
 pub(crate) async fn connect_ws(url: &str) -> Result<crate::Ws> {
@@ -49,8 +67,15 @@ pub(crate) async fn connect_ws(url: &str) -> Result<crate::Ws> {
 
     let methods = methods();
     for (i, method) in methods.iter().enumerate() {
-        let Some(ws) = method.connect(url).await? else {
-            continue;
+        let ws = match method.connect(url).await {
+            Ok(Some(ws)) => ws,
+            Ok(None) => continue,
+            // No other method gets a turn after a rejection, so name this one
+            Err(e) if is_http_rejection(&e) => {
+                let hint = method.rejected_hint();
+                return Err(e.context(hint));
+            }
+            Err(e) => return Err(e),
         };
         debug!("auth: using {}", method.name());
         for other in &methods[i + 1..] {

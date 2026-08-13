@@ -52,5 +52,8 @@ ImportCredential=varlink-httpd.tls.trust:trust
 ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
 
+# API key hashes, renamed to the short name matching the --api-keys flag
+ImportCredential=varlink-httpd.api-keys:api-keys
+
 [Install]
 WantedBy=network.target

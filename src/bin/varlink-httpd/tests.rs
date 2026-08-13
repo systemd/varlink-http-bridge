@@ -1990,3 +1990,248 @@ mod sshauth_tests {
         assert_hostname_reply(&output);
     }
 } // mod sshauth_tests
+
+// --- API key auth tests ---
+
+mod apikey_tests {
+    use super::*;
+    use crate::auth_api_key::{ApiKeyAuthenticator, append_api_key, create_api_key_authenticator};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Create a fake rootdir with an `etc/varlink-httpd/api-keys` file.
+    fn make_test_rootdir_with_api_key_lines(lines: &[&str]) -> tempfile::TempDir {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("etc/varlink-httpd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("api-keys")).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        root
+    }
+
+    /// Set up an API key authenticator that accepts one freshly generated key.
+    ///
+    /// Returns the authenticator, the key, and the API keys file path.
+    fn make_test_api_key_auth() -> (ApiKeyAuthenticator, String, std::path::PathBuf) {
+        let root = make_test_rootdir_with_api_key_lines(&[]);
+        let keys_path = root.path().join("etc/varlink-httpd/api-keys");
+        let key = crate::auth_api_key::generate_api_key();
+        append_api_key(&keys_path, &key, Some("testkey")).unwrap();
+        let auth = create_api_key_authenticator(None, None, root.path())
+            .unwrap()
+            .expect("API keys file exists, authenticator must be created");
+        std::mem::forget(root);
+        (auth, key, keys_path)
+    }
+
+    fn make_api_key_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.keep();
+        create_router(path.to_str().unwrap(), authenticators).unwrap()
+    }
+
+    #[test]
+    fn test_api_key_auth_accepts_valid_key() {
+        let (auth, key, _) = make_test_api_key_auth();
+        let header = format!("Bearer {key}");
+        check_request(&auth, "GET", "/sockets", Some(&header), None, None)
+            .expect("valid API key must be accepted");
+    }
+
+    #[test]
+    fn test_api_key_auth_rejects_unknown_key() {
+        let (auth, _, _) = make_test_api_key_auth();
+        let result = check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some("Bearer vhb_bogus"),
+            None,
+            None,
+        );
+        assert!(result.unwrap_err().to_string().contains("unknown API key"));
+    }
+
+    #[test]
+    fn test_api_key_auth_rejects_missing_header() {
+        let (auth, _, _) = make_test_api_key_auth();
+        let result = check_request(&auth, "GET", "/sockets", None, None, None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing Authorization header")
+        );
+    }
+
+    #[test]
+    fn test_api_key_auth_rejects_non_bearer_scheme() {
+        let (auth, _, _) = make_test_api_key_auth();
+        let result = check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some("Basic dXNlcjpwdw=="),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_api_key_auth_skips_garbage_lines() {
+        let root = make_test_rootdir_with_api_key_lines(&[
+            "# a comment",
+            "",
+            "not-an-api-key-line",
+            "sha256:tooshort",
+            &format!("sha256:{} named", "a".repeat(64)),
+            &"b".repeat(64), // missing sha256: prefix
+        ]);
+        let auth = create_api_key_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.key_count(), 1);
+    }
+
+    /// Write an api-keys file holding one fresh key under `root/base/`.
+    fn write_api_keys_at(root: &std::path::Path, base: &str) -> String {
+        let path = root.join(base).join("varlink-httpd/api-keys");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let key = crate::auth_api_key::generate_api_key();
+        append_api_key(&path, &key, None).unwrap();
+        key
+    }
+
+    #[test]
+    fn test_api_key_auth_config_hierarchy_and_credential() {
+        let root = tempfile::tempdir().unwrap();
+
+        // 1. /usr/lib alone is enough to enable api key auth
+        let usr_key = write_api_keys_at(root.path(), "usr/lib");
+        let auth = create_api_key_authenticator(None, None, root.path())
+            .unwrap()
+            .expect("a /usr/lib api-keys file must enable the authenticator");
+        assert_eq!(auth.key_count(), 1);
+        let header = format!("Bearer {usr_key}");
+        check_request(&auth, "GET", "/sockets", Some(&header), None, None)
+            .expect("key from /usr/lib must be accepted");
+
+        // 2. /etc wins outright: the lower-precedence keys are not merged in
+        let etc_key = write_api_keys_at(root.path(), "etc");
+        let auth = create_api_key_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.key_count(), 1, "only the /etc file should be read");
+        let header = format!("Bearer {etc_key}");
+        check_request(&auth, "GET", "/sockets", Some(&header), None, None)
+            .expect("key from /etc must be accepted");
+        let header = format!("Bearer {usr_key}");
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&header), None, None).is_err(),
+            "the shadowed /usr/lib key must not be accepted"
+        );
+
+        // 3. a credential is merged on top of the config file
+        let creds_dir = tempfile::tempdir().unwrap();
+        let cred_key = crate::auth_api_key::generate_api_key();
+        append_api_key(&creds_dir.path().join("api-keys"), &cred_key, None).unwrap();
+        let auth = create_api_key_authenticator(None, Some(creds_dir.path()), root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.key_count(), 2, "/etc + credential should be merged");
+        for key in [&etc_key, &cred_key] {
+            let header = format!("Bearer {key}");
+            check_request(&auth, "GET", "/sockets", Some(&header), None, None)
+                .expect("both merged keys must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_api_key_auth_not_configured_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let auth = create_api_key_authenticator(None, None, root.path()).unwrap();
+        assert!(
+            auth.is_none(),
+            "no API keys file anywhere: no authenticator"
+        );
+    }
+
+    #[test]
+    fn test_api_key_auth_explicit_flag_allows_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = dir.path().join("api-keys");
+        let auth = create_api_key_authenticator(
+            Some(keys_path.to_string_lossy().into_owned()),
+            None,
+            std::path::Path::new("/nonexistent"),
+        )
+        .unwrap()
+        .expect("explicit --api-keys must always enable the authenticator");
+        assert_eq!(auth.key_count(), 0);
+
+        // The file appearing later is picked up without a restart.
+        let key = crate::auth_api_key::generate_api_key();
+        append_api_key(&keys_path, &key, None).unwrap();
+        let header = format!("Bearer {key}");
+        check_request(&auth, "GET", "/sockets", Some(&header), None, None)
+            .expect("API key from newly appeared file must be accepted");
+    }
+
+    #[test]
+    fn test_api_key_auth_drops_keys_when_file_removed() {
+        let (auth, key, keys_path) = make_test_api_key_auth();
+        std::fs::remove_file(&keys_path).unwrap();
+        let header = format!("Bearer {key}");
+        let result = check_request(&auth, "GET", "/sockets", Some(&header), None, None);
+        assert!(
+            result.is_err(),
+            "API key from removed file must be rejected"
+        );
+        assert_eq!(auth.key_count(), 0);
+    }
+
+    #[test]
+    fn test_gen_api_key_default_name_is_hash_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = dir.path().join("api-keys");
+        let name = append_api_key(&keys_path, "vhb_test", None).unwrap();
+        assert_eq!(name.len(), 8);
+        let content = std::fs::read_to_string(&keys_path).unwrap();
+        assert!(content.contains(&name));
+    }
+
+    #[test]
+    fn test_gen_api_key_rejects_whitespace_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = dir.path().join("api-keys");
+        assert!(append_api_key(&keys_path, "vhb_test", Some("bad name")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_api_key_auth_via_router() {
+        let (auth, key, _) = make_test_api_key_auth();
+        let app = make_api_key_test_router(vec![Box::new(auth)]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/sockets")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+} // mod apikey_tests

@@ -14,6 +14,9 @@ use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannel
 /// (fingerprint -> key) map of supported keys it contained. Bundling
 /// these avoids having to keep the per-path mtime in a second map in
 /// lockstep with the keys.
+// TODO: AuthKeysFile/KeyCache are duplicated as ApiKeysFile/ApiKeyCache
+// in auth_api_key; extract a generic WatchedFiles<T> so behavior fixes
+// cannot diverge.
 struct AuthKeysFile {
     mtime: SystemTime,
     keys: HashMap<String, PublicKey>,
@@ -308,6 +311,8 @@ const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
     "ssh.ephemeral-authorized_keys-all",
 ];
 
+// TODO: use sysconf.rs like auth_api_key does. Not a plain find_config()
+// swap: this registers not-yet-existing paths for later reload.
 pub(crate) fn create_ssh_authenticator(
     cli_authorized_keys: Option<String>,
     creds_dir: Option<&std::path::Path>,
