@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 // Reduced-feature builds leave some shared auth plumbing unused; the
-// default build still gets full dead-code checking.
-#![cfg_attr(not(feature = "sshauth"), allow(dead_code))]
+// default all-features build still gets full dead-code checking.
+#![cfg_attr(not(all(feature = "sshauth", feature = "jwtauth")), allow(dead_code))]
 
 use anyhow::{Context, bail};
 use async_stream::stream;
@@ -34,6 +34,8 @@ use tokio_vsock::VsockListener;
 use varlink_http_bridge::TlsChannelBinding;
 use zlink::varlink_service::Proxy;
 
+#[cfg(feature = "jwtauth")]
+mod auth_jwt;
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
 #[cfg(feature = "sshauth")]
@@ -42,8 +44,11 @@ mod ws_framing;
 
 use ws_framing::VarlinkFramer;
 
+#[cfg(feature = "jwtauth")]
+use auth_jwt::create_jwt_authenticator;
 #[cfg(feature = "sshauth")]
 use auth_ssh::create_ssh_authenticator;
+
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -1052,7 +1057,9 @@ async fn start_server(
 
 #[derive(Debug)]
 enum Command {
-    Bridge(BridgeCli),
+    // Boxed: BridgeCli is much larger than the other variants, so storing it
+    // inline would bloat every Command to its size (clippy::large_enum_variant).
+    Bridge(Box<BridgeCli>),
     #[cfg(feature = "sshauth")]
     ImportSsh(import_ssh::ImportSsh),
 }
@@ -1132,6 +1139,23 @@ impl std::str::FromStr for BindAddr {
     }
 }
 
+#[derive(Debug, Default)]
+struct JwtCliOptions {
+    issuer: Option<String>,
+    audience: Option<String>,
+    issuer_jwks: Option<std::path::PathBuf>,
+    require_claims: Vec<String>,
+}
+
+impl JwtCliOptions {
+    fn any_option_set(&self) -> bool {
+        self.issuer.is_some()
+            || self.audience.is_some()
+            || self.issuer_jwks.is_some()
+            || !self.require_claims.is_empty()
+    }
+}
+
 #[derive(Debug)]
 struct BridgeCli {
     binds: Vec<BindAddr>,
@@ -1140,6 +1164,7 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     authorized_keys: Option<String>,
+    jwt: JwtCliOptions,
     insecure: bool,
 }
 
@@ -1166,6 +1191,11 @@ fn print_help() {
           --key=PATH                        TLS private key PEM file
           --trust=PATH                      CA certificate PEM for client verification (mTLS)
           --authorized-keys=PATH            authorized SSH public keys file
+          --issuer=URL                      JWT issuer (accepted 'iss'); enables JWT bearer auth
+          --audience=ID                     accepted JWT 'aud' (default: hostname)
+          --issuer-jwks=PATH                issuer JWKS file (RS256/ES256 public keys)
+          --require-claim=NAME=VALUE        require claim NAME to match VALUE ('*' globs;
+                                            repeat for OR; distinct names AND), repeatable
           --insecure                        run without any authentication (DANGEROUS)
           --help                            display this help and exit
     "}
@@ -1197,6 +1227,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut key = None;
     let mut trust = None;
     let mut authorized_keys = None;
+    let mut jwt = JwtCliOptions::default();
     let mut insecure = false;
     let mut got_positional = false;
 
@@ -1208,6 +1239,10 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("issuer") => jwt.issuer = Some(parser.value()?.parse()?),
+            Long("audience") => jwt.audience = Some(parser.value()?.parse()?),
+            Long("issuer-jwks") => jwt.issuer_jwks = Some(parser.value()?.into()),
+            Long("require-claim") => jwt.require_claims.push(parser.value()?.parse()?),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1237,15 +1272,16 @@ fn parse_cli() -> anyhow::Result<Command> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
 
-    Ok(Command::Bridge(BridgeCli {
+    Ok(Command::Bridge(Box::new(BridgeCli {
         binds,
         varlink_sockets_path,
         cert,
         key,
         trust,
         authorized_keys,
+        jwt,
         insecure,
-    }))
+    })))
 }
 
 #[cfg(feature = "sshauth")]
@@ -1298,6 +1334,13 @@ async fn main() -> anyhow::Result<()> {
         bail!("--authorized-keys= requires building with the 'sshauth' feature");
     }
 
+    #[cfg(not(feature = "jwtauth"))]
+    if cli.jwt.any_option_set() {
+        bail!(
+            "--issuer/--audience/--issuer-jwks/--require-claim require building with the 'jwtauth' feature"
+        );
+    }
+
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
 
     #[cfg(feature = "sshauth")]
@@ -1308,6 +1351,13 @@ async fn main() -> anyhow::Result<()> {
             std::path::Path::new("/"),
         )?;
         authenticators.push(Box::new(ssh_auth));
+    }
+
+    #[cfg(feature = "jwtauth")]
+    if let Some(jwt_auth) =
+        create_jwt_authenticator(cli.jwt, creds_dir.as_deref(), std::path::Path::new("/"))?
+    {
+        authenticators.push(Box::new(jwt_auth));
     }
 
     if cli.insecure {

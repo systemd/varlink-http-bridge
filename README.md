@@ -405,6 +405,209 @@ This is recommended because for websocket requests only the initial
 "upgrade" request is signed with the ssh key, after the upgrade it is
 a plain WebSocket which relies on the underlying TLS for security.
 
+### JWT bearer authentication
+
+The bridge can also authenticate requests with a JSON Web Token (JWT)
+presented as `Authorization: Bearer <token>`. This is vendor-neutral:
+any OIDC-style issuer that signs tokens with **RS256** or **ES256** and
+publishes a JWKS works, including issuers you do not operate (GitHub
+Actions, Google, Keycloak, Auth0, ...).
+
+The node verifies the token's signature against the issuer's public keys
+(its JWKS), then checks `iss`, `aud` and `exp`. Because `aud` from a
+third-party IdP is often a shared value (not "this node"), real
+authorization comes from **claim requirements** on the node: one or more
+`--require-claim NAME=VALUE` rules that must all hold (see below).
+
+> **TLS is required in production.** A bearer token has no
+> proof-of-possession, so a captured token is replayable until it
+> expires; only transport TLS protects it in flight.
+
+#### Authorization: `--require-claim`
+
+Each `--require-claim NAME=VALUE` requires claim `NAME` to be present and
+to match `VALUE`. The rules compose:
+
+- distinct names are **ANDed**: every named claim must match;
+- repeating a name **ORs** its values: list it twice to allow either;
+- `VALUE` is an exact match or a `*` wildcard (e.g. `repo:myorg/*`); array
+  claims match if any element matches; `email_verified=true` works as-is.
+
+At least one rule is required. Without any, a valid token from the issuer would
+be accepted on `iss`/`aud`/`exp` alone, which is too weak for a third-party IdP
+(its `aud` is shared, not per-caller). So if no rule is configured, JWT auth is
+**not enabled**: the bridge logs a warning and leaves it off, while the other
+authenticators (SSH, mTLS) keep working.
+
+#### The issuer's public keys (JWKS)
+
+The node needs the issuer's public keys to verify signatures. By default it
+discovers them automatically: given an HTTPS `--issuer`, it fetches
+`<issuer>/.well-known/openid-configuration`, follows the `jwks_uri`, and caches
+the result. When a token arrives with an unknown key id the JWKS is re-fetched
+on demand (rate-limited), so issuer key rotation is handled without a restart.
+This is the right mode for third-party IdPs like Google and GitHub, which
+rotate their keys.
+
+To pin the keys instead (a self-run signer, an air-gapped node, or to avoid the
+outbound fetch), point `--issuer-jwks` at a local JWKS file; it overrides
+discovery and is hot-reloaded on change:
+
+```console
+$ curl -s https://<issuer>/.well-known/openid-configuration | jq -r .jwks_uri
+https://<issuer>/.well-known/jwks
+$ curl -s https://<issuer>/.well-known/jwks -o /etc/varlink-httpd/issuer-jwks.json
+```
+
+Server flags:
+
+```
+--issuer=URL                accepted 'iss' claim
+--audience=ID               accepted 'aud' claim (default: hostname)
+--issuer-jwks=PATH          pin a JWKS file (else fetched via OIDC discovery)
+--require-claim=NAME=VALUE  require claim NAME to match VALUE (repeatable)
+```
+
+Any of these can also come from a systemd credential instead of a flag.
+See "Auto-deploy via systemd credentials" below.
+
+#### Working example: a GitHub Actions org
+
+GitHub hands every workflow a short-lived OIDC token, so any CI job in
+your org can drive the bridge with no client certificate and no custom
+issuer. The token's GitHub claims (`repository_owner`, `repository`,
+`sub`, ...) drive authorization; see [GitHub's OIDC token
+reference](https://docs.github.com/en/actions/concepts/security/openid-connect#understanding-the-oidc-token)
+for the full set of claims and their formats.
+
+**Server**: trust the GitHub issuer and allow any repository in the
+`myorg` organisation:
+
+```console
+$ varlink-httpd \
+    --cert=server.pem --key=server-key.pem \
+    --issuer=https://token.actions.githubusercontent.com \
+    --audience=varlink-node-1 \
+    --require-claim=repository_owner=myorg
+```
+
+The node discovers GitHub's keys over HTTPS; no JWKS file is needed.
+
+`varlink-node-1` is a name you pick for this node: the server's `--audience` and
+the workflow's `&audience=` (below) must use the same string. For GitHub the
+audience is **not** an authorization boundary (the workflow chooses its own, so
+any repo could request `varlink-node-1`); it only marks a token as minted for
+this node. The `--require-claim` rules are what actually authorize, since GitHub,
+not the caller, sets `repository_owner` / `repository` / `sub`.
+
+Tighten the scope by adding or replacing `--require-claim` rules in the server
+command above (they compose):
+
+```console
+# a single repo
+--require-claim=repository=myorg/myrepo
+# only the main branch of that repo (sub encodes the ref/event)
+--require-claim="sub=repo:myorg/myrepo:ref:refs/heads/main"
+# either of two repos (OR), and only from the prod environment (AND)
+--require-claim=repository=myorg/a --require-claim=repository=myorg/b \
+    --require-claim=environment=prod
+```
+
+**Client**: in the workflow, request a token for that audience and pass
+it via `VARLINK_JWT` (requires `permissions: id-token: write`):
+
+```yaml
+jobs:
+  drive-node:
+    permissions:
+      id-token: write           # allow minting the OIDC token
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # fetch the OIDC token for our node's audience
+          TOKEN=$(curl -s \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=varlink-node-1" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            | jq -r .value)
+
+          VARLINK_JWT="$TOKEN" \
+          VARLINK_BRIDGE_URL=https://node-1:1031/ws/sockets/io.systemd.Hostname \
+            varlinkctl call exec:/usr/libexec/varlinkctl-http \
+            io.systemd.Hostname.Describe '{}'
+```
+
+#### Working example: a self-hosted Keycloak
+
+For real logins (SSO, multiple users, central revocation) without depending on a
+third party, run your own [Keycloak](https://www.keycloak.org/). Create a realm
+and a `varlink` client (public, with *Direct access grants*); Keycloak then
+serves discovery at `https://kc.example.com/realms/myrealm/.well-known/openid-configuration`,
+so the node fetches the keys itself (no `--issuer-jwks`):
+
+```console
+$ varlink-httpd ... \
+    --issuer=https://kc.example.com/realms/myrealm \
+    --audience=varlink \
+    --require-claim=sub=3f2a8c1e-...
+```
+
+`sub` is Keycloak's immutable per-user id (read it from the token, or the admin
+UI), so the rule survives a username rename; `preferred_username=me` is the
+readable alternative if you accept that a login name can change. Unlike the
+GitHub and Google cases, the id token's `aud` is your own client id, so
+`--audience=varlink` is a genuine boundary on top of the user claim. Fetch a
+token with the password grant in one request (`curl -d grant_type=password -d
+client_id=varlink -d scope="openid email" -d username=me -d password=... .../token`,
+read `.id_token`); the device and authorization-code flows work too.
+
+#### Other issuers (e.g. a personal Google account)
+
+Any OIDC issuer that signs with RS256/ES256 and publishes a discovery document
+works the same way: set `--issuer` and one or more `--require-claim` rules. A
+personal Google account is tempting because everyone already has one, but mind
+the audience. The easy path, `gcloud auth print-identity-token`, stamps `aud`
+with the *shared* Google Cloud SDK client id
+(`32555940559.apps.googleusercontent.com`) that every gcloud user also gets, so
+`aud` is worthless as a boundary and a single rule on the verified `email` (or
+`sub`) is the *only* thing authorizing the caller:
+
+```console
+$ varlink-httpd ... \
+    --issuer=https://accounts.google.com \
+    --audience=32555940559.apps.googleusercontent.com \
+    --require-claim=email=you@gmail.com \
+    --require-claim=email_verified=true
+```
+
+That works, but it leans the whole boundary on one claim, so do not loosen the
+`email`/`sub` rule. To get a real `aud` back, register your own Google OAuth
+client and fetch tokens with the device flow; by then you have done about as
+much setup as standing up a dedicated issuer like the Keycloak above.
+
+#### Auto-deploy via systemd credentials
+
+Every JWT setting can come from a systemd credential instead of a flag,
+so a node can be provisioned entirely from the credstore (see
+`systemd.exec(5)` and `systemd.system-credentials(7)`). JWT auth turns on
+as soon as an issuer is configured by either route.
+
+| Credential                         | Equivalent flag  |
+|------------------------------------|------------------|
+| `varlink-httpd.jwt.issuer`         | `--issuer`       |
+| `varlink-httpd.jwt.audience`       | `--audience`     |
+| `varlink-httpd.jwt.jwks`           | `--issuer-jwks` (optional; omit to use OIDC discovery) |
+| `varlink-httpd.jwt.require-claims` | `--require-claim` (one `NAME=VALUE` per line; `#` comments allowed) |
+
+For the GitHub org example above, provision the credstore instead of flags. With
+discovery there is no JWKS to ship, so the issuer is the only key-related entry:
+
+```console
+# /etc/credstore/ entries (or LoadCredential=/ImportCredential= in the unit)
+$ echo https://token.actions.githubusercontent.com \
+    > /etc/credstore/varlink-httpd.jwt.issuer
+$ echo varlink-node-1 > /etc/credstore/varlink-httpd.jwt.audience
+$ echo repository_owner=myorg > /etc/credstore/varlink-httpd.jwt.require-claims
+```
 
 ## vsock transport
 

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+// Reduced-feature builds leave some shared auth plumbing unused; the
+// default all-features build still gets full dead-code checking.
+#![cfg_attr(not(any(feature = "sshauth", feature = "jwtauth")), allow(dead_code))]
+
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -17,6 +21,8 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use varlink_http_bridge::TlsChannelBinding;
 
 mod client_auth;
+#[cfg(feature = "jwtauth")]
+mod jwt_client;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
 
@@ -579,7 +585,7 @@ mod tests {
         async fn test_ws_handshake_401_is_detected_as_unauthorized() {
             let err =
                 handshake_error("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
-            assert!(sshauth_client::is_http_unauthorized(&err), "{err:#}");
+            assert!(client_auth::is_http_unauthorized(&err), "{err:#}");
         }
 
         #[tokio::test]
@@ -587,7 +593,7 @@ mod tests {
             let err =
                 handshake_error("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
                     .await;
-            assert!(!sshauth_client::is_http_unauthorized(&err), "{err:#}");
+            assert!(!client_auth::is_http_unauthorized(&err), "{err:#}");
         }
     }
 }

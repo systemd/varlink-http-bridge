@@ -29,6 +29,31 @@ impl CredentialsLoader {
         let path = self.dir.join(id);
         path.exists().then_some(path)
     }
+
+    /// Trimmed content of a scalar credential, if present and non-empty.
+    #[must_use]
+    pub fn get_string(&self, id: &str) -> Option<String> {
+        let path = self.path(id)?;
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Non-empty, non-`#` lines of a list credential.
+    #[must_use]
+    pub fn get_lines(&self, id: &str) -> Vec<String> {
+        self.path(id)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Highest-precedence existing config file for `rel`, following the systemd
@@ -54,6 +79,22 @@ mod tests {
         let loader = CredentialsLoader::from_dir(dir.path());
         assert_eq!(loader.path("cert"), Some(dir.path().join("cert")));
         assert_eq!(loader.path("missing"), None);
+    }
+
+    #[test]
+    fn test_credentials_loader_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scalar"), "  value\n").unwrap();
+        std::fs::write(dir.path().join("list"), "a\n# comment\n\n b \n").unwrap();
+
+        let loader = CredentialsLoader::from_dir(dir.path());
+        assert_eq!(loader.get_string("scalar").as_deref(), Some("value"));
+        assert_eq!(loader.get_string("missing"), None);
+        assert_eq!(
+            loader.get_lines("list"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(loader.get_lines("missing"), Vec::<String>::new());
     }
 
     #[test]

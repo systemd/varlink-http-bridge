@@ -1990,3 +1990,951 @@ mod sshauth_tests {
         assert_hostname_reply(&output);
     }
 } // mod sshauth_tests
+
+// --- JWT bearer auth tests ---
+
+#[cfg(feature = "jwtauth")]
+mod jwtauth_tests {
+    use super::*;
+    use crate::auth_jwt::{JwtAuthenticator, create_jwt_authenticator};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use openssl::pkey::PKey;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_ISSUER: &str = "https://issuer.example";
+    const TEST_AUDIENCE: &str = "node-1";
+
+    fn now_secs() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
+    /// base64url without padding, per RFC 7515/7518 (JWK members).
+    fn b64url(bytes: &[u8]) -> String {
+        openssl::base64::encode_block(bytes)
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    }
+
+    /// Left-pad a big-endian integer to `len` bytes (JWK coordinates are
+    /// fixed-width; `BigNum::to_vec` drops leading zero bytes).
+    fn pad_be(bytes: &[u8], len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len.saturating_sub(bytes.len())];
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// A test JWT issuer: a freshly generated keypair plus the matching JWKS.
+    struct TestIssuer {
+        priv_pem: Vec<u8>,
+        alg: Algorithm,
+        kid: String,
+    }
+
+    impl TestIssuer {
+        fn es256() -> Self {
+            let pkey = crate::auth_jwt::generate_p256_keypair();
+            Self {
+                priv_pem: pkey.private_key_to_pem_pkcs8().unwrap(),
+                alg: Algorithm::ES256,
+                kid: "test-ec".to_string(),
+            }
+        }
+
+        fn rs256() -> Self {
+            let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+            let pkey = PKey::from_rsa(rsa).unwrap();
+            Self {
+                priv_pem: pkey.private_key_to_pem_pkcs8().unwrap(),
+                alg: Algorithm::RS256,
+                kid: "test-rsa".to_string(),
+            }
+        }
+
+        /// The public half of this issuer's key as a single JWK.
+        fn jwk(&self) -> Value {
+            let pkey = PKey::private_key_from_pem(&self.priv_pem).unwrap();
+            match self.alg {
+                Algorithm::ES256 => {
+                    use openssl::bn::{BigNum, BigNumContext};
+                    let ec = pkey.ec_key().unwrap();
+                    let mut ctx = BigNumContext::new().unwrap();
+                    let (mut x, mut y) = (BigNum::new().unwrap(), BigNum::new().unwrap());
+                    ec.public_key()
+                        .affine_coordinates(ec.group(), &mut x, &mut y, &mut ctx)
+                        .unwrap();
+                    json!({
+                        "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
+                        "kid": self.kid,
+                        "x": b64url(&pad_be(&x.to_vec(), 32)),
+                        "y": b64url(&pad_be(&y.to_vec(), 32)),
+                    })
+                }
+                Algorithm::RS256 => {
+                    let rsa = pkey.rsa().unwrap();
+                    json!({
+                        "kty": "RSA", "alg": "RS256", "use": "sig",
+                        "kid": self.kid,
+                        "n": b64url(&rsa.n().to_vec()),
+                        "e": b64url(&rsa.e().to_vec()),
+                    })
+                }
+                other => panic!("unsupported test alg {other:?}"),
+            }
+        }
+
+        /// Write this issuer's JWKS to a fresh temp file and return both the
+        /// tempdir (keep it alive) and the path.
+        fn write_jwks(&self) -> (tempfile::TempDir, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("jwks.json");
+            let jwks = json!({ "keys": [self.jwk()] });
+            std::fs::write(&path, serde_json::to_vec(&jwks).unwrap()).unwrap();
+            (dir, path)
+        }
+
+        fn encoding_key(&self) -> EncodingKey {
+            match self.alg {
+                Algorithm::ES256 => EncodingKey::from_ec_pem(&self.priv_pem).unwrap(),
+                Algorithm::RS256 => EncodingKey::from_rsa_pem(&self.priv_pem).unwrap(),
+                other => panic!("unsupported test alg {other:?}"),
+            }
+        }
+
+        fn mint(&self, claims: &Value) -> String {
+            let mut header = Header::new(self.alg);
+            header.kid = Some(self.kid.clone());
+            encode(&header, claims, &self.encoding_key()).unwrap()
+        }
+    }
+
+    /// Standard, valid set of claims (iss/aud match the server, not expired).
+    fn valid_claims(sub: &str) -> Value {
+        json!({
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "sub": sub,
+            "exp": now_secs() + 300,
+            "iat": now_secs(),
+        })
+    }
+
+    /// `JwtAuthenticator` backed by `issuer`'s JWKS, with the given
+    /// `--require-claim` rules (e.g. `["sub=alice"]`).
+    fn auth_with_claims(
+        issuer: &TestIssuer,
+        rules: &[&str],
+    ) -> (tempfile::TempDir, JwtAuthenticator) {
+        let (dir, jwks_path) = issuer.write_jwks();
+        let auth = JwtAuthenticator::new_for_test(
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            jwks_path,
+            rules.iter().map(|s| (*s).to_string()).collect(),
+        )
+        .unwrap();
+        (dir, auth)
+    }
+
+    /// `JwtAuthenticator` requiring `sub == "alice"`, backed by `issuer`'s JWKS.
+    fn auth_with_allowlist(issuer: &TestIssuer) -> (tempfile::TempDir, JwtAuthenticator) {
+        auth_with_claims(issuer, &["sub=alice"])
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    #[test]
+    fn test_jwt_accepts_valid_es256_allowlisted_sub() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let token = issuer.mint(&valid_claims("alice"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("valid token for allowlisted sub should pass");
+    }
+
+    #[test]
+    fn test_jwt_rejects_sub_not_in_allowlist() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let token = issuer.mint(&valid_claims("mallory"));
+        let err =
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not in the allowed set"),
+            "expected allowlist rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_accepts_rs256() {
+        let issuer = TestIssuer::rs256();
+        // sub=anyone is satisfied by the token, so this exercises RS256 verification.
+        let (_dir, auth) = auth_with_claims(&issuer, &["sub=anyone"]);
+        let token = issuer.mint(&valid_claims("anyone"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("valid RS256 token should pass");
+    }
+
+    #[test]
+    fn test_jwt_accepts_matching_custom_claim() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_claims(&issuer, &["hd=example.com"]);
+        let mut claims = valid_claims("anyone");
+        claims["hd"] = json!("example.com");
+        let token = issuer.mint(&claims);
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("token with the required claim value should pass");
+    }
+
+    #[test]
+    fn test_jwt_glob_claim_match() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_claims(&issuer, &["sub=repo:myorg/myrepo:*"]);
+
+        let mut ok = valid_claims("x");
+        ok["sub"] = json!("repo:myorg/myrepo:ref:refs/heads/main");
+        let token = issuer.mint(&ok);
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("glob should match any ref under the repo");
+
+        let mut bad = valid_claims("x");
+        bad["sub"] = json!("repo:otherorg/repo:ref:refs/heads/main");
+        let token = issuer.mint(&bad);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "glob is anchored: a different repo must not match"
+        );
+    }
+
+    #[test]
+    fn test_jwt_distinct_claims_are_anded() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) =
+            auth_with_claims(&issuer, &["repository=myorg/myrepo", "environment=prod"]);
+
+        let mut claims = valid_claims("x");
+        claims["repository"] = json!("myorg/myrepo");
+        claims["environment"] = json!("prod");
+        let token = issuer.mint(&claims);
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("both required claims present and matching");
+
+        let mut claims = valid_claims("x");
+        claims["repository"] = json!("myorg/myrepo");
+        claims["environment"] = json!("staging");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "all distinct claims must match (AND)"
+        );
+
+        let mut claims = valid_claims("x");
+        claims["repository"] = json!("myorg/myrepo");
+        let token = issuer.mint(&claims);
+        let err =
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).unwrap_err();
+        assert!(err.to_string().contains("missing"), "got: {err}");
+    }
+
+    #[test]
+    fn test_jwt_repeated_claim_is_ored() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_claims(&issuer, &["repository=myorg/a", "repository=myorg/b"]);
+        for repo in ["myorg/a", "myorg/b"] {
+            let mut claims = valid_claims("x");
+            claims["repository"] = json!(repo);
+            let token = issuer.mint(&claims);
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+                .unwrap_or_else(|e| panic!("repository {repo} should be allowed: {e}"));
+        }
+        let mut claims = valid_claims("x");
+        claims["repository"] = json!("myorg/c");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "a value not listed must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_jwt_array_claim_matches_any_element() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_claims(&issuer, &["groups=admins"]);
+        let mut claims = valid_claims("x");
+        claims["groups"] = json!(["users", "admins"]);
+        let token = issuer.mint(&claims);
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("array claim should match if any element matches");
+    }
+
+    #[test]
+    fn test_jwt_configured_entirely_from_credentials() {
+        let issuer = TestIssuer::es256();
+        let creds = tempfile::tempdir().unwrap();
+        let jwks = json!({ "keys": [issuer.jwk()] });
+        std::fs::write(
+            creds.path().join("varlink-httpd.jwt.jwks"),
+            serde_json::to_vec(&jwks).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(creds.path().join("varlink-httpd.jwt.issuer"), TEST_ISSUER).unwrap();
+        std::fs::write(
+            creds.path().join("varlink-httpd.jwt.audience"),
+            TEST_AUDIENCE,
+        )
+        .unwrap();
+        std::fs::write(
+            creds.path().join("varlink-httpd.jwt.require-claims"),
+            "sub=alice\n# a comment line\n",
+        )
+        .unwrap();
+
+        // Empty root so the /etc path is absent; everything resolves from creds.
+        let root = tempfile::tempdir().unwrap();
+        let auth =
+            create_jwt_authenticator(JwtCliOptions::default(), Some(creds.path()), root.path())
+                .unwrap()
+                .expect("issuer credential should enable JWT auth");
+
+        let token = issuer.mint(&valid_claims("alice"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("credential-configured node should accept a valid token");
+
+        let token = issuer.mint(&valid_claims("mallory"));
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "require-claims credential should still be enforced"
+        );
+    }
+
+    #[test]
+    fn test_jwt_cli_require_claims_override_credential() {
+        let issuer = TestIssuer::es256();
+        let creds = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds.path().join("varlink-httpd.jwt.jwks"),
+            serde_json::to_vec(&json!({ "keys": [issuer.jwk()] })).unwrap(),
+        )
+        .unwrap();
+        // Credential requires sub=alice; the CLI flag must replace it, not merge.
+        std::fs::write(
+            creds.path().join("varlink-httpd.jwt.require-claims"),
+            "sub=alice",
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let auth = create_jwt_authenticator(
+            JwtCliOptions {
+                issuer: Some(TEST_ISSUER.to_string()),
+                audience: Some(TEST_AUDIENCE.to_string()),
+                require_claims: vec!["sub=bob".to_string()],
+                ..Default::default()
+            },
+            Some(creds.path()),
+            root.path(),
+        )
+        .unwrap()
+        .expect("issuer enables JWT auth");
+
+        let token = issuer.mint(&valid_claims("bob"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("the CLI require-claim should apply");
+
+        let token = issuer.mint(&valid_claims("alice"));
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "CLI --require-claim must replace the credential's rules, not merge"
+        );
+    }
+
+    #[test]
+    fn test_jwt_disabled_without_issuer() {
+        let creds = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let result =
+            create_jwt_authenticator(JwtCliOptions::default(), Some(creds.path()), root.path())
+                .unwrap();
+        assert!(
+            result.is_none(),
+            "no issuer anywhere -> JWT auth not enabled"
+        );
+    }
+
+    #[test]
+    fn test_jwt_etc_jwks_file_wins_over_discovery() {
+        let issuer = TestIssuer::es256();
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc/varlink-httpd");
+        std::fs::create_dir_all(&etc).unwrap();
+        let jwks = json!({ "keys": [issuer.jwk()] });
+        std::fs::write(
+            etc.join("issuer-jwks.json"),
+            serde_json::to_vec(&jwks).unwrap(),
+        )
+        .unwrap();
+
+        // TEST_ISSUER is an https URL, but the pinned file must win (with a
+        // warning) and no discovery fetch must happen.
+        let auth = create_jwt_authenticator(
+            JwtCliOptions {
+                issuer: Some(TEST_ISSUER.to_string()),
+                audience: Some(TEST_AUDIENCE.to_string()),
+                require_claims: vec!["sub=alice".to_string()],
+                ..Default::default()
+            },
+            None,
+            root.path(),
+        )
+        .unwrap()
+        .expect("issuer enables JWT auth");
+
+        let token = issuer.mint(&valid_claims("alice"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("pinned /etc JWKS should verify the token without discovery");
+    }
+
+    #[test]
+    fn test_jwt_other_flags_without_issuer_disabled() {
+        // audience/jwks/require-claim given but no issuer: still disabled (the
+        // flags are ignored, with a warning), not enabled wide open.
+        let creds = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let result = create_jwt_authenticator(
+            JwtCliOptions {
+                audience: Some(TEST_AUDIENCE.to_string()),
+                require_claims: vec!["sub=alice".to_string()],
+                ..Default::default()
+            },
+            Some(creds.path()),
+            root.path(),
+        )
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "JWT flags without an issuer must not enable JWT auth"
+        );
+    }
+
+    #[test]
+    fn test_jwt_not_enabled_without_rules() {
+        let issuer = TestIssuer::es256();
+        let (_dir, jwks_path) = issuer.write_jwks();
+        let root = tempfile::tempdir().unwrap();
+        // Issuer + audience but no --require-claim: JWT is left off (not wide-open),
+        // without failing the whole bridge.
+        let result = create_jwt_authenticator(
+            JwtCliOptions {
+                issuer: Some(TEST_ISSUER.to_string()),
+                audience: Some(TEST_AUDIENCE.to_string()),
+                issuer_jwks: Some(jwks_path),
+                ..Default::default()
+            },
+            None,
+            root.path(),
+        )
+        .unwrap();
+        assert!(result.is_none(), "no rules -> JWT auth not enabled");
+    }
+
+    #[test]
+    fn test_jwt_rejects_expired() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims["exp"] = json!(now_secs() - 120); // beyond the 60s leeway
+        claims["iat"] = json!(now_secs() - 300);
+        let token = issuer.mint(&claims);
+        let err =
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verification failure for expired token, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_future_nbf() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims["nbf"] = json!(now_secs() + 120); // not valid yet, beyond the 60s leeway
+        let token = issuer.mint(&claims);
+        let err =
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verification failure for not-yet-valid (nbf) token, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_wrong_issuer() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims["iss"] = json!("https://evil.example");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "token with wrong issuer should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_wrong_audience() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims["aud"] = json!("node-2");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "token minted for another node's audience should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_missing_audience() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims.as_object_mut().unwrap().remove("aud");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "a token omitting aud must not bypass the per-node audience check"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_missing_issuer() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let mut claims = valid_claims("alice");
+        claims.as_object_mut().unwrap().remove("iss");
+        let token = issuer.mint(&claims);
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "a token omitting iss must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_token_signed_by_untrusted_key() {
+        // JWKS belongs to `trusted`; the token is signed by `attacker`.
+        let trusted = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&trusted);
+
+        let mut attacker = TestIssuer::es256();
+        attacker.kid = trusted.kid.clone(); // even claiming the same kid must not help
+        let token = attacker.mint(&valid_claims("alice"));
+        assert!(
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None).is_err(),
+            "token signed by an untrusted key must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_jwt_rejects_non_bearer_scheme() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let token = issuer.mint(&valid_claims("alice"));
+        let dpop = format!("DPoP {token}");
+        let err = check_request(&auth, "GET", "/sockets", Some(&dpop), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("scheme must be 'Bearer'"),
+            "non-Bearer scheme should be rejected in stage-1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jwt_accepts_case_insensitive_bearer_scheme() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let token = issuer.mint(&valid_claims("alice"));
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&format!("bearer {token}")),
+            None,
+            None,
+        )
+        .expect("lowercase scheme should be accepted");
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&format!("BEARER {token}")),
+            None,
+            None,
+        )
+        .expect("uppercase scheme should be accepted");
+    }
+
+    #[test]
+    fn test_jwt_picks_up_rotated_key_on_reload() {
+        // Start trusting issuer A, then rotate the JWKS file to issuer B's key.
+        let issuer_a = TestIssuer::es256();
+        let (dir, jwks_path) = issuer_a.write_jwks();
+        let auth = JwtAuthenticator::new_for_test(
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            jwks_path.clone(),
+            vec!["sub=anyone".to_string()],
+        )
+        .unwrap();
+
+        let token_a = issuer_a.mint(&valid_claims("anyone"));
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&bearer(&token_a)),
+            None,
+            None,
+        )
+        .expect("token from the initially-trusted key should pass");
+
+        // Rotate: overwrite the JWKS with a different issuer key (same kid).
+        let mut issuer_b = TestIssuer::es256();
+        issuer_b.kid = issuer_a.kid.clone();
+        let jwks = json!({ "keys": [issuer_b.jwk()] });
+        // Ensure a new mtime even on coarse-grained filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&jwks_path, serde_json::to_vec(&jwks).unwrap()).unwrap();
+
+        let token_b = issuer_b.mint(&valid_claims("anyone"));
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&bearer(&token_b)),
+            None,
+            None,
+        )
+        .expect("after reload, token from the rotated key should pass");
+        // The old key is gone, so its token must now be rejected.
+        assert!(
+            check_request(
+                &auth,
+                "GET",
+                "/sockets",
+                Some(&bearer(&token_a)),
+                None,
+                None
+            )
+            .is_err(),
+            "after rotation the old key's token should be rejected"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn test_jwt_keeps_keys_when_jwks_becomes_invalid_then_recovers() {
+        let issuer = TestIssuer::es256();
+        let (dir, jwks_path) = issuer.write_jwks();
+        let auth = JwtAuthenticator::new_for_test(
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            jwks_path.clone(),
+            vec!["sub=anyone".to_string()],
+        )
+        .unwrap();
+        let token = issuer.mint(&valid_claims("anyone"));
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("initial key should pass");
+
+        // Overwrite with garbage: the previous keys must be retained, and (with
+        // the mtime now recorded) repeated requests must keep validating.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&jwks_path, b"not json").unwrap();
+        for _ in 0..3 {
+            check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+                .expect("a broken JWKS file must not drop the working keys");
+        }
+
+        // A later valid rewrite is still picked up.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            &jwks_path,
+            serde_json::to_vec(&json!({ "keys": [issuer.jwk()] })).unwrap(),
+        )
+        .unwrap();
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("after a valid rewrite the keys should reload");
+        drop(dir);
+    }
+
+    #[test]
+    fn test_jwt_authenticator_debug() {
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let s = format!("{auth:?}");
+        assert!(s.contains("JwtAuthenticator"), "got: {s}");
+        // one key loaded, lock healthy -> rendered as the count, not <poisoned>
+        assert!(s.contains("key_count: 1"), "got: {s}");
+    }
+
+    // --- end-to-end through the HTTP auth middleware ---
+
+    fn make_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
+        let tmpdir = tempfile::tempdir().unwrap();
+        // /sockets over an empty dir returns an empty list with 200, which is
+        // all we need to prove the request made it past the auth middleware.
+        let path = tmpdir.keep();
+        create_router(path.to_str().unwrap(), authenticators).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_jwt_http_accepts_valid_and_rejects_invalid() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let issuer = TestIssuer::es256();
+        let (_dir, auth) = auth_with_allowlist(&issuer);
+        let app = make_router(vec![Box::new(auth)]);
+
+        // Valid token for an allowlisted sub -> request reaches the handler.
+        let token = issuer.mint(&valid_claims("alice"));
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::get("/sockets")
+                    .header("Authorization", bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Garbage token -> 401.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::get("/sockets")
+                    .header("Authorization", "Bearer not-a-jwt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        // No Authorization header at all -> 401.
+        let missing = app
+            .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Build a JWT-only TLS server (issuer JWKS + `sub` allowlist) and return it
+    /// together with the issuer, the temp dirs to keep alive, and a fake
+    /// `XDG_CONFIG_HOME` holding the server CA so the client trusts the server.
+    /// Mirrors the setup of `sshauth_tests::test_tls_ssh_e2e`.
+    async fn jwt_tls_server() -> (
+        TestIssuer,
+        TestServer<std::net::SocketAddr>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        TestPki,
+    ) {
+        let pki = make_test_pki();
+        let issuer = TestIssuer::es256();
+        let (jwks_dir, jwks_path) = issuer.write_jwks();
+        let auth = JwtAuthenticator::new_for_test(
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            jwks_path,
+            vec!["sub=alice".to_string()],
+        )
+        .unwrap();
+
+        let acceptor = load_tls_acceptor(
+            pki.server_cert_path.to_str().unwrap(),
+            pki.server_key_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let server =
+            run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
+
+        let fake_xdg_home = tempfile::tempdir().unwrap();
+        let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::copy(&pki.ca_cert_path, tls_dir.join("server-ca-file")).unwrap();
+
+        (issuer, server, jwks_dir, fake_xdg_home, pki)
+    }
+
+    /// Full TLS client→server flow, the JWT analogue of `test_tls_ssh_e2e`:
+    /// varlinkctl drives `varlinkctl-http`, which reads `VARLINK_JWT` and sends
+    /// `Authorization: Bearer <token>` on the websocket upgrade; the server
+    /// verifies it against the issuer JWKS over a real TLS connection.
+    #[test_with::path(/usr/bin/openssl)]
+    #[test_with::path(/usr/bin/varlinkctl)]
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
+    #[tokio::test]
+    async fn test_tls_jwt_bearer_e2e() {
+        let (issuer, server, _jwks_dir, fake_xdg_home, _pki) = jwt_tls_server().await;
+        let bridge_url = format!(
+            "https://localhost:{}/ws/sockets/io.systemd.Hostname",
+            server.addr.port()
+        );
+        let token = issuer.mint(&valid_claims("alice"));
+
+        let output = tokio::process::Command::new("varlinkctl")
+            .args([
+                "call",
+                "--json=short",
+                &format!("exec:{}", helper_binary().display()),
+                "io.systemd.Hostname.Describe",
+                "{}",
+            ])
+            .env("VARLINK_BRIDGE_URL", &bridge_url)
+            .env("XDG_CONFIG_HOME", fake_xdg_home.path())
+            .env("VARLINK_JWT", &token)
+            // make sure no ambient ssh-agent interferes with the JWT path
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("VARLINK_SSH_KEY")
+            .output()
+            .await
+            .expect("failed to run varlinkctl");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "varlinkctl with TLS + JWT bearer failed (stderr: {stderr})"
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
+        let line = stdout.trim().trim_start_matches('\x1e');
+        let body: Value = serde_json::from_str(line).expect("invalid JSON");
+        let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+        assert_eq!(body["Hostname"], expected_hostname);
+    }
+
+    /// Same TLS setup, but without `VARLINK_JWT` the client sends no bearer
+    /// token, so the JWT-only server rejects the upgrade and varlinkctl fails.
+    #[test_with::path(/usr/bin/openssl)]
+    #[test_with::path(/usr/bin/varlinkctl)]
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
+    #[tokio::test]
+    async fn test_tls_jwt_bearer_e2e_no_token_rejected() {
+        let (_issuer, server, _jwks_dir, fake_xdg_home, _pki) = jwt_tls_server().await;
+        let bridge_url = format!(
+            "https://localhost:{}/ws/sockets/io.systemd.Hostname",
+            server.addr.port()
+        );
+
+        let output = tokio::process::Command::new("varlinkctl")
+            .args([
+                "call",
+                "--json=short",
+                &format!("exec:{}", helper_binary().display()),
+                "io.systemd.Hostname.Describe",
+                "{}",
+            ])
+            .env("VARLINK_BRIDGE_URL", &bridge_url)
+            .env("XDG_CONFIG_HOME", fake_xdg_home.path())
+            .env_remove("VARLINK_JWT")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("VARLINK_SSH_KEY")
+            .output()
+            .await
+            .expect("failed to run varlinkctl");
+
+        assert!(
+            !output.status.success(),
+            "varlinkctl without a JWT should be rejected by the JWT-only server"
+        );
+    }
+
+    /// End-to-end URL mode: a local OIDC issuer serves the discovery document
+    /// and JWKS over HTTP; the authenticator fetches the keys by URL (no file)
+    /// and verifies a token signed by that issuer.
+    #[tokio::test]
+    async fn test_jwt_url_discovery_e2e() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let issuer = TestIssuer::es256();
+        let jwks_json = json!({ "keys": [issuer.jwk()] }).to_string();
+
+        // Bind first so we know the port to advertise in the discovery doc.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = json!({ "issuer": base, "jwks_uri": format!("{base}/jwks") }).to_string();
+
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || {
+                    let d = discovery.clone();
+                    async move { ([("content-type", "application/json")], d) }
+                }),
+            )
+            .route(
+                "/jwks",
+                get(move || {
+                    let j = jwks_json.clone();
+                    async move { ([("content-type", "application/json")], j) }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Build the authenticator in URL mode (no jwks file): it fetches the
+        // discovery doc + JWKS at startup. Run it off the async worker since the
+        // fetch is blocking.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let issuer_url = base.clone();
+        let auth = tokio::task::spawn_blocking(move || {
+            create_jwt_authenticator(
+                JwtCliOptions {
+                    issuer: Some(issuer_url),
+                    audience: Some(TEST_AUDIENCE.to_string()),
+                    // no issuer_jwks: forces URL/discovery mode
+                    require_claims: vec!["sub=alice".to_string()],
+                    ..Default::default()
+                },
+                None,
+                &root_path,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("issuer URL should enable JWT auth");
+
+        // Token's iss must match the configured issuer (the server URL).
+        let claims = json!({
+            "iss": base,
+            "aud": TEST_AUDIENCE,
+            "sub": "alice",
+            "exp": now_secs() + 300,
+            "iat": now_secs(),
+        });
+        let token = issuer.mint(&claims);
+        check_request(&auth, "GET", "/sockets", Some(&bearer(&token)), None, None)
+            .expect("token should verify against the discovered JWKS");
+
+        server.abort();
+    }
+} // mod jwtauth_tests

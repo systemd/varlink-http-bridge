@@ -52,5 +52,8 @@ ImportCredential=varlink-httpd.tls.trust:trust
 ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
 
+# JWT configuration (issuer, audience, jwks, require-claims)
+ImportCredential=varlink-httpd.jwt.*
+
 [Install]
 WantedBy=network.target

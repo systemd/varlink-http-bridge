@@ -9,6 +9,7 @@
 use anyhow::Result;
 use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
+use tokio_tungstenite::tungstenite;
 
 pub(crate) trait ClientAuth {
     fn name(&self) -> &'static str;
@@ -29,15 +30,24 @@ pub(crate) trait ClientAuth {
 
 /// Always compiled, so a credential whose method is compiled out warns
 /// instead of being silently ignored.
-const METHOD_FEATURES: &[(&str, &str, bool)] =
-    &[("VARLINK_SSH_KEY", "sshauth", cfg!(feature = "sshauth"))];
+const METHOD_FEATURES: &[(&str, &str, bool)] = &[
+    ("VARLINK_JWT", "jwtauth", cfg!(feature = "jwtauth")),
+    ("VARLINK_SSH_KEY", "sshauth", cfg!(feature = "sshauth")),
+];
 
 /// In precedence order.
 fn methods() -> Vec<&'static dyn ClientAuth> {
     vec![
+        #[cfg(feature = "jwtauth")]
+        &crate::jwt_client::JwtBearer,
         #[cfg(feature = "sshauth")]
         &crate::sshauth_client::SshSignature,
     ]
+}
+
+pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tungstenite::Error>()
+        .is_some_and(|e| matches!(e, tungstenite::Error::Http(r) if r.status() == 401))
 }
 
 pub(crate) async fn connect_ws(url: &str) -> Result<crate::Ws> {

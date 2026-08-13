@@ -16,8 +16,9 @@ name = "varlinkctl-http"
 path = "src/bin/varlinkctl-http/main.rs"
 
 [features]
-default = ["sshauth"]
+default = ["sshauth", "jwtauth"]
 sshauth = ["dep:ssh-key", "dep:sshauth", "dep:tempfile", "dep:ssh-key-import"]
+jwtauth = ["dep:jsonwebtoken", "dep:ureq", "rustix/system"]
 # never enable directly: pulled in via the self dev-dependency so that
 # test-only constructors exist in test builds but not in release builds
 test-helpers = []
@@ -61,6 +62,8 @@ ssh-key = { version = "0.6", optional = true }
 sshauth = { git = "https://github.com/mvo5/sshauth.git", branch = "add-support-for-SkEd25519", optional = true }
 tempfile = { version = "3.27", optional = true }
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
+jsonwebtoken = { version = "9", optional = true }
+ureq = { version = "3", optional = true, default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 varlink-http-bridge = { path = ".", features = ["test-helpers"] }
