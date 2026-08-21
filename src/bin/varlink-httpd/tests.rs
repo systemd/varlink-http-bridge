@@ -1126,8 +1126,7 @@ async fn test_tls_credentials_directory_fallback() {
 
     // No CLI flags; resolve_tls_acceptor should pick up creds from the directory
     let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()))
-        .expect("credentials directory fallback failed")
-        .expect("expected Some(acceptor) from credentials directory");
+        .expect("credentials directory fallback failed");
 
     let varlink_dir = tempfile::tempdir().unwrap();
     let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
@@ -1231,13 +1230,20 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
 }
 
 #[test]
-fn test_tls_credentials_directory_returns_none_without_creds() {
+fn test_tls_half_configured_is_rejected() {
     let empty_dir = tempfile::tempdir().unwrap();
-    let result = resolve_tls_acceptor(None, None, None, Some(empty_dir.path())).unwrap();
-    assert!(
-        result.is_none(),
-        "empty credentials dir should yield no TLS"
-    );
+    for (cert, key) in [
+        (Some("/nonexistent/cert.pem".to_string()), None),
+        (None, Some("/nonexistent/key.pem".to_string())),
+    ] {
+        let Err(err) = resolve_tls_acceptor(cert, key, None, Some(empty_dir.path())) else {
+            panic!("--cert and --key must be given together");
+        };
+        assert!(
+            format!("{err:#}").contains("must be specified together"),
+            "unexpected error: {err:#}"
+        );
+    }
 }
 
 #[test_with::path(/usr/bin/openssl)]
