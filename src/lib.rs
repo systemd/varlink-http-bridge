@@ -44,6 +44,27 @@ pub fn parse_vsock_cid_port(authority: &str) -> anyhow::Result<(u32, u32)> {
     }
 }
 
+/// Fingerprint of a certificate's public key: base64 of the SHA-256 digest
+/// of the DER-encoded `SubjectPublicKeyInfo`.
+///
+/// httpd prints it if a self-signed cert is used, and the client pins against it.
+/// The encoding matches what `curl --pinnedpubkey sha256//…` expects.
+///
+/// # Errors
+/// Returns an error if the key cannot be extracted or DER-encoded.
+pub fn public_key_pin(cert: &openssl::x509::X509Ref) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let spki = cert
+        .public_key()
+        .context("reading certificate public key")?
+        .public_key_to_der()
+        .context("encoding SubjectPublicKeyInfo")?;
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &spki)
+        .context("hashing SubjectPublicKeyInfo")?;
+    Ok(openssl::base64::encode_block(&digest))
+}
+
 /// TLS channel binding label per RFC 9266 (`tls-exporter`).
 ///
 /// Both client and server call `export_keying_material()` with this label

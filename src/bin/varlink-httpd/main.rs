@@ -39,6 +39,7 @@ mod auth_ssh;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
+mod tls_cert;
 mod ws_framing;
 
 use ws_framing::VarlinkFramer;
@@ -499,15 +500,17 @@ fn load_tls_acceptor(
     Ok(builder.build())
 }
 
-/// Resolve TLS configuration: explicit paths take priority, then fall back to
-/// systemd's $`CREDENTIALS_DIRECTORY` (see systemd.exec(5)), then no TLS.
+/// Resolve TLS configuration: explicit paths take priority, then systemd's
+/// $`CREDENTIALS_DIRECTORY` (see systemd.exec(5)), then a self-signed
+/// certificate generated and persisted under the state directory.
+///
 /// Credential file names match the CLI flag names: cert, key, trust.
 fn resolve_tls_acceptor(
     cli_cert: Option<String>,
     cli_key: Option<String>,
     cli_ca: Option<String>,
     creds_dir: Option<&std::path::Path>,
-) -> anyhow::Result<Option<openssl::ssl::SslAcceptor>> {
+) -> anyhow::Result<openssl::ssl::SslAcceptor> {
     let creds = creds_dir.map(varlink_http_bridge::sysconf::CredentialsLoader::from_dir);
     let cred = |name: &str| -> Option<String> {
         creds
@@ -521,12 +524,21 @@ fn resolve_tls_acceptor(
     let client_ca = cli_ca.or_else(|| cred("trust"));
 
     match (tls_cert.as_deref(), tls_key.as_deref()) {
-        (Some(cert), Some(key)) => Ok(Some(load_tls_acceptor(cert, key, client_ca.as_deref())?)),
+        (Some(cert), Some(key)) => load_tls_acceptor(cert, key, client_ca.as_deref()),
         (None, None) => {
-            if client_ca.is_some() {
-                bail!("--trust requires --cert and --key");
-            }
-            Ok(None)
+            // TLS is not optional, generate a self-signed cert.
+            let dir = tls_cert::state_dir()?;
+            let (cert_path, key_path) = tls_cert::load_or_generate(&dir)?;
+            tls_cert::print_pin(&cert_path)?;
+            load_tls_acceptor(
+                cert_path
+                    .to_str()
+                    .expect("failed to convert cert path to str"),
+                key_path
+                    .to_str()
+                    .expect("failed to convert key path to str"),
+                client_ca.as_deref(),
+            )
         }
         _ => bail!("--cert and --key must be specified together"),
     }
@@ -1251,10 +1263,13 @@ fn print_help() {
                                             default: 0.0.0.0:{DEFAULT_PORT})
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
           --cert=PATH                       TLS certificate PEM file
+                                            (default: self-signed, generated
+                                            and persisted on first start)
           --key=PATH                        TLS private key PEM file
           --trust=PATH                      CA certificate PEM for client verification (mTLS)
           --authorized-keys=PATH            authorized SSH public keys file
-          --insecure                        run without any authentication (DANGEROUS)
+          --insecure                        run over plain HTTP without any
+                                            authentication (DANGEROUS)
           --help                            display this help and exit
     "}
     );
@@ -1379,7 +1394,21 @@ async fn main() -> anyhow::Result<()> {
     let has_mtls =
         cli.trust.is_some() || creds_dir.as_ref().is_some_and(|d| d.join("trust").exists());
 
-    let tls_acceptor = resolve_tls_acceptor(cli.cert, cli.key, cli.trust, creds_dir.as_deref())?;
+    let tls_acceptor = if cli.insecure {
+        None
+    } else {
+        Some(resolve_tls_acceptor(
+            cli.cert,
+            cli.key,
+            cli.trust,
+            creds_dir.as_deref(),
+        )?)
+    };
+    let scheme = if tls_acceptor.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
 
     #[cfg(not(feature = "sshauth"))]
     if cli.authorized_keys.is_some() {
@@ -1420,12 +1449,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = create_router(&cli.varlink_sockets_path, authenticators)?;
-
-    let scheme = if tls_acceptor.is_some() {
-        "HTTPS"
-    } else {
-        "HTTP"
-    };
 
     // Socket activation: consume all activated fds, or fall back to explicit --bind
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"

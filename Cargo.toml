@@ -17,7 +17,7 @@ path = "src/bin/varlinkctl-http/main.rs"
 
 [features]
 default = ["sshauth"]
-sshauth = ["dep:ssh-key", "dep:sshauth", "dep:tempfile", "dep:ssh-key-import"]
+sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import"]
 # never enable directly: pulled in via the self dev-dependency so that
 # test-only constructors exist in test builds but not in release builds
 test-helpers = []
@@ -42,7 +42,7 @@ listenfd = "1.0.2"
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3" }
 bytes = "1"
-rustix = { version = "1.0", features = ["net", "process"] }
+rustix = { version = "1.0", features = ["net", "process", "system"] }
 # TODO: switch back to crates.io once tokio-vsock releases a version with
 # From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
 tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086", features = ["axum08"] }
@@ -59,7 +59,7 @@ ssh-key = { version = "0.6", optional = true }
 # merged and released (https://github.com/mvo5/sshauth/tree/add-support-for-SkEd25519)
 # (see https://github.com/oxidecomputer/sshauth/pull/8)
 sshauth = { git = "https://github.com/mvo5/sshauth.git", branch = "add-support-for-SkEd25519", optional = true }
-tempfile = { version = "3.27", optional = true }
+tempfile = "3.27"
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
 
 [dev-dependencies]

@@ -18,6 +18,7 @@ Type=simple
 ExecStart=@bindir@/varlink-httpd
 Restart=on-failure
 RestartSec=5
+StateDirectory=varlink-httpd
 
 # Pass the FDs from both socket units in a single service start. Without
 # this, whichever socket triggers activation first wins the race; the
