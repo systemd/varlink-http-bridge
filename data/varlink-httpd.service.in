@@ -53,5 +53,7 @@ ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
 ImportCredential=varlink-httpd.ssh.authorized-keys.*
 
+RefreshOnReload=credentials
+
 [Install]
 WantedBy=network.target

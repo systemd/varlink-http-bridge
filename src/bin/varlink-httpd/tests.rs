@@ -1558,10 +1558,13 @@ mod sshauth_tests {
         std::fs::write(&file_a, pubkey_a.as_bytes()).unwrap();
         std::fs::write(&file_b, pubkey_b.as_bytes()).unwrap();
 
-        let auth = crate::auth_ssh::SshKeyAuthenticator::new(vec![
-            file_a.to_string_lossy().into_owned(),
-            file_b.to_string_lossy().into_owned(),
-        ])
+        let auth = crate::auth_ssh::SshKeyAuthenticator::new(
+            vec![
+                file_a.to_string_lossy().into_owned(),
+                file_b.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(auth.key_count(), 2);
 
@@ -2061,6 +2064,48 @@ mod sshauth_tests {
             auth.key_count(),
             3,
             ".root (1 key) + two per-provider credentials (1 key each) should be merged"
+        );
+    }
+
+    #[test]
+    fn test_ssh_auth_prefixed_credential_appears_after_start() {
+        let keygen_dir_a = tempfile::tempdir().unwrap();
+        let (pubkey_a, _) = generate_ed25519_keypair(keygen_dir_a.path());
+        let keygen_dir_b = tempfile::tempdir().unwrap();
+        let (pubkey_b, _) = generate_ed25519_keypair(keygen_dir_b.path());
+        let empty_root = tempfile::tempdir().unwrap();
+
+        let creds_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds_dir
+                .path()
+                .join("varlink-httpd.ssh.authorized-keys.first"),
+            pubkey_a.as_bytes(),
+        )
+        .unwrap();
+        let auth =
+            create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
+        assert_eq!(auth.key_count(), 1);
+
+        // A prefixed credential appearing later (RefreshOnReload= swaps in a
+        // new tree on `systemctl reload`) is found via the directory mtime.
+        let new_cred = creds_dir
+            .path()
+            .join("varlink-httpd.ssh.authorized-keys.second");
+        std::fs::write(&new_cred, pubkey_b.as_bytes()).unwrap();
+        auth.reload_for_test();
+        assert_eq!(
+            auth.key_count(),
+            2,
+            "new prefixed credential should be re-enumerated"
+        );
+
+        std::fs::remove_file(&new_cred).unwrap();
+        auth.reload_for_test();
+        assert_eq!(
+            auth.key_count(),
+            1,
+            "removed prefixed credential should be dropped"
         );
     }
 

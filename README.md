@@ -349,6 +349,9 @@ locations:
 
 Keys from 2, 3 and 4 are merged and deduplicated.
 
+All sources are re-read when they change (checked lazily on each
+request), so key updates need no restart.
+
 The simplest setup is to pass the path explicitly:
 
 ```console
