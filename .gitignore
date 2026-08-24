@@ -4,3 +4,6 @@
 mkosi.tools
 mkosi.tools.manifest
 *.list
+.direnv
+.envrc
+/.local
