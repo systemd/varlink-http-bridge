@@ -31,6 +31,7 @@ fn check_request(
         path,
         headers: &headers,
         tls_channel_binding,
+        client_cert_verified: None,
     })
 }
 
@@ -144,12 +145,18 @@ fn assert_hostname_reply(output: &std::process::Output) {
     assert_eq!(body["Hostname"], expected_hostname);
 }
 
+/// Production assembly instead of hand-built authenticators, so tests
+/// catch config-to-authenticator bugs; the empty etc root keeps host
+/// SSH keys from leaking in.
+fn production_authenticators(insecure: bool, has_mtls: bool) -> Vec<Box<dyn Authenticator>> {
+    let empty_etc_root = tempfile::tempdir().unwrap();
+    crate::build_authenticators(None, None, empty_etc_root.path(), insecure, has_mtls)
+        .expect("build_authenticators failed")
+}
+
 async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
-    run_test_server_with_auth(
-        varlink_sockets_path,
-        vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
-    )
-    .await
+    // --insecure: these tests exercise routing, not auth
+    run_test_server_with_auth(varlink_sockets_path, production_authenticators(true, false)).await
 }
 
 async fn run_test_server_with_auth(
@@ -726,7 +733,7 @@ async fn test_varlink_conn_cache_reuses_connection() {
         varlink_sockets: sockets,
         authenticators: Arc::new(Vec::new()),
     };
-    let cache = VarlinkConnCache::new(None);
+    let cache = VarlinkConnCache::new(None, None);
 
     let conn1 = get_varlink_connection("io.systemd.Hostname", &state, &cache)
         .await
@@ -983,16 +990,17 @@ fn make_test_pki() -> TestPki {
     }
 }
 
+/// `has_mtls` selects the production mTLS-only assembly, otherwise
+/// `--insecure`.
 async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
+    has_mtls: bool,
 ) -> TestServer<std::net::SocketAddr> {
-    // mirror the production mTLS-only path: the client is verified during
-    // the TLS handshake, no per-request HTTP authentication
     run_test_tls_server_with_auth(
         varlink_sockets_path,
         tls_acceptor,
-        vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
+        production_authenticators(!has_mtls, has_mtls),
     )
     .await
 }
@@ -1037,7 +1045,7 @@ async fn test_tls_basic_connection() {
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor, false).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1068,7 +1076,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor, true).await;
     // Without a client certificate the TLS handshake is rejected
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client_no_cert = Client::builder()
@@ -1114,6 +1122,45 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     );
 }
 
+// /health bypasses the auth middleware, so assert against an
+// authenticated route
+#[test_with::path(/usr/bin/openssl)]
+#[tokio::test]
+async fn test_mtls_only_no_ssh_keys_allows_authed_routes() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(pki.ca_cert_path.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor, true).await;
+
+    let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+    let identity =
+        reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem).unwrap();
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .resolve("localhost", server.addr)
+        .build()
+        .unwrap();
+
+    let res = client
+        .get(format!("https://localhost:{}/sockets", server.addr.port()))
+        .send()
+        .await
+        .expect("mTLS connection with client cert failed");
+    assert_eq!(
+        res.status(),
+        200,
+        "mTLS-verified client must not need an Authorization header"
+    );
+}
+
 #[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_tls_credentials_directory_fallback() {
@@ -1130,7 +1177,7 @@ async fn test_tls_credentials_directory_fallback() {
         .expect("expected Some(acceptor) from credentials directory");
 
     let varlink_dir = tempfile::tempdir().unwrap();
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor, false).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1160,7 +1207,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", acceptor, true).await;
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
@@ -1198,7 +1245,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", acceptor, true).await;
     // Provide the server CA (so the client trusts the server) but NO client cert/key
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
@@ -1487,6 +1534,20 @@ mod sshauth_tests {
         std::mem::forget(tmpdir);
         std::mem::forget(root);
         (auth, key_path)
+    }
+
+    /// Like [`make_test_ssh_auth`], but assembled through the production
+    /// `build_authenticators()`.
+    fn make_test_ssh_authenticators() -> (Vec<Box<dyn Authenticator>>, std::path::PathBuf) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (pubkey_line, key_path) = generate_ed25519_keypair(tmpdir.path());
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let authenticators =
+            crate::build_authenticators(None, None, root.path(), false, false).unwrap();
+        // Leak both tempdirs so they live for the test duration.
+        std::mem::forget(tmpdir);
+        std::mem::forget(root);
+        (authenticators, key_path)
     }
 
     /// Build a [`sshauth::signer::TokenSigner`] from the private key at `key_path`,
@@ -2064,12 +2125,42 @@ mod sshauth_tests {
         );
     }
 
+    // pins the auth matrix: a TLS-verified client cert alone suffices,
+    // while a certless connection still needs an HTTP-level method
+    #[test]
+    fn test_build_authenticators_mtls_and_ssh_keys() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (pubkey_line, _key_path) = generate_ed25519_keypair(tmpdir.path());
+        let root = make_test_rootdir_with_keys(&[pubkey_line.trim()]);
+        let auths = crate::build_authenticators(None, None, root.path(), false, true).unwrap();
+        let headers = axum::http::HeaderMap::new();
+        let with_cert = AuthRequest {
+            method: "GET",
+            path: "/sockets",
+            headers: &headers,
+            tls_channel_binding: None,
+            client_cert_verified: Some("CN=test-client"),
+        };
+        assert!(
+            auths.iter().any(|a| a.check_request(&with_cert).is_ok()),
+            "TLS-verified client cert must suffice without further HTTP auth"
+        );
+        let certless = AuthRequest {
+            client_cert_verified: None,
+            ..with_cert
+        };
+        assert!(
+            auths.iter().all(|a| a.check_request(&certless).is_err()),
+            "certless unauthenticated request must be rejected"
+        );
+    }
+
     #[test_with::path(/usr/bin/varlinkctl)]
     #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_tls_ssh_e2e() {
         let pki = make_test_pki();
-        let (auth, key_path) = make_test_ssh_auth();
+        let (authenticators, key_path) = make_test_ssh_authenticators();
 
         let acceptor = load_tls_acceptor(
             pki.server_cert_path.to_str().unwrap(),
@@ -2078,8 +2169,7 @@ mod sshauth_tests {
         )
         .unwrap();
 
-        let server =
-            run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
+        let server = run_test_tls_server_with_auth("/run/systemd", acceptor, authenticators).await;
         let fake_xdg_home = tempfile::tempdir().unwrap();
         let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
         std::fs::create_dir_all(&tls_dir).unwrap();

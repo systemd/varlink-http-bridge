@@ -257,8 +257,17 @@ Since `varlink-httpd` runs as root, allows connections over the
 network, exposes privileged information and allows arbitrary commands
 to be invoked, authentication MUST be used.
 
-Two modes of authenentication are supported:
+Two modes of authentication are supported:
 TLS certificates and SSH key signatures.
+
+They compose as follows: with `--trust=` (mTLS), the TLS handshake
+requires a certificate signed by the given CA from every client, and
+a request on such a verified connection needs no further
+authentication. HTTP-level methods (currently SSH key signatures) can
+be configured in addition, but for mTLS-verified clients they are
+optional extras. Without mTLS, at least one HTTP-level method must
+authenticate each request. In short: mTLS plus optional HTTP auth is
+the recommended setup right now.
 
 
 ### TLS / mTLS

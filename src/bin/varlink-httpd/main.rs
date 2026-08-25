@@ -274,13 +274,20 @@ type VarlinkConns = HashMap<String, Arc<tokio::sync::Mutex<zlink::tokio::unix::C
 struct VarlinkConnCache {
     conns: Arc<tokio::sync::Mutex<VarlinkConns>>,
     tls_channel_binding: Option<TlsChannelBinding>,
+    /// Subject of the client cert, present iff the TLS handshake
+    /// verified one against `--trust`.
+    client_cert_verified: Option<String>,
 }
 
 impl VarlinkConnCache {
-    fn new(tls_channel_binding: Option<TlsChannelBinding>) -> Self {
+    fn new(
+        tls_channel_binding: Option<TlsChannelBinding>,
+        client_cert_verified: Option<String>,
+    ) -> Self {
         Self {
             conns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             tls_channel_binding,
+            client_cert_verified,
         }
     }
 }
@@ -288,7 +295,7 @@ impl VarlinkConnCache {
 impl Connected<IncomingStream<'_, PlainListener>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, PlainListener>) -> Self {
         info!("New connection from {}", target.remote_addr());
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
@@ -449,12 +456,18 @@ impl axum::serve::Listener for PlainListener {
     }
 }
 
+fn verified_client_cert_subject(ssl: &openssl::ssl::SslRef) -> Option<String> {
+    // a peer cert is only present when the handshake verified it
+    ssl.peer_certificate()
+        .map(|cert| format_x509_subject(&cert))
+}
+
 impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, AsyncTlsListener<PlainListener>>) -> Self {
         let ssl = target.io().ssl();
         log_tls_connection(ssl, target.remote_addr());
         let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
-        Self::new(Some(tls_channel_binding))
+        Self::new(Some(tls_channel_binding), verified_client_cert_subject(ssl))
     }
 }
 
@@ -462,7 +475,7 @@ impl Connected<IncomingStream<'_, VsockListener>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, VsockListener>) -> Self {
         let peer = target.remote_addr();
         info!("New vsock connection from CID {}", peer.cid());
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
@@ -472,7 +485,7 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkC
         let peer = target.remote_addr();
         info!("New TLS vsock connection from CID {}", peer.cid());
         let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
-        Self::new(Some(tls_channel_binding))
+        Self::new(Some(tls_channel_binding), verified_client_cert_subject(ssl))
     }
 }
 
@@ -540,6 +553,9 @@ struct AuthRequest<'a> {
     headers: &'a axum::http::HeaderMap,
     /// From the TLS layer (RFC 9266 exporter), not a header.
     tls_channel_binding: Option<&'a TlsChannelBinding>,
+    /// Also from the TLS layer: subject of the client cert, present
+    /// iff the handshake verified one against `--trust`.
+    client_cert_verified: Option<&'a str>,
 }
 
 impl AuthRequest<'_> {
@@ -573,8 +589,7 @@ trait Authenticator: Send + Sync {
 
 /// Authenticator that accepts every request.
 ///
-/// Pushed explicitly when authentication is delegated to a lower layer
-/// (mTLS verified during the TLS handshake) or deliberately disabled
+/// Pushed explicitly when authentication is deliberately disabled
 /// (`--insecure`). Making this an explicit authenticator keeps the
 /// middleware fail-closed: an empty `authenticators` list always rejects,
 /// so no future code path can accidentally turn into open access by
@@ -593,15 +608,34 @@ impl Authenticator for AllowAllAuthenticator {
     }
 }
 
+/// The actual verification happened during the TLS handshake (against
+/// `--trust`); this reports that verdict into the authenticator list
+/// so it composes with the HTTP-level methods.
+struct MtlsAuthenticator;
+
+impl Authenticator for MtlsAuthenticator {
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
+        let subject = request
+            .client_cert_verified
+            .ok_or_else(|| anyhow::anyhow!("no TLS-verified client certificate"))?;
+        debug!(
+            "auth: allowing {} {} (client cert: {subject})",
+            request.method, request.path
+        );
+        Ok(())
+    }
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let tls_channel_binding: Option<TlsChannelBinding> = request
-        .extensions()
-        .get::<ConnectInfo<VarlinkConnCache>>()
-        .and_then(|ci| ci.0.tls_channel_binding.clone());
+    let conn_info = request.extensions().get::<ConnectInfo<VarlinkConnCache>>();
+    let tls_channel_binding: Option<TlsChannelBinding> =
+        conn_info.and_then(|ci| ci.0.tls_channel_binding.clone());
+    let client_cert_verified: Option<String> =
+        conn_info.and_then(|ci| ci.0.client_cert_verified.clone());
 
     let auth_request = AuthRequest {
         method: request.method().as_str(),
@@ -611,6 +645,7 @@ async fn auth_middleware(
             .map_or(request.uri().path(), axum::http::uri::PathAndQuery::as_str),
         headers: request.headers(),
         tls_channel_binding: tls_channel_binding.as_ref(),
+        client_cert_verified: client_cert_verified.as_deref(),
     };
 
     debug!(
@@ -1360,6 +1395,44 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
+/// `etc_root` is the filesystem root for the well-known
+/// `/etc/varlink-httpd` key discovery; only tests override it.
+#[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
+fn build_authenticators(
+    authorized_keys: Option<String>,
+    creds_dir: Option<&std::path::Path>,
+    etc_root: &std::path::Path,
+    insecure: bool,
+    has_mtls: bool,
+) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
+    let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
+
+    // HTTP-level methods below become optional extras for mTLS clients
+    if has_mtls {
+        authenticators.push(Box::new(MtlsAuthenticator));
+    }
+
+    #[cfg(feature = "sshauth")]
+    {
+        let ssh_auth = create_ssh_authenticator(authorized_keys, creds_dir, etc_root)?;
+        authenticators.push(Box::new(ssh_auth));
+    }
+
+    if insecure {
+        authenticators.clear();
+        authenticators.push(Box::new(AllowAllAuthenticator {
+            reason: "--insecure",
+        }));
+        eprintln!("WARNING: running without authentication - all routes are open");
+    } else if authenticators.is_empty() {
+        bail!(
+            "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
+        );
+    }
+
+    Ok(authenticators)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // not using "tracing" crate here because its quite big (>1.2mb to the production build)
@@ -1386,38 +1459,13 @@ async fn main() -> anyhow::Result<()> {
         bail!("--authorized-keys= requires building with the 'sshauth' feature");
     }
 
-    let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
-
-    #[cfg(feature = "sshauth")]
-    {
-        let ssh_auth = create_ssh_authenticator(
-            cli.authorized_keys,
-            creds_dir.as_deref(),
-            std::path::Path::new("/"),
-        )?;
-        authenticators.push(Box::new(ssh_auth));
-    }
-
-    if cli.insecure {
-        authenticators.clear();
-        authenticators.push(Box::new(AllowAllAuthenticator {
-            reason: "--insecure",
-        }));
-        eprintln!("WARNING: running without authentication - all routes are open");
-    } else if authenticators.is_empty() {
-        if has_mtls {
-            // mTLS verifies the client during the TLS handshake; no
-            // additional per-request HTTP authentication is needed.
-            authenticators.push(Box::new(AllowAllAuthenticator {
-                reason: "mTLS verified at TLS layer",
-            }));
-        } else {
-            #[cfg(not(feature = "sshauth"))]
-            bail!(
-                "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
-            );
-        }
-    }
+    let authenticators = build_authenticators(
+        cli.authorized_keys,
+        creds_dir.as_deref(),
+        std::path::Path::new("/"),
+        cli.insecure,
+        has_mtls,
+    )?;
 
     let app = create_router(&cli.varlink_sockets_path, authenticators)?;
 
