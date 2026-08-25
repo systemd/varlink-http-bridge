@@ -19,6 +19,10 @@ ExecStart=@bindir@/varlink-httpd
 Restart=on-failure
 RestartSec=5
 
+# We need writable space to store the self-signed certificate that can
+# get automatcially generated when no cert/key is configured.
+StateDirectory=varlink-httpd
+
 # Pass the FDs from both socket units in a single service start. Without
 # this, whichever socket triggers activation first wins the race; the
 # other socket's FD stays held by systemd and connections on that
