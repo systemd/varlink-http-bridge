@@ -3,9 +3,10 @@
 //! Self-signed server certificate management.
 //!
 //! TLS is mandatory for TCP listeners, so an operator who provides no
-//! `--cert`/`--key` still needs one. Rather than refusing to start, the
-//! bridge generates a long-lived self-signed certificate on first run and
-//! persists it alongside its key, mirroring how `sshd` treats host keys.
+//! `--cert`/`--key` (or no `cert`/`key` credential) still needs
+//! one. Rather than refusing to start, the bridge generates a
+//! long-lived self-signed certificate on first run and persists it
+//! alongside its key, mirroring how `sshd` treats host keys.
 //!
 //! It chains to nothing, so clients must pin it. The pin covers the public
 //! key, not the certificate, so regenerating the certificate from the same
