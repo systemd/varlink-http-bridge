@@ -320,9 +320,11 @@ client TLS material in the first existing directory:
 | `server-ca-file`       | CA certificate PEM (for private/self-signed server CAs) |
 | `known-hosts`          | pinned server public keys, one line per peer |
 
-The system CAs are used automatically. A certificate that validates
-against them (or against `server-ca-file`) is accepted as-is; a
-self-signed one is pinned in `known-hosts` instead, learned on first
+Without a `server-ca-file` the system CAs are used. If present, it
+is the exclusive trust anchor and system CAs are no longer consulted.
+
+A certificate that validates against the configured CA is accepted as-is;
+a self-signed one is pinned in `known-hosts` instead, learned on first
 contact and refused if it later changes. The peer is `host:port`, or
 `vsock:CID:PORT` for vsock. For mTLS, drop the client cert
 and key into the config directory:

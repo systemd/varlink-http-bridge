@@ -242,9 +242,10 @@ fn build_ssl_connector(
         }
 
         if ca.exists() {
-            builder
-                .set_ca_file(&ca)
-                .with_context(|| format!("loading CA certificate {}", ca.display()))?;
+            builder.set_cert_store(
+                varlink_http_bridge::exclusive_ca_store(&ca)
+                    .with_context(|| format!("loading CA certificate {}", ca.display()))?,
+            );
         }
     }
 

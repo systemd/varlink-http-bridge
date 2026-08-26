@@ -493,7 +493,9 @@ fn load_tls_acceptor(
     builder.check_private_key()?;
 
     if let Some(ca_path) = client_ca_path {
-        builder.set_ca_file(ca_path)?;
+        builder.set_cert_store(varlink_http_bridge::exclusive_ca_store(
+            std::path::Path::new(ca_path),
+        )?);
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
     }
 

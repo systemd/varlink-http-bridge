@@ -115,6 +115,34 @@ pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> TlsChannelBindi
     TlsChannelBinding(openssl::base64::encode_block(&buf))
 }
 
+/// A trust store holding only the certificates in `ca_path`.
+///
+/// # Errors
+/// Returns an error if `ca_path` cannot be read, contains no PEM certificate,
+/// or the store cannot be assembled.
+pub fn exclusive_ca_store(
+    ca_path: &std::path::Path,
+) -> anyhow::Result<openssl::x509::store::X509Store> {
+    use anyhow::{Context, bail};
+
+    let pem = std::fs::read(ca_path)
+        .with_context(|| format!("reading CA certificate {}", ca_path.display()))?;
+    let certs = openssl::x509::X509::stack_from_pem(&pem)
+        .with_context(|| format!("parsing CA certificate {}", ca_path.display()))?;
+    if certs.is_empty() {
+        bail!("no PEM certificate found in {}", ca_path.display());
+    }
+
+    let mut store =
+        openssl::x509::store::X509StoreBuilder::new().context("creating certificate store")?;
+    for cert in certs {
+        store
+            .add_cert(cert)
+            .with_context(|| format!("adding a certificate from {}", ca_path.display()))?;
+    }
+    Ok(store.build())
+}
+
 /// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.
 ///
 /// Keepalive timing uses the OS defaults. Tunable via
@@ -138,4 +166,126 @@ pub fn set_tcp_keepalive_and_nodelay(fd: &impl std::os::fd::AsFd) -> anyhow::Res
     //   sock.set_tcp_keepalive(&keepalive)
     sock.set_keepalive(true).context("set SO_KEEPALIVE")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::x509::{X509, X509StoreContext, store::X509StoreRef};
+
+    type Identity = (X509, openssl::pkey::PKey<openssl::pkey::Private>);
+
+    /// A throwaway CA, or a leaf signed by `issuer` when one is given.
+    fn identity(cn: &str, issuer: Option<&Identity>) -> Identity {
+        use openssl::{asn1::Asn1Time, ec, hash::MessageDigest, nid::Nid, pkey::PKey, x509};
+
+        let group = ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(ec::EcKey::generate(&group).unwrap()).unwrap();
+
+        let mut nb = x509::X509NameBuilder::new().unwrap();
+        nb.append_entry_by_nid(Nid::COMMONNAME, cn).unwrap();
+        let name = nb.build();
+
+        let mut b = x509::X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        b.set_subject_name(&name).unwrap();
+        match issuer {
+            Some((cert, _)) => b.set_issuer_name(cert.subject_name()).unwrap(),
+            None => b.set_issuer_name(&name).unwrap(),
+        }
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        if issuer.is_none() {
+            b.append_extension(
+                x509::extension::BasicConstraints::new()
+                    .critical()
+                    .ca()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        b.sign(issuer.map_or(&key, |(_, k)| k), MessageDigest::sha256())
+            .unwrap();
+        (b.build(), key)
+    }
+
+    fn write_ca(dir: &std::path::Path, cert: &X509) -> std::path::PathBuf {
+        let path = dir.join("server-ca-file");
+        std::fs::write(&path, cert.to_pem().unwrap()).unwrap();
+        path
+    }
+
+    /// Whether `store` will vouch for `leaf`.
+    fn accepts(store: &X509StoreRef, leaf: &X509) -> bool {
+        let chain = openssl::stack::Stack::new().unwrap();
+        X509StoreContext::new()
+            .unwrap()
+            .init(store, leaf, &chain, |c| {
+                Ok(c.verify_cert().unwrap_or(false))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn trusts_only_the_configured_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_a = identity("ca-a", None);
+        let ca_b = identity("ca-b", None);
+        let leaf_a = identity("leaf-a", Some(&ca_a));
+        let leaf_b = identity("leaf-b", Some(&ca_b));
+
+        let store = exclusive_ca_store(&write_ca(dir.path(), &ca_a.0)).unwrap();
+
+        assert!(accepts(&store, &leaf_a.0), "the configured CA must vouch");
+        assert!(!accepts(&store, &leaf_b.0), "no other authority may vouch");
+    }
+
+    /// The point of the helper: `set_ca_file` would leave an already loaded
+    /// authority trusted next to the configured CA. For `SslConnector`, which
+    /// pre-loads the default verify paths, that authority is the whole public
+    /// PKI.
+    #[test]
+    fn replaces_the_system_bundle_rather_than_extending_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = identity("configured-ca", None);
+        let preloaded = identity("preloaded-ca", None);
+        let leaf = identity("leaf", Some(&preloaded));
+
+        let mut builder =
+            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client()).unwrap();
+        // Stands in for the system bundle the builder pre-loads, so the test
+        // does not depend on the host having one.
+        builder.cert_store_mut().add_cert(preloaded.0).unwrap();
+        builder.set_cert_store(exclusive_ca_store(&write_ca(dir.path(), &configured.0)).unwrap());
+
+        let ctx = builder.build().into_context();
+        assert_eq!(
+            ctx.cert_store().all_certificates().len(),
+            1,
+            "only the configured CA may remain in the store"
+        );
+        assert!(
+            !accepts(ctx.cert_store(), &leaf.0),
+            "a pre-loaded authority must not survive"
+        );
+    }
+
+    #[test]
+    fn rejects_a_file_holding_no_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server-ca-file");
+        std::fs::write(&path, b"not a certificate\n").unwrap();
+
+        let Err(err) = exclusive_ca_store(&path) else {
+            panic!("a file holding no certificate must be refused");
+        };
+        assert!(
+            format!("{err:#}").contains("no PEM certificate"),
+            "unexpected error: {err:#}"
+        );
+    }
 }
