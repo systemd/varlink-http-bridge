@@ -258,9 +258,20 @@ Since `varlink-httpd` runs as root, allows connections over the
 network, exposes privileged information and allows arbitrary commands
 to be invoked, authentication MUST be used.
 
-Two modes of authenentication are supported:
-TLS certificates and SSH key signatures.
+Authentication has two independent layers that compose:
 
+```
+--auth=MECHANISMS   per-request authentication to enable (required)
+```
+
+`--auth=ssh` authenticates every request by an SSH key signature.
+`--auth=none` selects no per-request mechanism, leaving mTLS to
+authenticate the client; without mTLS the bridge refuses to start.
+
+mTLS is enabled separately (see below) and applies on top of whatever
+`--auth=` selects, so `--auth=ssh` together with mTLS requires both to
+pass. `--insecure` is the one way to serve with no authentication at
+all, and implies `--auth=none`.
 
 ### TLS / mTLS
 
@@ -270,11 +281,18 @@ TLS flag names follow the systemd convention.
 --cert=PATH    path to TLS certificate PEM file
 --key=PATH     path to TLS private key PEM file
 --trust=PATH   path to CA certificate PEM for client verification (mTLS)
+--require-mtls require a verified client certificate
 --insecure     run over plain HTTP without any authentication (DANGEROUS)
 ```
 
-Providing `--trust=` implicitly enables mTLS: the server will
-require clients to present a certificate signed by that CA.
+`--require-mtls` makes every client present a certificate signed by the
+configured CA. `--trust=` implies it, since a CA is only ever used to
+verify clients.
+
+Pass `--require-mtls` on its own when the CA arrives as a credential
+rather than a file, which systemd may only provide on a later
+`systemctl reload`. Until a CA is available every client is rejected.
+A `trust` credential without `--require-mtls` won't enable mTLS.
 
 Listeners always speak TLS unless `--insecure` is given. Without
 `--cert=`/`--key=` the bridge generates a self-signed certificate on
@@ -301,7 +319,26 @@ them to the short names the service expects.  To provision TLS:
 # cp ca.pem         /etc/credstore/varlink-httpd.tls.trust
 ```
 
+The `trust` credential only takes effect together with `--require-mtls`,
+so add it to the unit with a drop-in:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/varlink-httpd --auth=ssh --require-mtls
+```
+
 Explicit CLI flags take priority over credentials.
+
+The CA is re-read when it changes (checked on each handshake), so a
+rotated CA, or one that only appears on a later `systemctl reload`,
+takes effect without a restart. Removing it rejects every client again
+rather than falling back to accepting them. As with SSH keys, systemd
+refreshes credentials on reload only with systemd >= 260
+(`RefreshOnReload=`); on older versions a restart is needed.
+
+The server's own certificate and key are read once at start, so
+replacing those does still require a restart.
 
 #### Client (varlinkctl-http)
 
@@ -377,7 +414,7 @@ systemd the setting is ignored and a full restart is needed instead.
 The simplest setup is to pass the path explicitly:
 
 ```console
-$ varlink-httpd --authorized-keys ~/.ssh/authorized_keys
+$ varlink-httpd --auth=ssh --authorized-keys ~/.ssh/authorized_keys
 ```
 
 To fetch keys from GitHub (or any HTTPS URL) and save them locally,
@@ -385,8 +422,8 @@ use the `import-ssh` subcommand:
 
 ```console
 $ run0 varlink-httpd import-ssh gh:myuser
-Wrote 3 key line(s) to /etc/varlink-httpd/authorized_keys, run with:
-  varlink-httpd --authorized-keys /etc/varlink-httpd/authorized_keys
+Wrote 3 key(s) to /etc/varlink-httpd/authorized_keys, run with:
+  varlink-httpd --auth=ssh --authorized-keys=/etc/varlink-httpd/authorized_keys
 ```
 
 The source can be `gh:<user>` (shorthand for
@@ -394,7 +431,7 @@ The source can be `gh:<user>` (shorthand for
 path is auto-detected but can be overridden with a second positional
 argument.  Once written to `/etc/varlink-httpd/authorized_keys`,
 the bridge picks up the file automatically (discovery path 2) so the
-`--authorized-keys` flag is no longer needed.
+`--authorized-keys` flag is no longer needed; `--auth=ssh` still is.
 
 When running as a systemd service, the bridge discovers keys from
 credentials automatically (discovery paths 3 and 4):
@@ -435,7 +472,7 @@ example, use regular TLS (not mTLS) for transport encryption and SSH
 keys for user authentication:
 
 ```console
-$ varlink-httpd \
+$ varlink-httpd --auth=ssh \
     --cert=server.pem \
     --key=server-key.pem \
     --authorized-keys ~/.ssh/authorized_keys
@@ -463,7 +500,7 @@ only an `--insecure` server.
 
 ```console
 # Server (inside the guest):
-$ varlink-httpd --bind=vsock --authorized-keys ~/.ssh/authorized_keys
+$ varlink-httpd --auth=ssh --bind=vsock --authorized-keys ~/.ssh/authorized_keys
 
 # Client (on the host):
 $ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
@@ -479,7 +516,7 @@ See the installation instructions above.)
 Server (inside the guest):
 
 ```console
-$ varlink-httpd --bind=vsock \
+$ varlink-httpd --auth=none --bind=vsock \
     --cert=server.pem --key=server-key.pem --trust=ca.pem
 ```
 

@@ -71,7 +71,7 @@ impl AuthKeysFile {
 }
 
 /// Keep track of the mtime of the tracked paths. This means when comparing two
-/// MtimeSnapshots for "eq" we cover changed, appeared or vanished files.
+/// `MtimeSnapshot`s for "eq" we cover changed, appeared or vanished files.
 #[derive(PartialEq)]
 struct MtimeSnapshot(HashMap<String, SystemTime>);
 
@@ -303,7 +303,7 @@ impl SshKeyAuthenticator {
 
     fn maybe_reload(&self) {
         let Ok(paths) = current_paths(&self.paths, self.creds_dir.as_deref()).inspect_err(|e| {
-            warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)")
+            warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)");
         }) else {
             return;
         };
@@ -380,6 +380,29 @@ fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> std::io::Result<Vec<St
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Names of the authorized-keys credentials present in `dir`, so a
+/// configuration that never reads them can say which ones it is ignoring.
+pub(crate) fn authorized_keys_credentials(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = SSH_AUTHORIZED_KEYS_CREDENTIALS
+        .iter()
+        .filter(|name| dir.join(name).exists())
+        .map(|name| (*name).to_string())
+        .collect();
+    names.extend(
+        ssh_authorized_keys_prefixed(dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            }),
+    );
+    names.sort();
+    names
 }
 
 fn current_paths(

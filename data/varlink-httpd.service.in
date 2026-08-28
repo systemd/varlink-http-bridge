@@ -15,7 +15,10 @@ Conflicts=shutdown.target
 
 [Service]
 Type=simple
-ExecStart=@bindir@/varlink-httpd
+# --auth= picks what authenticates a request; ssh matches the authorized keys
+# imported below. mTLS composes on top of it and is opt-in: provide a CA via
+# the trust credential and add --require-mtls with a drop-in.
+ExecStart=@bindir@/varlink-httpd --auth=ssh
 Restart=on-failure
 RestartSec=5
 StateDirectory=varlink-httpd

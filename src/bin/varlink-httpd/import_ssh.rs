@@ -63,9 +63,9 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
         keys_count = imported.keys.len()
     );
     if varlink_http_bridge::sysconf::CredentialsLoader::path_from_env().is_some() {
-        eprintln!("  varlink-httpd");
+        eprintln!("  varlink-httpd --auth=ssh");
     } else {
-        eprintln!("  varlink-httpd --authorized-keys={output_path}");
+        eprintln!("  varlink-httpd --auth=ssh --authorized-keys={output_path}");
     }
 
     Ok(())

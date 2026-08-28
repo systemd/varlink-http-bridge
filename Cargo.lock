@@ -2366,6 +2366,7 @@ checksum = "577e034de553ad1a2f3a62c711080f5095afb875da2e482646c7ad89e3c88428"
 dependencies = [
  "libtest-mimic",
  "test-with-derive",
+ "which",
 ]
 
 [[package]]
@@ -2378,6 +2379,7 @@ dependencies = [
  "quote",
  "regex",
  "syn 3.0.4",
+ "which",
 ]
 
 [[package]]
@@ -2862,6 +2864,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "8.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

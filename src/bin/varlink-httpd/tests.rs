@@ -917,7 +917,7 @@ async fn test_jsonseq_userdb_get_user_record_more() {
     assert!(users.contains(&"root"), "root user not found in {users:#?}");
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_hostname_describe() {
@@ -939,7 +939,7 @@ async fn test_varlinkctl_helper_hostname_describe() {
     assert!(!stderr.contains("WARN"), "unexpected warning: {stderr}");
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_varlinkctl_helper_userdb_get_user_record() {
@@ -1071,13 +1071,13 @@ fn make_test_pki() -> TestPki {
 
 async fn run_test_tls_server(
     varlink_sockets_path: &str,
-    tls_acceptor: openssl::ssl::SslAcceptor,
+    tls_config: TlsConfig,
 ) -> TestServer<std::net::SocketAddr> {
     // mirror the production mTLS-only path: the client is verified during
     // the TLS handshake, no per-request HTTP authentication
     run_test_tls_server_with_auth(
         varlink_sockets_path,
-        tls_acceptor,
+        tls_config,
         vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
     )
     .await
@@ -1085,7 +1085,7 @@ async fn run_test_tls_server(
 
 async fn run_test_tls_server_with_auth(
     varlink_sockets_path: &str,
-    tls_acceptor: openssl::ssl::SslAcceptor,
+    tls_config: TlsConfig,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> TestServer<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1099,7 +1099,7 @@ async fn run_test_tls_server_with_auth(
     let handle = tokio::spawn(async move {
         start_server(
             Transport::Tcp(listener),
-            Some(tls_acceptor),
+            Some(tls_config),
             &varlink_sockets_path,
             authenticators,
         )
@@ -1110,20 +1110,21 @@ async fn run_test_tls_server_with_auth(
     TestServer { handle, addr }
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_tls_basic_connection() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         None,
+        false,
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1139,7 +1140,7 @@ async fn test_tls_basic_connection() {
     assert_eq!(res.status(), 200);
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_mtls_accepts_client_cert_and_rejects_without() {
     init_test_logger();
@@ -1147,14 +1148,15 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     // Without a client certificate the TLS handshake is rejected
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client_no_cert = Client::builder()
@@ -1200,7 +1202,124 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     );
 }
 
-#[test_with::path(/usr/bin/openssl)]
+/// A credential that does not exist yet resolves to no path at all, so the
+/// expected location has to be watched instead or the CA could never arrive.
+#[test_with::executable(openssl)]
+#[test]
+fn test_mtls_watches_trust_credential_before_it_exists() {
+    let pki = make_test_pki();
+    let creds_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
+    std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
+
+    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), true).unwrap();
+
+    let trust = tls.client_trust.expect("mTLS must carry a trust store");
+    assert_eq!(
+        trust.path.as_deref(),
+        Some(creds_dir.path().join("trust").as_path())
+    );
+}
+
+/// The CA may show up after start, when systemd refreshes credentials on
+/// reload. It has to take effect without restarting the listener, and
+/// removing it again has to take effect just as immediately.
+#[test_with::executable(openssl)]
+#[tokio::test]
+async fn test_mtls_trust_reloads_when_ca_appears_and_vanishes() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+    let creds_dir = tempfile::tempdir().unwrap();
+    let ca_path = creds_dir.path().join("trust");
+
+    // enabled, but the CA is not there yet
+    let tls = load_tls_config(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(ca_path.to_str().unwrap()),
+        true,
+    )
+    .unwrap();
+
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
+    let url = format!("https://localhost:{}/health", server.addr.port());
+    let client = || {
+        Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap())
+            .identity(
+                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
+                    .unwrap(),
+            )
+            .resolve("localhost", server.addr)
+            .build()
+            .unwrap()
+    };
+
+    assert!(
+        client().get(&url).send().await.is_err(),
+        "must reject before the CA exists"
+    );
+
+    std::fs::copy(&pki.ca_cert_path, &ca_path).unwrap();
+    let res = client()
+        .get(&url)
+        .send()
+        .await
+        .expect("must accept once the CA appears");
+    assert_eq!(res.status(), 200);
+
+    std::fs::remove_file(&ca_path).unwrap();
+    assert!(
+        client().get(&url).send().await.is_err(),
+        "must reject again once the CA is removed"
+    );
+}
+
+/// mTLS may be enabled before the CA credential arrives. Until it does the
+/// trust store is empty, and an empty store must reject rather than accept.
+#[test_with::executable(openssl)]
+#[tokio::test]
+async fn test_mtls_without_ca_rejects_every_client() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+
+    let tls = load_tls_config(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        None,
+        true,
+    )
+    .unwrap();
+
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
+    let url = format!("https://localhost:{}/health", server.addr.port());
+
+    for (what, identity) in [
+        ("no client cert", None),
+        (
+            "a client cert signed by the CA we have not been given",
+            Some(
+                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
+                    .unwrap(),
+            ),
+        ),
+    ] {
+        let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+        let mut builder = Client::builder()
+            .add_root_certificate(ca_cert)
+            .resolve("localhost", server.addr);
+        if let Some(identity) = identity {
+            builder = builder.identity(identity);
+        }
+        let result = builder.build().unwrap().get(&url).send().await;
+        assert!(
+            result.is_err(),
+            "mTLS with an unconfigured CA must reject, but {what} was accepted"
+        );
+    }
+}
+
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_tls_credentials_directory_fallback() {
     let pki = make_test_pki();
@@ -1210,12 +1329,12 @@ async fn test_tls_credentials_directory_fallback() {
     std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
-    // No CLI flags; resolve_tls_acceptor should pick up creds from the directory
-    let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()))
+    // No CLI flags; resolve_tls_config should pick up creds from the directory
+    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), false)
         .expect("credentials directory fallback failed");
 
     let varlink_dir = tempfile::tempdir().unwrap();
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1231,21 +1350,22 @@ async fn test_tls_credentials_directory_fallback() {
     assert_eq!(res.status(), 200);
 }
 
-#[test_with::path(/usr/bin/openssl)]
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(openssl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_mtls_hostname_describe() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", tls).await;
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
@@ -1269,21 +1389,22 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     assert_hostname_reply(&output);
 }
 
-#[test_with::path(/usr/bin/openssl)]
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(openssl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_mtls_no_client_cert() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", tls).await;
     // Provide the server CA (so the client trusts the server) but NO client cert/key
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
@@ -1322,7 +1443,7 @@ fn test_tls_half_configured_is_rejected() {
         (Some("/nonexistent/cert.pem".to_string()), None),
         (None, Some("/nonexistent/key.pem".to_string())),
     ] {
-        let Err(err) = resolve_tls_acceptor(cert, key, None, Some(empty_dir.path())) else {
+        let Err(err) = resolve_tls_config(cert, key, None, Some(empty_dir.path()), false) else {
             panic!("--cert and --key must be given together");
         };
         assert!(
@@ -1332,7 +1453,7 @@ fn test_tls_half_configured_is_rejected() {
     }
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[test]
 fn test_format_x509_subject() {
     let pki = make_test_pki();
@@ -1342,7 +1463,7 @@ fn test_format_x509_subject() {
     assert_eq!(subject, "CN=test-client");
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[test]
 fn test_format_x509_subject_multiple_fields() {
     use std::process::Command;
@@ -1509,7 +1630,7 @@ async fn test_vsock_health_endpoint() {
     );
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_vsock_hostname_describe() {
@@ -1529,6 +1650,182 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
     )
     .await;
     assert_hostname_reply(&output);
+}
+
+// --- unused credential reporting tests ---
+
+/// Just the names, so assertions read as "which credentials go unread".
+fn unread_names(
+    creds_dir: &std::path::Path,
+    insecure: bool,
+    require_mtls: bool,
+    auth: &[AuthMechanism],
+    authorized_keys: Option<&str>,
+) -> Vec<String> {
+    crate::unread_credentials(creds_dir, insecure, require_mtls, auth, authorized_keys)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Every credential the daemon knows how to read, so each test only has to say
+/// which of them it expects to be ignored.
+fn creds_dir_with_everything() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "cert",
+        "key",
+        "trust",
+        "ssh.authorized_keys.root",
+        "varlink-httpd.ssh.authorized-keys.example",
+    ] {
+        std::fs::write(dir.path().join(name), b"").unwrap();
+    }
+    dir
+}
+
+#[test]
+fn test_unread_credentials_none_when_all_are_used() {
+    let dir = creds_dir_with_everything();
+    let auth = [
+        #[cfg(feature = "sshauth")]
+        AuthMechanism::Ssh,
+        #[cfg(not(feature = "sshauth"))]
+        AuthMechanism::None,
+    ];
+    assert!(unread_names(dir.path(), false, true, &auth, None).is_empty());
+}
+
+#[test]
+fn test_unread_credentials_reports_trust_without_mtls() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), false, false, &[AuthMechanism::None], None);
+    assert!(unread.contains(&"trust".to_string()), "{unread:?}");
+}
+
+/// --insecure never reads TLS material at all.
+#[test]
+fn test_unread_credentials_reports_tls_material_under_insecure() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), true, false, &[AuthMechanism::None], None);
+    for name in ["cert", "key", "trust"] {
+        assert!(
+            unread.contains(&name.to_string()),
+            "{name} missing: {unread:?}"
+        );
+    }
+}
+
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), false, true, &[AuthMechanism::None], None);
+    for name in [
+        "ssh.authorized_keys.root",
+        "varlink-httpd.ssh.authorized-keys.example",
+    ] {
+        assert!(
+            unread.contains(&name.to_string()),
+            "{name} missing: {unread:?}"
+        );
+    }
+}
+
+/// An explicit path replaces credential discovery instead of adding to it, so
+/// the credentials go unread even though ssh auth is on.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_unread_credentials_reports_ssh_keys_hidden_by_explicit_path() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(
+        dir.path(),
+        false,
+        true,
+        &[AuthMechanism::Ssh],
+        Some("/etc/varlink-httpd/authorized_keys"),
+    );
+    assert!(
+        unread.contains(&"ssh.authorized_keys.root".to_string()),
+        "{unread:?}"
+    );
+}
+
+#[test]
+fn test_unread_credentials_ignores_absent_files() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(unread_names(dir.path(), true, false, &[AuthMechanism::None], None).is_empty());
+}
+
+// --- --auth= mechanism selection tests ---
+
+/// Every `build_authenticators()` case, with `/` never touched.
+fn build_authenticators_in(
+    auth: &[AuthMechanism],
+    insecure: bool,
+    require_mtls: bool,
+    etc_root: &std::path::Path,
+) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
+    crate::build_authenticators(auth, insecure, require_mtls, None, None, etc_root)
+}
+
+#[test]
+fn test_parse_auth_rejects_unknown_mechanism() {
+    let err = crate::parse_auth("nope").unwrap_err().to_string();
+    assert!(err.contains("unknown --auth mechanism 'nope'"), "{err}");
+}
+
+#[test]
+fn test_parse_auth_rejects_empty() {
+    let err = crate::parse_auth(",,").unwrap_err().to_string();
+    assert!(err.contains("needs at least one mechanism"), "{err}");
+}
+
+/// "none" means no mechanism, so pairing it with one is a contradiction.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_parse_auth_rejects_none_combined_with_mechanism() {
+    let err = crate::parse_auth("none,ssh").unwrap_err().to_string();
+    assert!(err.contains("cannot be combined"), "{err}");
+}
+
+/// Without mTLS or --insecure nothing would authenticate the client, so
+/// refuse to start rather than serve every request.
+#[test]
+fn test_build_authenticators_none_without_mtls_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let Err(err) = build_authenticators_in(&[AuthMechanism::None], false, false, root.path())
+    else {
+        panic!("--auth=none without mTLS must not produce an authenticator");
+    };
+    assert!(err.to_string().contains("--auth=none needs mTLS"), "{err}");
+}
+
+#[test]
+fn test_build_authenticators_none_with_mtls_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::None], false, true, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
+}
+
+#[test]
+fn test_build_authenticators_insecure_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::None], true, false, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
+}
+
+/// Selecting a mechanism must never fall back to open access, not even when
+/// it has no keys to check against yet.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_build_authenticators_ssh_without_keys_rejects() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::Ssh], false, false, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    assert!(check_request(auths[0].as_ref(), "GET", "/health", None, None, None).is_err());
 }
 
 // --- SSH key auth tests ---
@@ -2243,22 +2540,22 @@ mod sshauth_tests {
         );
     }
 
-    #[test_with::path(/usr/bin/varlinkctl)]
+    #[test_with::executable(varlinkctl)]
     #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_tls_ssh_e2e() {
         let pki = make_test_pki();
         let (auth, key_path) = make_test_ssh_auth();
 
-        let acceptor = load_tls_acceptor(
+        let tls = load_tls_config(
             pki.server_cert_path.to_str().unwrap(),
             pki.server_key_path.to_str().unwrap(),
             None,
+            false,
         )
         .unwrap();
 
-        let server =
-            run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
+        let server = run_test_tls_server_with_auth("/run/systemd", tls, vec![Box::new(auth)]).await;
         let fake_xdg_home = tempfile::tempdir().unwrap();
         let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
         std::fs::create_dir_all(&tls_dir).unwrap();

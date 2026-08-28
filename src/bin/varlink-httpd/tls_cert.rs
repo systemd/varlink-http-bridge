@@ -221,10 +221,11 @@ mod tests {
         assert!(cert_path.exists() && key_path.exists());
 
         // the pair must actually load as a TLS server identity
-        crate::load_tls_acceptor(
+        crate::load_tls_config(
             cert_path.to_str().unwrap(),
             key_path.to_str().unwrap(),
             None,
+            false,
         )
         .expect("generated material must build an acceptor");
     }

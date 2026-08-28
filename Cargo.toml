@@ -65,7 +65,7 @@ ssh-key-import = { path = "crates/ssh-key-import", optional = true }
 [dev-dependencies]
 varlink-http-bridge = { path = ".", features = ["test-helpers"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
-test-with = { version = "0.17", default-features = false, features = ["runtime"] }
+test-with = { version = "0.17", default-features = false, features = ["runtime", "executable"] }
 gethostname = "1.1.0"
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
