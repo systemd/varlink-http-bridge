@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
-use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, TlsChannelBinding};
+use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, TlsChannelBinding, sshauth_accept_value};
 
 use crate::client_auth::ClientAuth;
 
@@ -69,9 +69,18 @@ async fn add_auth_headers(
         .map_or(request.uri().path(), |pq| pq.as_str())
         .to_string();
 
-    let (auth_header, nonce) = sign_with_key(key, "GET", &path_and_query, tls_channel_binding)
-        .await
-        .context(SigningFailed)?;
+    let accept = sshauth_accept_value(
+        request
+            .headers()
+            .get_all(tungstenite::http::header::ACCEPT)
+            .iter()
+            .map(tungstenite::http::HeaderValue::as_bytes),
+    );
+
+    let (auth_header, nonce) =
+        sign_with_key(key, "GET", &path_and_query, &accept, tls_channel_binding)
+            .await
+            .context(SigningFailed)?;
 
     request.headers_mut().insert(
         "Authorization",
@@ -252,13 +261,14 @@ async fn list_ssh_keys() -> Result<Vec<SshKey>> {
     Ok(vec![])
 }
 
-/// Sign the request parameters (method, path, nonce, TLS channel binding)
-/// with the given key.  Returns the `Authorization` header value carrying
-/// the signed sshauth token, and the nonce.
+/// Sign the request parameters (method, path, accept, nonce, TLS channel
+/// binding) with the given key.  Returns the `Authorization` header value
+/// carrying the signed sshauth token, and the nonce.
 async fn sign_with_key(
     key: &SshKey,
     method: &str,
     path_and_query: &str,
+    accept: &str,
     tls_channel_binding: Option<&TlsChannelBinding>,
 ) -> Result<(String, String)> {
     let nonce = generate_nonce();
@@ -283,6 +293,7 @@ async fn sign_with_key(
     let mut tb = signer.sign_for();
     tb.action("method", method)
         .action("path", path_and_query)
+        .action("accept", accept)
         .action("nonce", &nonce)
         .action(
             "tls-channel-binding",

@@ -482,6 +482,11 @@ This is recommended because for websocket requests only the initial
 "upgrade" request is signed with the ssh key, after the upgrade it is
 a plain WebSocket which relies on the underlying TLS for security.
 
+The signed token covers the HTTP method, the path including the query
+string, the `Accept` header, a per-request nonce and the TLS channel
+binding. The request body is not signed, its integrity
+relies on TLS.
+
 
 ## vsock transport
 

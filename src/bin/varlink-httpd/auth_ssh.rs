@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use crate::{AuthRequest, Authenticator};
-use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannelBinding};
+use varlink_http_bridge::{
+    SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannelBinding, sshauth_accept_value,
+};
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
 /// (fingerprint -> key) map of supported keys it contained. Bundling
@@ -453,6 +455,13 @@ impl Authenticator for SshKeyAuthenticator {
         let nonce =
             extract_nonce(request.headers).context("missing nonce header (x-auth-nonce)")?;
         let nonce = nonce.as_str();
+        let accept = sshauth_accept_value(
+            request
+                .headers
+                .get_all(axum::http::header::ACCEPT)
+                .iter()
+                .map(axum::http::HeaderValue::as_bytes),
+        );
 
         let unverified_token =
             sshauth::UnverifiedToken::try_from(token_str).context("invalid token")?;
@@ -470,6 +479,7 @@ impl Authenticator for SshKeyAuthenticator {
             .max_skew_seconds(self.max_skew)
             .action("method", method)
             .action("path", path)
+            .action("accept", &accept)
             .action("nonce", nonce)
             .action(
                 "tls-channel-binding",

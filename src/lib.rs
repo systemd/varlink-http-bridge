@@ -13,6 +13,18 @@ pub const SSHAUTH_MAGIC_PREFIX: [u8; 8] = *b"vhbridge";
 /// token payload to prevent replay attacks.
 pub const SSHAUTH_NONCE_HEADER: &str = "x-auth-nonce";
 
+#[cfg(feature = "sshauth")]
+/// The `Accept` header as it enters the signed token: all values joined as
+/// one list, "" when absent. It selects the varlink `more` flag, so client
+/// and server must agree on one canonical form.
+pub fn sshauth_accept_value<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> String {
+    values
+        .into_iter()
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Default port for the HTTP bridge when listening on or connecting via vsock.
 pub const DEFAULT_PORT: u32 = 1031;
 

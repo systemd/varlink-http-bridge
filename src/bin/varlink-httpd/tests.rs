@@ -1984,6 +1984,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce);
         let token = tb.sign().await.unwrap();
 
@@ -2009,6 +2010,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce);
         let token = tb.sign().await.unwrap();
 
@@ -2034,6 +2036,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce)
             .action("tls-channel-binding", cb.as_str());
         let token = tb.sign().await.unwrap();
@@ -2048,6 +2051,55 @@ mod sshauth_tests {
             Some(&cb),
         )
         .expect("valid ed25519 token should pass");
+    }
+
+    #[tokio::test]
+    async fn test_ssh_auth_accept_header_is_signed() {
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+
+        let sign = async |nonce: &str, accept: &str| {
+            let mut tb = signer.sign_for();
+            tb.action("method", "GET")
+                .action("path", "/sockets")
+                .action("accept", accept)
+                .action("nonce", nonce)
+                .action("tls-channel-binding", cb.as_str());
+            format!("Bearer {}", tb.sign().await.unwrap().encode())
+        };
+        let check = |header: &str, nonce: &str, accept: Option<&str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("authorization", header.parse().unwrap());
+            headers.insert("x-auth-nonce", nonce.parse().unwrap());
+            if let Some(a) = accept {
+                headers.insert("accept", a.parse().unwrap());
+            }
+            auth.check_request(&AuthRequest {
+                method: "GET",
+                path: "/sockets",
+                headers: &headers,
+                tls_channel_binding: Some(&cb),
+            })
+        };
+
+        let nonce = "accept-signed-match-1234";
+        let header = sign(nonce, "application/json-seq").await;
+        check(&header, nonce, Some("application/json-seq")).expect("matching Accept should pass");
+
+        let nonce = "accept-signed-stripped-12";
+        let header = sign(nonce, "application/json-seq").await;
+        assert!(
+            check(&header, nonce, None).is_err(),
+            "a stripped Accept header must be rejected"
+        );
+
+        let nonce = "accept-signed-added-1234";
+        let header = sign(nonce, "").await;
+        assert!(
+            check(&header, nonce, Some("application/json-seq")).is_err(),
+            "an added Accept header must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -2193,6 +2245,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce)
             .action("tls-channel-binding", cb.as_str());
         let token = tb.sign().await.unwrap();
@@ -2234,7 +2287,9 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path);
 
         let mut tb = signer.sign_for();
-        tb.action("method", "GET").action("path", "/sockets");
+        tb.action("method", "GET")
+            .action("path", "/sockets")
+            .action("accept", "");
         let token = tb.sign().await.unwrap();
         let header = format!("Bearer {}", token.encode());
 
@@ -2256,6 +2311,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce)
             .action("tls-channel-binding", cb_signer);
         let token = tb.sign().await.unwrap();
@@ -2286,6 +2342,7 @@ mod sshauth_tests {
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
+            .action("accept", "")
             .action("nonce", nonce)
             .action("tls-channel-binding", cb.as_str());
         let token = tb.sign().await.unwrap();
