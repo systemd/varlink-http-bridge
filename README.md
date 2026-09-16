@@ -504,6 +504,83 @@ binding. The request body is not signed, its integrity
 relies on TLS.
 
 
+## Running unprivileged
+
+By default the service runs as root, which is what makes the root-only
+varlink sockets reachable and satisfies the `uid == 0` peer checks a few
+systemd services still do. It can instead run as a `DynamicUser=` with a
+polkit rule granting the privileges it needs:
+
+```ini
+# /etc/systemd/system/varlink-httpd.service.d/10-dynamic-user.conf
+[Service]
+DynamicUser=yes
+# io.systemd.JournalAccess is 0660 root:systemd-journal, the other
+# registry sockets are 0666
+SupplementaryGroups=systemd-journal
+```
+
+```js
+// /etc/polkit-1/rules.d/10-varlink-httpd.rules
+const ALLOWED = [
+    "org.freedesktop.systemd1.manage-units",
+    "org.freedesktop.hostname1.set-static-hostname",
+    "org.freedesktop.login1.reboot",
+];
+
+polkit.addRule(function (action, subject) {
+    if (subject.system_unit === "varlink-httpd.service" &&
+        subject.no_new_privileges &&
+        ALLOWED.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+```
+
+Matching on `subject.system_unit` rather than on the user means nothing
+depends on NSS resolving the dynamic user. `subject.no_new_privileges`
+is what makes matching on a unit meaningful (see `polkit(8)`); the unit
+sets `NoNewPrivileges=yes` already.
+
+Keep the rule an allowlist. A blanket `polkit.Result.YES` leaves the
+bridge root-equivalent: `manage-units` plus a transient unit with no
+`User=` is root again in one call. That only helps against bugs that
+yield code execution, not against an authentication bypass. An
+allowlist is a real boundary, and doubles as the coarse authorization
+layer the bridge otherwise lacks: authentication decides *who* may
+call, the rule decides *what* may be done.
+
+This does not replace authentication. It takes the pre-authentication
+surface (TLS, HTTP, websocket framing, SSH signature checking) out of
+uid 0, nothing more.
+
+### What stops working
+
+Two kinds of call: anything whose socket is mode 0600 root:root, which
+the bridge can no longer connect to at all, and anything whose service
+checks for `uid == 0` on the peer, which is refused after connecting.
+`io.systemd.Journal.Rotate` is a prominent example of the latter. The
+exact set shrinks over time: the fix is for those services to grow
+polkit support, and the bridge cannot work around them meanwhile.
+
+Everything on a 0666 socket that checks polkit, including the unit
+methods on `io.systemd.Manager`, works with a rule.
+
+Authorization decisions also need a working D-Bus, since that is the
+only way to reach polkit. So an unprivileged bridge cannot serve
+privileged calls in early boot before dbus is up, and stops serving
+them if dbus goes away. That is somewhat ironic for a bridge whose
+protocol needs neither. A root bridge has no such dependency.
+
+### Requirements
+
+polkit >= 124, for the `system_unit` and `no_new_privileges` subject
+attributes.
+
+Any authentication material on disk has to be readable by the service
+user.
+
 ## vsock transport
 
 The bridge supports `AF_VSOCK` as an alternative to TCP, allowing
