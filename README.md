@@ -372,6 +372,7 @@ client TLS material in the first existing directory:
 | `client-key-file`      | Client private key PEM (for mTLS)         |
 | `server-ca-file`       | CA certificate PEM (for private/self-signed server CAs) |
 | `known-hosts`          | pinned server public keys, one line per peer |
+| `api-key`              | API key, for `--auth=api-key` servers; refused if world-readable |
 
 Without a `server-ca-file` the system CAs are used. If present, it
 is the exclusive trust anchor and system CAs are no longer consulted.
@@ -551,3 +552,135 @@ $ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
 The client looks for its certificate and key in the same config
 directories as for TCP (see [Client (varlinkctl-http)](#client-varlinkctl-http)
 below). CID 3+ are guests; CID 2 is the host.
+
+## API key authentication
+
+For plain `curl` (shell scripts, cron jobs, CI) the bridge supports
+static API keys presented as `Authorization: Bearer <key>`. The
+server only stores the SHA-256 hash of each key. Enable it with
+`--auth=api-key`; it can be combined with SSH key auth as
+`--auth=api-key,ssh`, mechanisms are tried in the given order and the
+first one that accepts wins.
+
+> **Keys must be random secrets, not passwords.** The stored hash is
+> an unsalted SHA-256, which only protects a key with enough entropy;
+> a hashed password is cracked in seconds. Use `gen-api-key` or a
+> random generator such as `openssl rand -hex 32`. The bridge refuses
+> keys shorter than 32 characters.
+
+> **TLS is required in production.** An API key has no
+> proof-of-possession: anyone who captures it can replay it. Only
+> transport TLS (or a non-sniffable transport like vsock) protects it
+> in flight. For stronger per-request authentication use SSH key auth.
+
+### Server setup
+
+Generate a key with the `gen-api-key` subcommand; it prints the key
+to stdout exactly once and appends its hash to the API keys file:
+
+```console
+$ run0 varlink-httpd gen-api-key --name=deploy-script
+vhb_9f8e7d6c5b4a...
+Appended hash of API key 'deploy-script' to /etc/varlink-httpd/api-keys, run with:
+  varlink-httpd --auth=api-key
+```
+
+With `--auth=api-key` the bridge reads API key hashes from these
+locations:
+
+1. `--api-keys=PATH` - explicit CLI flag; when given, it is the only
+   file used
+2. `varlink-httpd/api-keys` in the config hierarchy - `/etc` over `/run`
+   over `/usr/lib`, and only the highest-precedence one is read, so a
+   file in `/etc` shadows a vendor default in `/usr/lib`
+3. the `varlink-httpd.api-keys` credential and every
+   `varlink-httpd.api-keys.*` one - the shipped unit imports both from
+   the credstore (see `systemd.exec(5)`), so each provider can drop its
+   own file instead of editing a shared one
+
+Keys from 2 and 3 are merged, so a credential adds to the config file
+rather than replacing it. Credentials are re-enumerated on `systemctl
+reload`, which is when `RefreshOnReload=credentials` swaps in a fresh
+credentials tree.
+
+The API keys file has one key per line, `sha256:<hex> [name]`, with
+`#` comments allowed. The name identifies the key in logs; revoke a
+key by deleting its line (the file is hot-reloaded, no restart
+needed). To add a key generated elsewhere by hand, it must be at
+least 32 random characters:
+
+```console
+$ API_KEY=$(openssl rand -hex 32)
+$ echo "sha256:$(printf %s "${API_KEY:?}" | sha256sum | cut -d' ' -f1) ci-runner" \
+    >> /etc/varlink-httpd/api-keys
+```
+
+### Using it with curl
+
+`gen-api-key` registers the hash on the machine it runs on, so run it
+on the server; only the printed key is copied to the client:
+
+```console
+myhost$ run0 varlink-httpd gen-api-key --name=laptop-cli
+vhb_2048f47eb397b0eed671280444b6f89692170d9ae33a94713681d1a22ea0dc55
+Appended hash of API key 'laptop-cli' to /etc/varlink-httpd/api-keys, run with:
+  varlink-httpd --auth=api-key
+```
+
+Then, from anywhere that can reach the bridge. The bridge serves TLS
+with a generated self-signed certificate unless `--cert=`/`--key=` are
+given, so the client has to pin the key the server printed on first
+start. curl checks `--pinnedpubkey` independently of the certificate
+chain, so `-k` is still needed to accept the self-signed certificate;
+the pin is what actually authenticates the server. With a certificate
+from a real CA drop `-k` and `--pinnedpubkey` (or replace the latter
+with `--cacert`):
+
+```console
+$ export API_KEY=vhb_2048f47eb397b0ee...   # the value printed above
+$ export PIN=sha256//N/XBoWQvWrJScutg5/l0WO5sC1/QV2th677ylUNaVa8=   # printed by the server
+
+$ curl -sk --pinnedpubkey "$PIN" -H "Authorization: Bearer $API_KEY" \
+    https://myhost:1031/sockets | jq
+{
+  "sockets": [
+    "io.systemd.Hostname",
+...
+
+$ curl -sk --pinnedpubkey "$PIN" -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -X POST https://myhost:1031/call/io.systemd.Hostname.Describe -d '{}' \
+    | jq .StaticHostname
+"top"
+```
+
+### Client (varlinkctl-http)
+
+The `varlinkctl-http` bridge helper takes the key from `VARLINK_API_KEY`,
+or from an `api-key` file in its config directory
+(`~/.config/varlinkctl-http/` and friends, as for the client TLS
+material); the environment wins, so a one-off key can override the
+configured one. Either way API key auth takes priority over SSH key
+auth:
+
+```console
+$ VARLINK_API_KEY="$API_KEY" \
+  VARLINK_BRIDGE_URL=https://myhost:1031/ws/sockets/io.systemd.Hostname \
+    varlinkctl call exec:/usr/libexec/varlinkctl-http \
+    io.systemd.Hostname.Describe '{}'
+```
+
+### Provisioning via systemd credentials
+
+Instead of a file in `/etc`, ship the hashes through the credstore;
+the shipped unit imports `varlink-httpd.api-keys` automatically and
+warns when it is present but `--auth=api-key` is not enabled (add it
+to `ExecStart=` with a drop-in).
+Because the file only contains hashes it can also be generated on one
+machine and copied to the nodes as part of provisioning:
+
+```console
+$ varlink-httpd gen-api-key --name=deploy-script api-keys
+vhb_9f8e7d6c5b4a...
+$ scp api-keys myhost:/etc/credstore/varlink-httpd.api-keys
+```

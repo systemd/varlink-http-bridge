@@ -59,5 +59,9 @@ ImportCredential=varlink-httpd.ssh.authorized-keys.*
 
 RefreshOnReload=credentials
 
+# API key hashes, only read with --auth=api-key.
+ImportCredential=varlink-httpd.api-keys
+ImportCredential=varlink-httpd.api-keys.*
+
 [Install]
 WantedBy=network.target

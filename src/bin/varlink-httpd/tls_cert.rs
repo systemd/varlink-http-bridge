@@ -26,6 +26,8 @@ use openssl::x509::{X509, X509NameBuilder};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use varlink_http_bridge::secret_file::{SecretAccess, check_secret_file};
+
 /// Ten years. A self-signed certificate has no revocation story.
 const VALIDITY_DAYS: u32 = 3650;
 
@@ -145,18 +147,7 @@ pub(crate) fn load_or_generate(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)>
 
     match (cert_path.exists(), key_path.exists()) {
         (true, true) => {
-            let mode = std::fs::metadata(&key_path)
-                .with_context(|| format!("stat {}", key_path.display()))?
-                .permissions()
-                .mode()
-                & 0o777;
-            // reject group/other access only, so 0400 is as fine as 0600
-            if mode & 0o077 != 0 {
-                bail!(
-                    "refusing to use generated TLS key {}: permissions are 0{mode:o}, must not be group- or world-accessible",
-                    key_path.display()
-                );
-            }
+            check_secret_file(&key_path, SecretAccess::OwnerOnly)?;
             return Ok((cert_path, key_path));
         }
         (false, false) => {}

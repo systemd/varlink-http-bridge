@@ -29,6 +29,32 @@ impl CredentialsLoader {
         let path = self.dir.join(id);
         path.exists().then_some(path)
     }
+
+    /// Sorted, so the merge order is stable.
+    ///
+    /// # Errors
+    /// A missing directory means no credentials; other errors propagate so the
+    /// caller can keep what it already loaded rather than lose sources silently.
+    pub fn paths_with_prefix(&self, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix))
+            {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
 }
 
 /// Highest-precedence existing config file for `rel`, following the systemd
@@ -54,6 +80,42 @@ mod tests {
         let loader = CredentialsLoader::from_dir(dir.path());
         assert_eq!(loader.path("cert"), Some(dir.path().join("cert")));
         assert_eq!(loader.path("missing"), None);
+    }
+
+    #[test]
+    fn test_credentials_loader_paths_with_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "varlink-httpd.api-keys.b",
+            "varlink-httpd.api-keys.a",
+            "api-keys",
+            "unrelated",
+        ] {
+            std::fs::write(dir.path().join(name), "dummy").unwrap();
+        }
+
+        let loader = CredentialsLoader::from_dir(dir.path());
+        assert_eq!(
+            loader.paths_with_prefix("varlink-httpd.api-keys.").unwrap(),
+            vec![
+                dir.path().join("varlink-httpd.api-keys.a"),
+                dir.path().join("varlink-httpd.api-keys.b"),
+            ],
+            "only prefixed credentials, sorted"
+        );
+        assert!(
+            loader.paths_with_prefix("nomatch.").unwrap().is_empty(),
+            "no match is not an error"
+        );
+
+        let missing = CredentialsLoader::from_dir(dir.path().join("nonexistent"));
+        assert!(
+            missing
+                .paths_with_prefix("varlink-httpd.")
+                .unwrap()
+                .is_empty(),
+            "a missing credentials directory means no credentials"
+        );
     }
 
     #[test]

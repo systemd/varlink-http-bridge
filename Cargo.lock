@@ -2706,6 +2706,7 @@ dependencies = [
  "async-stream",
  "axum",
  "bytes",
+ "data-encoding",
  "env_logger",
  "futures-core",
  "futures-util",
