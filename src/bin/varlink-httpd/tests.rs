@@ -3366,3 +3366,39 @@ async fn test_integration_openapi_requires_more_flag() {
         "CleanPool should NOT have json response (requires 'more')"
     );
 }
+
+/// A client that connects and then says nothing must not hold the
+/// handshake task and its fd until its TCP dies.
+#[test_with::executable(openssl)]
+#[tokio::test]
+async fn test_tls_handshake_timeout_drops_a_silent_client() {
+    use axum::serve::Listener as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let pki = make_test_pki();
+    let mut tls = load_tls_config(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        None,
+        false,
+    )
+    .unwrap();
+    tls.handshake_timeout = Duration::from_millis(100);
+
+    let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = inner.local_addr().unwrap();
+    let mut listener = AsyncTlsListener::new(PlainListener { inner }, tls).unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("the connection must be dropped on a silent client");
+    assert_eq!(read.unwrap(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "nothing must have been handed to axum"
+    );
+}

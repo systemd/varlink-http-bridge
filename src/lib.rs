@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #[cfg(feature = "sshauth")]
+pub mod listen;
 pub mod sshauth_token;
 pub mod sysconf;
 
