@@ -33,6 +33,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
 use tokio_vsock::VsockListener;
 use varlink_http_bridge::TlsChannelBinding;
+use varlink_http_bridge::sysconf::CredentialsLoader;
 use zlink::varlink_service::Proxy;
 
 mod auth_api_key;
@@ -639,13 +640,11 @@ fn resolve_tls_config(
     cli_cert: Option<String>,
     cli_key: Option<String>,
     cli_ca: Option<String>,
-    creds_dir: Option<&std::path::Path>,
+    creds: Option<&CredentialsLoader>,
     require_mtls: bool,
 ) -> anyhow::Result<TlsConfig> {
-    let creds = creds_dir.map(varlink_http_bridge::sysconf::CredentialsLoader::from_dir);
     let cred = |name: &str| -> Option<String> {
         creds
-            .as_ref()
             .and_then(|c| c.path(name))
             .and_then(|p| p.to_str().map(String::from))
     };
@@ -657,7 +656,7 @@ fn resolve_tls_config(
     // `systemctl reload`, and a path we never learned cannot be watched.
     let client_ca = cli_ca
         .or_else(|| cred("trust"))
-        .or_else(|| creds_dir.map(|d| d.join("trust").to_string_lossy().into_owned()));
+        .or_else(|| creds.map(|c| c.expected_path("trust").to_string_lossy().into_owned()));
 
     match (tls_cert.as_deref(), tls_key.as_deref()) {
         (Some(cert), Some(key)) => load_tls_config(cert, key, client_ca.as_deref(), require_mtls),
@@ -1595,9 +1594,9 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     require_mtls: bool,
-    authorized_keys: Option<String>,
+    authorized_keys: Option<std::path::PathBuf>,
     auth: Vec<AuthMechanism>,
-    api_keys: Option<String>,
+    api_keys: Option<std::path::PathBuf>,
     insecure: bool,
 }
 
@@ -1706,9 +1705,9 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("require-mtls") => require_mtls = true,
-            Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("authorized-keys") => authorized_keys = Some(parser.value()?.into()),
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
-            Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
+            Long("api-keys") => api_keys = Some(parser.value()?.into()),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1829,7 +1828,7 @@ fn parse_gen_api_key_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command
                 print_gen_api_key_help();
                 std::process::exit(0);
             }
-            Value(val) if output.is_none() => output = Some(val.parse()?),
+            Value(val) if output.is_none() => output = Some(val.into()),
             _ => return Err(arg.unexpected().into()),
         }
     }
@@ -1861,13 +1860,13 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
-/// Warns about credentials present in `creds_dir` that are unused due to flag
+/// Warns about credentials present in `creds` that are unused due to flag
 /// usage, or `None` when every credential present is read.
 ///
 /// Credentials don't enable mechanisms implicitly, and concrete flag values
 /// take precedence over credentials. The warning names the unused credentials
 /// and why they aren't used so we can point at potential misconfiguration.
-fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> Option<String> {
+fn unread_credentials_warning(creds: &CredentialsLoader, cli: &BridgeCli) -> Option<String> {
     let mut unread: Vec<String> = Vec::new();
 
     for (name, read, why, explicit) in [
@@ -1894,7 +1893,7 @@ fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> O
             cli.trust.is_some(),
         ),
     ] {
-        if !creds_dir.join(name).exists() {
+        if creds.path(name).is_none() {
             continue;
         }
         let why = if !read {
@@ -1909,44 +1908,18 @@ fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> O
         }
     }
 
-    {
-        // An explicit --api-keys= replaces discovery rather than adding to it,
-        // so it hides credentials even when API key auth is selected.
-        let why = if !cli.auth.contains(&AuthMechanism::ApiKey) {
-            Some("pass --auth=api-key to use it")
-        } else if cli.api_keys.is_some() {
-            Some("an explicit path takes priority")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            unread.extend(
-                auth_api_key::api_keys_credentials(creds_dir)
-                    .into_iter()
-                    .map(|name| format!("{name} ({why})")),
-            );
-        }
-    }
+    unread.extend(auth_api_key::unread_credentials(
+        creds,
+        cli.auth.contains(&AuthMechanism::ApiKey),
+        cli.api_keys.is_some(),
+    ));
 
     #[cfg(feature = "sshauth")]
-    {
-        // An explicit --authorized-keys= replaces discovery rather than adding
-        // to it, so it hides credentials even when ssh auth is selected.
-        let why = if cli.authorized_keys.is_some() {
-            Some("--authorized-keys= replaces credential discovery")
-        } else if !cli.auth.contains(&AuthMechanism::Ssh) {
-            Some("pass --auth=ssh to use them")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            unread.extend(
-                auth_ssh::authorized_keys_credentials(creds_dir)
-                    .into_iter()
-                    .map(|name| format!("{name} ({why})")),
-            );
-        }
-    }
+    unread.extend(auth_ssh::unread_credentials(
+        creds,
+        cli.auth.contains(&AuthMechanism::Ssh),
+        cli.authorized_keys.is_some(),
+    ));
 
     if unread.is_empty() {
         return None;
@@ -1967,9 +1940,9 @@ fn build_authenticators(
     auth: &[AuthMechanism],
     insecure: bool,
     require_mtls: bool,
-    authorized_keys: Option<&str>,
-    api_keys: Option<&str>,
-    creds_dir: Option<&std::path::Path>,
+    authorized_keys: Option<&std::path::Path>,
+    api_keys: Option<&std::path::Path>,
+    creds: Option<&CredentialsLoader>,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
@@ -1977,14 +1950,14 @@ fn build_authenticators(
         match mechanism {
             #[cfg(feature = "sshauth")]
             AuthMechanism::Ssh => authenticators.push(Box::new(create_ssh_authenticator(
-                authorized_keys.map(String::from),
-                creds_dir,
+                authorized_keys.map(std::path::Path::to_path_buf),
+                creds.cloned(),
                 etc_root,
             )?)),
             AuthMechanism::ApiKey => authenticators.push(Box::new(
                 auth_api_key::create_api_key_authenticator(
-                    api_keys.map(String::from),
-                    creds_dir,
+                    api_keys.map(std::path::Path::to_path_buf),
+                    creds.cloned(),
                     etc_root,
                 )?
                 .context(
@@ -2030,10 +2003,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Bridge(cli) => cli,
     };
 
-    let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
+    let creds = CredentialsLoader::from_env();
 
-    if let Some(dir) = creds_dir.as_deref()
-        && let Some(warning) = unread_credentials_warning(dir, &cli)
+    if let Some(creds) = &creds
+        && let Some(warning) = unread_credentials_warning(creds, &cli)
     {
         warn!("{warning}");
     }
@@ -2044,7 +2017,7 @@ async fn main() -> anyhow::Result<()> {
         cli.require_mtls,
         cli.authorized_keys.as_deref(),
         cli.api_keys.as_deref(),
-        creds_dir.as_deref(),
+        creds.as_ref(),
         std::path::Path::new("/"),
     )?;
 
@@ -2055,7 +2028,7 @@ async fn main() -> anyhow::Result<()> {
             cli.cert,
             cli.key,
             cli.trust,
-            creds_dir.as_deref(),
+            creds.as_ref(),
             cli.require_mtls,
         )?)
     };

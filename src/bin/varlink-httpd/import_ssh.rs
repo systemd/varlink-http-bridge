@@ -10,9 +10,9 @@ pub(crate) struct ImportSsh {
 }
 
 fn default_authorized_keys_path() -> String {
-    if let Some(creds_dir) = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env() {
-        return creds_dir
-            .join("authorized_keys")
+    if let Some(creds) = varlink_http_bridge::sysconf::CredentialsLoader::from_env() {
+        return creds
+            .expected_path("authorized_keys")
             .to_string_lossy()
             .into_owned();
     }
@@ -62,7 +62,7 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
         "Wrote {keys_count} key(s) to {output_path}, run with:",
         keys_count = imported.keys.len()
     );
-    if varlink_http_bridge::sysconf::CredentialsLoader::path_from_env().is_some() {
+    if varlink_http_bridge::sysconf::CredentialsLoader::from_env().is_some() {
         eprintln!("  varlink-httpd --auth=ssh");
     } else {
         eprintln!("  varlink-httpd --auth=ssh --authorized-keys={output_path}");

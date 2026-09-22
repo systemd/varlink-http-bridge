@@ -10,6 +10,12 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 use varlink_http_bridge::TlsChannelBinding;
+use varlink_http_bridge::sysconf::CredentialsLoader;
+
+/// A credentials directory for a test, from a `TempDir` or a path.
+fn creds(dir: impl AsRef<std::path::Path>) -> CredentialsLoader {
+    CredentialsLoader::from_dir(dir.as_ref())
+}
 
 /// Saves each test from assembling an `AuthRequest` and its backing `HeaderMap`.
 fn check_request(
@@ -1342,7 +1348,7 @@ fn test_mtls_watches_trust_credential_before_it_exists() {
     std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
-    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), true).unwrap();
+    let tls = resolve_tls_config(None, None, None, Some(&creds(&creds_dir)), true).unwrap();
 
     let trust = tls.client_trust.expect("mTLS must carry a trust store");
     assert_eq!(
@@ -1528,7 +1534,7 @@ async fn test_tls_credentials_directory_fallback() {
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
     // No CLI flags; resolve_tls_config should pick up creds from the directory
-    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), false)
+    let tls = resolve_tls_config(None, None, None, Some(&creds(&creds_dir)), false)
         .expect("credentials directory fallback failed");
 
     let varlink_dir = tempfile::tempdir().unwrap();
@@ -1641,7 +1647,7 @@ fn test_tls_half_configured_is_rejected() {
         (Some("/nonexistent/cert.pem".to_string()), None),
         (None, Some("/nonexistent/key.pem".to_string())),
     ] {
-        let Err(err) = resolve_tls_config(cert, key, None, Some(empty_dir.path()), false) else {
+        let Err(err) = resolve_tls_config(cert, key, None, Some(&creds(&empty_dir)), false) else {
             panic!("--cert and --key must be given together");
         };
         assert!(
@@ -1862,7 +1868,7 @@ fn unread_warning(
     authorized_keys: Option<&str>,
 ) -> Option<String> {
     let cli = cli_looking_up_credentials(insecure, require_mtls, auth, authorized_keys);
-    crate::unread_credentials_warning(creds_dir, &cli)
+    crate::unread_credentials_warning(&creds(creds_dir), &cli)
 }
 
 /// `creds_dir_with_everything()` writes ssh credentials too, so a configuration
@@ -1888,7 +1894,7 @@ fn cli_looking_up_credentials(
         key: None,
         trust: None,
         require_mtls,
-        authorized_keys: authorized_keys.map(String::from),
+        authorized_keys: authorized_keys.map(std::path::PathBuf::from),
         api_keys: None,
         auth: auth.to_vec(),
         insecure,
@@ -1947,7 +1953,7 @@ fn test_unread_credentials_reports_tls_material_hidden_by_explicit_paths() {
         ..cli_looking_up_credentials(false, true, &[AuthMechanism::None], None)
     };
     assert_eq!(
-        crate::unread_credentials_warning(dir.path(), &cli),
+        crate::unread_credentials_warning(&creds(&dir), &cli),
         Some(format!(
             "credential(s) present but unused by this configuration: \
              cert (an explicit path takes priority)\
@@ -2036,11 +2042,11 @@ fn test_unread_credentials_reports_api_keys_hidden_by_explicit_path() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("varlink-httpd.api-keys"), "").unwrap();
     let cli = crate::BridgeCli {
-        api_keys: Some("/etc/varlink-httpd/api-keys".to_string()),
+        api_keys: Some("/etc/varlink-httpd/api-keys".into()),
         ..cli_looking_up_credentials(false, true, &[AuthMechanism::ApiKey], None)
     };
     assert_eq!(
-        crate::unread_credentials_warning(dir.path(), &cli).as_deref(),
+        crate::unread_credentials_warning(&creds(&dir), &cli).as_deref(),
         Some(
             "credential(s) present but unused by this configuration: \
              varlink-httpd.api-keys (an explicit path takes priority)"
@@ -2055,6 +2061,34 @@ fn test_unread_credentials_ignores_absent_files() {
         unread_warning(dir.path(), true, false, &[AuthMechanism::None], None),
         None
     );
+}
+
+// --- credential imports in the shipped unit ---
+
+/// A credential the code looks for but the unit does not import would sit in
+/// the credstore and never reach the service, so the two lists must agree,
+/// down to the `ImportCredential=` spelling of the globs.
+#[test]
+fn test_unit_imports_every_mechanism_credential() {
+    let unit = include_str!("../../../data/varlink-httpd.service.in");
+    let imported: Vec<&str> = unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("ImportCredential="))
+        // `id:alias` imports under another name, the credstore id is what matters
+        .map(|value| value.split_once(':').map_or(value, |(id, _alias)| id))
+        .collect();
+
+    let mut looked_for: Vec<&str> = crate::auth_api_key::API_KEY_CREDENTIALS.to_vec();
+    #[cfg(feature = "sshauth")]
+    {
+        looked_for.extend(crate::auth_ssh::SSH_AUTHORIZED_KEYS_CREDENTIALS);
+    }
+    for pattern in looked_for {
+        assert!(
+            imported.contains(&pattern),
+            "{pattern} is read by the service but not imported by the unit"
+        );
+    }
 }
 
 // --- --auth= mechanism selection tests ---
@@ -2289,14 +2323,9 @@ mod sshauth_tests {
         std::fs::write(&file_a, pubkey_a.as_bytes()).unwrap();
         std::fs::write(&file_b, pubkey_b.as_bytes()).unwrap();
 
-        let auth = crate::auth_ssh::SshKeyAuthenticator::new(
-            vec![
-                file_a.to_string_lossy().into_owned(),
-                file_b.to_string_lossy().into_owned(),
-            ],
-            None,
-        )
-        .unwrap();
+        let auth =
+            crate::auth_ssh::SshKeyAuthenticator::new(vec![file_a.clone(), file_b.clone()], None)
+                .unwrap();
         assert_eq!(auth.key_count(), 2);
 
         std::fs::remove_file(&file_b).unwrap();
@@ -2777,7 +2806,7 @@ mod sshauth_tests {
         )
         .unwrap();
         let auth =
-            create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
+            create_ssh_authenticator(None, Some(creds(&creds_dir)), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from creds_dir");
 
         // 4. Both /etc and $CREDENTIALS_DIRECTORY exist → keys are merged
@@ -2792,7 +2821,7 @@ mod sshauth_tests {
         writeln!(creds_file, "{}", pubkey_b2.trim()).unwrap();
         drop(creds_file);
         let auth =
-            create_ssh_authenticator(None, Some(creds_dir_b.path()), root_both.path()).unwrap();
+            create_ssh_authenticator(None, Some(creds(&creds_dir_b)), root_both.path()).unwrap();
         assert_eq!(
             auth.key_count(),
             3,
@@ -2809,7 +2838,7 @@ mod sshauth_tests {
         )
         .unwrap();
         let auth =
-            create_ssh_authenticator(None, Some(creds_dir_all.path()), empty_root.path()).unwrap();
+            create_ssh_authenticator(None, Some(creds(&creds_dir_all)), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from .all credential");
 
         // 5c. Both .root and .all credentials exist → keys are merged
@@ -2828,8 +2857,8 @@ mod sshauth_tests {
         writeln!(all_file, "{}", pubkey_b1.trim()).unwrap();
         writeln!(all_file, "{}", pubkey_b2.trim()).unwrap();
         drop(all_file);
-        let auth =
-            create_ssh_authenticator(None, Some(creds_dir_both.path()), empty_root.path()).unwrap();
+        let auth = create_ssh_authenticator(None, Some(creds(&creds_dir_both)), empty_root.path())
+            .unwrap();
         assert_eq!(
             auth.key_count(),
             3,
@@ -2841,8 +2870,8 @@ mod sshauth_tests {
         let cli_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(cli_file.path(), format!("{}\n", pubkey_b1.trim())).unwrap();
         let auth = create_ssh_authenticator(
-            Some(cli_file.path().to_str().unwrap().to_string()),
-            Some(creds_dir.path()),
+            Some(cli_file.path().to_path_buf()),
+            Some(creds(&creds_dir)),
             cli_root.path(),
         )
         .unwrap();
@@ -2891,7 +2920,7 @@ mod sshauth_tests {
             b"not a key",
         )
         .unwrap();
-        let auth = create_ssh_authenticator(None, Some(creds_dir_multi.path()), empty_root.path())
+        let auth = create_ssh_authenticator(None, Some(creds(&creds_dir_multi)), empty_root.path())
             .unwrap();
         assert_eq!(
             auth.key_count(),
@@ -2917,7 +2946,7 @@ mod sshauth_tests {
         )
         .unwrap();
         let auth =
-            create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
+            create_ssh_authenticator(None, Some(creds(&creds_dir)), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1);
 
         // A prefixed credential appearing later (RefreshOnReload= swaps in a
@@ -2956,7 +2985,7 @@ mod sshauth_tests {
             .join("varlink-httpd.ssh.authorized-keys.first");
         std::fs::write(&first, pubkey_a.as_bytes()).unwrap();
         let auth =
-            create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
+            create_ssh_authenticator(None, Some(creds(&creds_dir)), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1);
 
         // Empty the first file but restore its mtime: a reload triggered by
@@ -3757,7 +3786,7 @@ mod apikey_tests {
             None,
         )
         .unwrap();
-        let auth = create_api_key_authenticator(None, Some(creds_dir.path()), root.path())
+        let auth = create_api_key_authenticator(None, Some(creds(&creds_dir)), root.path())
             .unwrap()
             .unwrap();
         assert_eq!(auth.key_count(), 2, "/etc + credential should be merged");
@@ -3783,7 +3812,7 @@ mod apikey_tests {
         let dir = tempfile::tempdir().unwrap();
         let keys_path = dir.path().join("api-keys");
         let auth = create_api_key_authenticator(
-            Some(keys_path.to_string_lossy().into_owned()),
+            Some(keys_path.clone()),
             None,
             std::path::Path::new("/nonexistent"),
         )
@@ -3826,7 +3855,7 @@ mod apikey_tests {
         )
         .unwrap();
 
-        let auth = create_api_key_authenticator(None, Some(creds_dir.path()), root.path())
+        let auth = create_api_key_authenticator(None, Some(creds(&creds_dir)), root.path())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3853,7 +3882,7 @@ mod apikey_tests {
         )
         .unwrap();
 
-        let auth = create_api_key_authenticator(None, Some(creds_dir.path()), root.path())
+        let auth = create_api_key_authenticator(None, Some(creds(&creds_dir)), root.path())
             .unwrap()
             .expect("a globbed credential alone must enable the authenticator");
         let header = format!("Bearer {key}");
@@ -3872,7 +3901,7 @@ mod apikey_tests {
         )
         .unwrap();
         let creds_dir = tempfile::tempdir().unwrap();
-        let auth = create_api_key_authenticator(None, Some(creds_dir.path()), root.path())
+        let auth = create_api_key_authenticator(None, Some(creds(&creds_dir)), root.path())
             .unwrap()
             .unwrap();
 
@@ -3904,7 +3933,7 @@ mod apikey_tests {
         std::fs::create_dir(&creds_dir).unwrap();
         let key = crate::auth_api_key::generate_api_key();
         append_api_key(&creds_dir.join("varlink-httpd.api-keys"), &key, None).unwrap();
-        let auth = create_api_key_authenticator(None, Some(&creds_dir), root.path())
+        let auth = create_api_key_authenticator(None, Some(creds(&creds_dir)), root.path())
             .unwrap()
             .unwrap();
         let header = format!("Bearer {key}");
@@ -3932,10 +3961,7 @@ mod apikey_tests {
         let auth = ApiKeyAuthenticator::new(
             // the broken one first: a bail-on-first-error loop never reaches
             // the good one
-            vec![
-                broken.to_string_lossy().into_owned(),
-                good.to_string_lossy().into_owned(),
-            ],
+            vec![broken.clone(), good.clone()],
             None,
         )
         .unwrap();
