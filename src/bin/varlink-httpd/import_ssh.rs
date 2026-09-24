@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug)]
 pub(crate) struct ImportSsh {
@@ -32,6 +33,30 @@ fn default_authorized_keys_path() -> String {
         .into_owned()
 }
 
+/// Write `text` as the authorized_keys at `out`. Mode 0644 because the
+/// bridge can run as non-root.
+fn write_authorized_keys(out: &std::path::Path, text: &str) -> anyhow::Result<()> {
+    let parent = out
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine parent directory of {}", out.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+
+    // Write to a tempfile in the target directory, then rename, so a
+    // reader never observes a partially-written authorized_keys.
+    let mut tmp_authorized_keys = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o644))
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create tempfile in {}", parent.display()))?;
+    tmp_authorized_keys
+        .write_all(text.as_bytes())
+        .with_context(|| format!("failed to write tempfile in {}", parent.display()))?;
+    tmp_authorized_keys
+        .persist(out)
+        .with_context(|| format!("failed to rename tempfile to {}", out.display()))?;
+    Ok(())
+}
+
 pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
     let output_path = cmd.output.unwrap_or_else(default_authorized_keys_path);
 
@@ -40,23 +65,7 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
     // and lock out all users.
     let imported = ssh_key_import::fetch(&cmd.source)?;
 
-    let out = std::path::Path::new(&output_path);
-    let parent = out
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine parent directory of {output_path}"))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-
-    // Write to a tempfile in the target directory, then rename, so a
-    // reader never observes a partially-written authorized_keys.
-    let mut tmp_authorized_keys = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create tempfile in {}", parent.display()))?;
-    tmp_authorized_keys
-        .write_all(imported.text.as_bytes())
-        .with_context(|| format!("failed to write tempfile in {}", parent.display()))?;
-    tmp_authorized_keys
-        .persist(out)
-        .with_context(|| format!("failed to rename tempfile to {output_path}"))?;
+    write_authorized_keys(std::path::Path::new(&output_path), &imported.text)?;
 
     eprintln!(
         "Wrote {keys_count} key(s) to {output_path}, run with:",
@@ -69,4 +78,22 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorized_keys_are_readable_by_a_non_root_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("authorized_keys");
+        let keys = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample user@host\n";
+
+        write_authorized_keys(&out, keys).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), keys);
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
 }
