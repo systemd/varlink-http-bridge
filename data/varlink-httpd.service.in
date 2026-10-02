@@ -62,6 +62,8 @@ RefreshOnReload=credentials
 # API key hashes, only read with --auth=api-key.
 ImportCredential=varlink-httpd.api-keys
 ImportCredential=varlink-httpd.api-keys.*
+# JWT configuration (issuer, audience, jwks, require-claims)
+ImportCredential=varlink-httpd.jwt.*
 
 [Install]
 WantedBy=network.target
