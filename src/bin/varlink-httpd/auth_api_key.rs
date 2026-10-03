@@ -433,7 +433,7 @@ pub(crate) fn append_api_key(
     name: Option<&str>,
 ) -> anyhow::Result<String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     validate_api_key(key)?;
 
@@ -449,15 +449,19 @@ pub(crate) fn append_api_key(
         .with_context(|| format!("cannot determine parent directory of {}", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    // 0600: the file only holds hashes, but there is no reason to share it.
+    // 0640: the service reads this as a member of the varlink-httpd group.
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .mode(0o600)
+        .mode(0o640)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     writeln!(f, "sha256:{hex} {name}")
         .with_context(|| format!("failed to write {}", path.display()))?;
+    // .mode() above is masked by the umask and ignored for a file that
+    // already exists.
+    f.set_permissions(std::fs::Permissions::from_mode(0o640))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
     Ok(name.to_string())
 }
 

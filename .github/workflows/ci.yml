@@ -32,6 +32,9 @@ jobs:
         run: |
           rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /usr/bin/varlink-httpd
           rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /usr/lib/systemd/system/varlink-httpd.service
+          rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /usr/share/polkit-1/rules.d/10-varlink-httpd.rules
+          rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /usr/lib/sysusers.d/varlink-httpd.conf
+          rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /usr/lib/tmpfiles.d/varlink-httpd.conf
           rpm -qlp mkosi/mkosi.output/varlink-httpd-*.rpm | grep -x /etc/varlink-httpd
           rpm -qlp mkosi/mkosi.output/varlinkctl-http-*.rpm | grep -x /usr/lib/systemd/varlink-bridges/http
           rpm -qlp mkosi/mkosi.output/varlinkctl-http-*.rpm | grep -x /usr/lib/systemd/varlink-bridges/https

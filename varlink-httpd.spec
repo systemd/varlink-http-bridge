@@ -18,6 +18,10 @@ BuildRequires:  pkgconfig
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
 
+# The bridge runs with DynamicUser=yes and many varlink call need
+# to be authorized by polkit
+Requires:       polkit
+
 %description
 An HTTP bridge that makes local varlink services available over HTTP and
 WebSocket. The main use case is systemd, so only the subset of varlink that
@@ -46,6 +50,9 @@ just build release
 DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 
 %post
+# the group must exist before tmpfiles can hand it /etc/varlink-httpd
+%sysusers_create_compat %{_sysusersdir}/varlink-httpd.conf
+%tmpfiles_create %{_tmpfilesdir}/varlink-httpd.conf
 %systemd_post varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket
 
 %preun
@@ -59,6 +66,9 @@ DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 %{_unitdir}/varlink-httpd.service
 %{_unitdir}/varlink-httpd.socket
 %{_unitdir}/varlink-httpd-vsock.socket
+%{_datadir}/polkit-1/rules.d/10-varlink-httpd.rules
+%{_sysusersdir}/varlink-httpd.conf
+%{_tmpfilesdir}/varlink-httpd.conf
 %dir %{_sysconfdir}/varlink-httpd
 
 %files -n varlinkctl-http
