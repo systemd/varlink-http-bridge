@@ -9,6 +9,7 @@
 
 use anyhow::{Context, bail};
 use std::io::Write as _;
+use std::time::Duration;
 
 mod key;
 
@@ -42,6 +43,12 @@ pub fn resolve_key_url(source: &str) -> anyhow::Result<String> {
     }
 }
 
+/// 640KB ought to be enough for anybody (ureq's default of 10MB is a bit much).
+const BODY_LIMIT: u64 = 640 * 1024;
+
+/// Bounds the whole exchange so a stalled endpoint cannot hang the import.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetch authorized keys from `source`, validate them, and return the raw
 /// text together with the parsed keys.
 ///
@@ -50,29 +57,17 @@ pub fn resolve_key_url(source: &str) -> anyhow::Result<String> {
 /// response contains no valid SSH public keys (e.g. an HTML error page
 /// from a mistyped URL).
 pub fn fetch(source: &str) -> anyhow::Result<AuthorizedKeys> {
-    fetch_url(&resolve_key_url(source)?)
+    // resolve_key_url has already guaranteed https; https_only keeps a
+    // redirect from downgrading away from it, which matters because the keys
+    // below are trusted verbatim.
+    fetch_url(&resolve_key_url(source)?, true)
 }
 
 /// Fetch and validate the authorized keys at `url`, without the checks
 /// of [`resolve_key_url`].
-fn fetch_url(url: &str) -> anyhow::Result<AuthorizedKeys> {
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .build();
-    let agent = ureq::config::Config::builder()
-        .tls_config(tls)
-        .build()
-        .new_agent();
-    let text = agent
-        .get(url)
-        .call()
-        .with_context(|| format!("failed to fetch keys from {url}"))?
-        .body_mut()
-        .with_config()
-        // 640KB ought to be enough for anybody (default of 10mb is a bit much)
-        .limit(640 * 1024)
-        .read_to_string()
-        .with_context(|| format!("failed to read response body from {url}"))?;
+fn fetch_url(url: &str, https_only: bool) -> anyhow::Result<AuthorizedKeys> {
+    let text = http_fetch::Fetcher::new(https_only, FETCH_TIMEOUT, BODY_LIMIT)
+        .get(url, "authorized keys")?;
 
     let keys = validate(&text)
         .with_context(|| format!("response from {url} contains invalid SSH public keys"))?;
@@ -129,7 +124,7 @@ mod tests {
     #[test]
     fn fetch_url_returns_the_served_keys() {
         let body = format!("{ED25519_KEY}\n");
-        let imported = fetch_url(&serve_once("200 OK", &body)).unwrap();
+        let imported = fetch_url(&serve_once("200 OK", &body), false).unwrap();
         assert_eq!(imported.text, body);
         assert_eq!(imported.keys.len(), 1);
         assert_eq!(imported.keys[0].to_openssh().unwrap(), ED25519_KEY);
@@ -144,9 +139,9 @@ mod tests {
                 "SSH public keys",
             ),
             ("200 OK", "", "no valid SSH public keys"),
-            ("404 Not Found", "Not Found", "failed to fetch keys"),
+            ("404 Not Found", "Not Found", "authorized keys request to"),
         ] {
-            let Err(err) = fetch_url(&serve_once(status, body)) else {
+            let Err(err) = fetch_url(&serve_once(status, body), false) else {
                 panic!("{status} {body:?} was accepted");
             };
             assert!(format!("{err:#}").contains(expected), "{err:#}");

@@ -11,4 +11,4 @@ p256 = { version = "0.13", default-features = false, features = ["arithmetic", "
 ssh-key = { version = "0.6", features = ["ed25519", "p256"] }
 sshauth = { workspace = true }
 tempfile = "3.27"
-ureq = { version = "3", default-features = false, features = ["native-tls"] }
+http-fetch = { path = "../http-fetch" }

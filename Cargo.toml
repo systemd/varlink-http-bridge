@@ -5,7 +5,7 @@ edition = "2024"
 license = "LGPL-2.1-or-later"
 
 [workspace]
-members = [".", "crates/ssh-key-import", "crates/varlink-http-core", "crates/varlink-http-client"]
+members = [".", "crates/http-fetch", "crates/ssh-key-import", "crates/varlink-http-core", "crates/varlink-http-client"]
 
 [workspace.dependencies]
 # TODO: switch back to crates.io once SkEd25519 (hardware key) support
