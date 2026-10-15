@@ -9,6 +9,9 @@ sockets) like `/run/varlink/registry` as the argument and will serve
 whatever it finds in there. Sockets can be added or removed dynamically
 in the dir as needed.
 
+See [README.relayd.md](README.relayd.md) for the plan to reach a
+`varlink-httpd` behind NAT or a firewall through a relay.
+
 ## URL Schema
 
 ```
