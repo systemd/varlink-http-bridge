@@ -3725,6 +3725,23 @@ mod apikey_tests {
         assert_eq!(auth.key_count(), 1);
     }
 
+    #[test]
+    fn test_append_api_key_writes_a_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-keys");
+        let key = crate::auth_api_key::generate_api_key();
+        append_api_key(&path, &key, None).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o640);
+
+        // a file from before the group existed is brought along
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        append_api_key(&path, &crate::auth_api_key::generate_api_key(), None).unwrap();
+        assert_eq!(mode(&path), 0o640);
+    }
+
     /// Write an api-keys file holding one fresh key under `root/base/`.
     fn write_api_keys_at(root: &std::path::Path, base: &str) -> String {
         let path = root.join(base).join("varlink-httpd/api-keys");
