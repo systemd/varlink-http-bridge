@@ -50,7 +50,7 @@ rustix = { version = "1.0", features = ["net", "process", "system"] }
 tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086", features = ["axum08"] }
 vsock = "0.5"
 socket2 = "0.6"
-# using opeenssl here to keep size small, rusttls adds ~1.8MB binary size
+# using openssl here to keep size small, rusttls adds ~1.8MB binary size
 # and nativetls does not support mTLS
 # 0.10.81: Asn1StringRef::to_string (format_x509_subject)
 openssl = "0.10.81"
