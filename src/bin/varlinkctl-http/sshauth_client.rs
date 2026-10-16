@@ -11,7 +11,7 @@ use varlink_http_bridge::sshauth_token::{
     SSHAUTH_NONCE_HEADER, SignedParts, signer_from_agent, signer_from_private_key,
 };
 
-use crate::client_auth::ClientAuth;
+use crate::client_auth::{ClientAuth, is_http_unauthorized};
 
 /// An SSH key that can be used for authentication.
 enum SshKey {
@@ -194,11 +194,6 @@ impl fmt::Display for SigningFailed {
 
 fn is_signing_failure(err: &anyhow::Error) -> bool {
     err.is::<SigningFailed>()
-}
-
-pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<tungstenite::Error>()
-        .is_some_and(|e| matches!(e, tungstenite::Error::Http(r) if r.status() == 401))
 }
 
 /// Return all available SSH keys for authentication.

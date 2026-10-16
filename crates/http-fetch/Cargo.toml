@@ -1,0 +1,9 @@
+[package]
+name = "http-fetch"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+anyhow = "1.0.100"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
