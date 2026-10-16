@@ -526,7 +526,7 @@ impl ClientTrust {
     }
 
     /// Re-read the CA file when its mtime changed. Removing the file drops the CAs.
-    /// An unparseable or empty file keeps the previous CAs and leaves the mtime untouched
+    /// An unparsable or empty file keeps the previous CAs and leaves the mtime untouched
     /// so the next connection retries.
     fn maybe_reload(&self) {
         let Some(path) = self.path.as_deref() else {

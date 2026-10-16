@@ -39,7 +39,7 @@ fn validate_api_key(key: &str) -> anyhow::Result<()> {
 
 fn hex_decode_sha256(hex: &str) -> anyhow::Result<[u8; SHA256_LEN]> {
     // the value is left out of the error to avoid leaking real keys
-    // that got pasted accidentially without hasing
+    // that got pasted accidentally without hashing
     HEXLOWER_PERMISSIVE
         .decode(hex.as_bytes())
         .context("digest is not valid hex")?

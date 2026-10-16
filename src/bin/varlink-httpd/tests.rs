@@ -690,7 +690,7 @@ async fn test_integration_real_systemd_idl_get() {
     );
 }
 
-/// The IDL is handed back unparsed, so it must stay parseable by the same
+/// The IDL is handed back unparsed, so it must stay parsable by the same
 /// code `/openapi/` uses; otherwise the two endpoints describe different
 /// things for the same interface.
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
@@ -709,7 +709,7 @@ async fn test_integration_idl_matches_openapi_title() {
         .text()
         .await
         .expect("idl body is not text");
-    let iface: zlink::idl::Interface<'_> = body.as_str().try_into().expect("unparseable IDL");
+    let iface: zlink::idl::Interface<'_> = body.as_str().try_into().expect("unparsable IDL");
 
     let doc = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
     assert_eq!(doc["info"]["title"], iface.name());
