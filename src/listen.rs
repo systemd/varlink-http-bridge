@@ -42,7 +42,7 @@ pub async fn accept_and_configure(
 }
 
 /// Returns a `SslAcceptorBuilder` from the given {cert,key}_path with
-/// a minimium TLS1.3 version requirement for TLS channel binding.
+/// a minimum TLS1.3 version requirement for TLS channel binding.
 ///
 /// # Errors
 /// Returns an error if the certificate or key cannot be loaded or do
