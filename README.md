@@ -272,18 +272,51 @@ If both are enabled, systemd passes two fds to the service on activation.
 The daemon starts on demand when the first connection arrives
 and listens on boths sockets, regardless of which connection came first.
 
-The daemon binary and unit files can be installed with `just install_server`.
+Everything the server needs can be installed with `just install_server`.
 
 After installation, enable with:
 ```console
 # systemctl enable --now varlink-httpd.socket varlink-httpd-vsock.socket
 ```
 
+### Privileges: DynamicUser and polkit
+
+The default unit runs unprivileged with `DynamicUser=yes`. The varlink
+services authorize their callers with polkit and by default the bridge
+ships a rule that opens the bridge for all varlink services. This is
+equivalent to giving root. So while the bridge itself does not run as
+root it can spawn root processes via varlink and this polkit rule. The
+core idea of this separation is that with polkit we allow fine(r)
+grained rules and are also more open for the future where polkit
+hopefully can carry more information from the bridge to polkit for
+decisions.
+
+Important to know:
+
+- **polkit must be installed.** Without it systemd treats every
+  authorization check as denied, so an unprivileged bridge can do
+  almost nothing.
+- **Secrets in `/etc` are shared through the `varlink-httpd` group.**
+  A root-owned 0600 file is not readable by the unit, so the
+  shipped sysusers.d snippet creates a static `varlink-httpd` group
+  and the /etc/varlink-httpd dir is group readable by it.
+
+To run as root instead, override the unit and the rule stops mattering
+(uid 0 skips the polkit check):
+
+```console
+# systemctl edit varlink-httpd.service
+[Service]
+DynamicUser=no
+```
+
 ## Authentication
 
-Since `varlink-httpd` runs as root, allows connections over the
-network, exposes privileged information and allows arbitrary commands
-to be invoked, authentication MUST be used.
+`varlink-httpd` allows connections over the network, exposes
+privileged information and allows arbitrary commands to be invoked --
+with the authority of root, whether or not the bridge itself runs as
+root (see [Privileges](#privileges-dynamicuser-and-polkit)). So
+authentication MUST be used.
 
 Authentication has two orthogonal layers that compose:
 
@@ -327,7 +360,8 @@ A `trust` credential without `--require-mtls` won't enable mTLS.
 Listeners always speak TLS unless `--insecure` is given. Without
 `--cert=`/`--key=` the bridge generates a self-signed certificate on
 first start, persists it under `$STATE_DIRECTORY`
-(`/var/lib/varlink-httpd` for the shipped unit) and prints the key to
+(`/var/lib/varlink-httpd` for the shipped unit, a symlink into
+`/var/lib/private/` because of `DynamicUser=yes`) and prints the key to
 pin, e.g. `sha256//N/XBoWQvWrJScutg5/l0WO5sC1/QV2th677ylUNaVa8=`. The
 pin covers the public key, not the certificate, so regenerating the
 certificate from the same key keeps existing pins valid. Clients take it
