@@ -478,7 +478,7 @@ impl Transport {
         let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
         debug!("connecting to {host}:{port} (tls: {use_tls})");
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        let tcp = varlink_http_core::mptcp::connect((host.as_str(), port))
             .await
             .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
         varlink_http_core::set_tcp_keepalive_and_nodelay(&tcp)

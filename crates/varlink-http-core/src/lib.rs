@@ -6,6 +6,7 @@
 //!
 //! To talk to a bridge, use `varlink-http-client`.
 
+pub mod mptcp;
 pub mod secret_file;
 #[cfg(feature = "sshauth")]
 pub mod sshauth_token;

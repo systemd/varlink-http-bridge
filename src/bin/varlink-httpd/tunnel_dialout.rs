@@ -181,7 +181,7 @@ async fn dial(
     // none of these steps has a timeout of its own, a relay that accepts
     // and then says nothing would park the dial loop for good
     let prelude = async {
-        let tcp = TcpStream::connect((target.host.as_str(), target.port))
+        let tcp = varlink_http_bridge::mptcp::connect((target.host.as_str(), target.port))
             .await
             .context("connecting to relay")?;
         varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp)?;

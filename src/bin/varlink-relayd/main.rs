@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use log::{info, warn};
-use tokio::net::TcpListener;
 
 use varlink_http_bridge::tunnel::TUNNEL_PATH;
 
@@ -103,10 +102,10 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     warn!("varlink-relayd is EXPERIMENTAL and subject to change without advance notice");
 
-    let node_listener = TcpListener::bind(&args.bind_node)
+    let node_listener = varlink_http_bridge::mptcp::bind(&args.bind_node)
         .await
         .with_context(|| format!("binding node listener {}", args.bind_node))?;
-    let caller_listener = TcpListener::bind(&args.bind_caller)
+    let caller_listener = varlink_http_bridge::mptcp::bind(&args.bind_caller)
         .await
         .with_context(|| format!("binding caller listener {}", args.bind_caller))?;
     info!(

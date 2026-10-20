@@ -1459,7 +1459,9 @@ async fn listener_from_bind_addr(bind: BindAddr) -> anyhow::Result<Transport> {
             Ok(Transport::Vsock(listener))
         }
         BindAddr::Tcp(ref addr) => {
-            let listener = TcpListener::bind(addr).await?;
+            let listener = varlink_http_bridge::mptcp::bind(addr)
+                .await
+                .with_context(|| format!("TCP bind to {addr}"))?;
             Ok(Transport::Tcp(listener))
         }
     }
