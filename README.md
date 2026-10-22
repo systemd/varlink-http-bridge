@@ -293,7 +293,19 @@ Authentication has two orthogonal layers that compose:
 
 `--auth=ssh` authenticates every request by an SSH key signature.
 `--auth=none` selects no per-request mechanism, leaving mTLS to
-authenticate the client; without mTLS the bridge refuses to start.
+authenticate the client. Without mTLS the bridge refuses to start
+unless the sockets to serve are given explicitly on the commandline,
+as a single socket or a dedicated directory (e.g. with symlinks to
+the sockets), never the full `/run/varlink/registry`. This makes some
+services reachable without auth while everything else is served by a
+second bridge with auth:
+
+```console
+$ varlink-httpd --auth=none --bind=0.0.0.0:1032 /run/varlink/registry/com.example.Ping
+```
+
+Every method on those sockets can then be called by anyone, as root,
+so only use this for sockets that are designed for it.
 
 mTLS is enabled separately (see below) and applies on top of whatever
 `--auth=` selects, so `--auth=ssh` together with mTLS requires both to

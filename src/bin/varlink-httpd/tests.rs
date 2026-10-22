@@ -2114,11 +2114,10 @@ fn test_unit_imports_every_mechanism_credential() {
 /// Every `build_authenticators()` case, with `/` never touched.
 fn build_authenticators_in(
     auth: &[AuthMechanism],
-    insecure: bool,
-    require_mtls: bool,
+    auth_none_allowed_because: Option<AuthNoneAllowedBecause>,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
-    crate::build_authenticators(auth, insecure, require_mtls, None, None, None, etc_root)
+    crate::build_authenticators(auth, auth_none_allowed_because, None, None, None, etc_root)
 }
 
 #[test]
@@ -2146,8 +2145,7 @@ fn test_parse_auth_rejects_none_combined_with_mechanism() {
 #[test]
 fn test_build_authenticators_none_without_mtls_is_rejected() {
     let root = tempfile::tempdir().unwrap();
-    let Err(err) = build_authenticators_in(&[AuthMechanism::None], false, false, root.path())
-    else {
+    let Err(err) = build_authenticators_in(&[AuthMechanism::None], None, root.path()) else {
         panic!("--auth=none without mTLS must not produce an authenticator");
     };
     assert!(err.to_string().contains("--auth=none needs mTLS"), "{err}");
@@ -2156,15 +2154,77 @@ fn test_build_authenticators_none_without_mtls_is_rejected() {
 #[test]
 fn test_build_authenticators_none_with_mtls_accepts() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::None], false, true, root.path()).unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(AuthNoneAllowedBecause::Mtls),
+        root.path(),
+    )
+    .unwrap();
     assert_eq!(auths.len(), 1);
     check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
 
 #[test]
+fn test_build_authenticators_none_for_dedicated_sockets_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(AuthNoneAllowedBecause::DedicatedSockets),
+        root.path(),
+    )
+    .unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "POST", "/call/a.b.C", None, None, None).unwrap();
+}
+
+#[test]
+fn test_auth_none_allowed_because_from_cli() {
+    let none = [AuthMechanism::None];
+    let cli = cli_looking_up_credentials(true, false, &none, None);
+    assert!(matches!(
+        AuthNoneAllowedBecause::from_cli(&cli),
+        Some(AuthNoneAllowedBecause::Insecure)
+    ));
+    let cli = cli_looking_up_credentials(false, true, &none, None);
+    assert!(matches!(
+        AuthNoneAllowedBecause::from_cli(&cli),
+        Some(AuthNoneAllowedBecause::Mtls)
+    ));
+    let cli = cli_looking_up_credentials(false, false, &none, None);
+    assert!(AuthNoneAllowedBecause::from_cli(&cli).is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let cli = crate::BridgeCli {
+        varlink_sockets_path: dir.path().to_str().unwrap().to_string(),
+        ..cli_looking_up_credentials(false, false, &none, None)
+    };
+    assert!(matches!(
+        AuthNoneAllowedBecause::from_cli(&cli),
+        Some(AuthNoneAllowedBecause::DedicatedSockets)
+    ));
+}
+
+#[test]
+fn test_dedicated_sockets_path_is_not_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(crate::is_dedicated_sockets_path(
+        dir.path().to_str().unwrap()
+    ));
+    assert!(!crate::is_dedicated_sockets_path(
+        crate::DEFAULT_SOCKETS_PATH
+    ));
+    assert!(!crate::is_dedicated_sockets_path("/does/not/exist"));
+}
+
+#[test]
 fn test_build_authenticators_insecure_accepts() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::None], true, false, root.path()).unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(AuthNoneAllowedBecause::Insecure),
+        root.path(),
+    )
+    .unwrap();
     assert_eq!(auths.len(), 1);
     check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
@@ -2175,7 +2235,7 @@ fn test_build_authenticators_insecure_accepts() {
 #[test]
 fn test_build_authenticators_ssh_without_keys_rejects() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::Ssh], false, false, root.path()).unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::Ssh], None, root.path()).unwrap();
     assert_eq!(auths.len(), 1);
     assert!(check_request(auths[0].as_ref(), "GET", "/health", None, None, None).is_err());
 }

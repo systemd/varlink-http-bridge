@@ -1617,7 +1617,7 @@ fn print_help() {
 
         Bridge options:
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
-                                            (default: /run/varlink/registry)
+                                            (default: {DEFAULT_SOCKETS_PATH})
           --bind=ADDR                       address to bind to (repeatable;
                                             default: 0.0.0.0:{DEFAULT_PORT}, or
                                             127.0.0.1:{DEFAULT_PORT} with --insecure)
@@ -1625,7 +1625,10 @@ fn print_help() {
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
                                             mTLS is enabled separately and applies
-                                            on top of whatever is selected here
+                                            on top of whatever is selected here.
+                                            none needs mTLS or an explicit
+                                            VARLINK_SOCKETS_PATH that is not the
+                                            registry
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
@@ -1699,12 +1702,22 @@ fn default_bind(insecure: bool) -> (String, Option<String>) {
     }
 }
 
+const DEFAULT_SOCKETS_PATH: &str = "/run/varlink/registry";
+
+/// Whether `path` was picked for `--auth=none` on purpose, i.e. it is not
+/// the registry with every service of the system.
+fn is_dedicated_sockets_path(path: &str) -> bool {
+    let registry =
+        std::fs::canonicalize(DEFAULT_SOCKETS_PATH).unwrap_or_else(|_| DEFAULT_SOCKETS_PATH.into());
+    std::fs::canonicalize(path).is_ok_and(|path| path != registry)
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 
     let mut bind_strs: Vec<String> = Vec::new();
-    let mut varlink_sockets_path = String::from("/run/varlink/registry");
+    let mut varlink_sockets_path = String::from(DEFAULT_SOCKETS_PATH);
     let mut cert = None;
     let mut key = None;
     let mut trust = None;
@@ -1952,6 +1965,30 @@ fn unread_credentials_warning(creds: &CredentialsLoader, cli: &BridgeCli) -> Opt
     ))
 }
 
+/// What makes serving without per-request authentication acceptable.
+#[derive(Clone, Copy, Debug)]
+enum AuthNoneAllowedBecause {
+    Insecure,
+    /// the client is authenticated by mTLS instead
+    Mtls,
+    /// the sockets to serve were picked on purpose, see [`is_dedicated_sockets_path`]
+    DedicatedSockets,
+}
+
+impl AuthNoneAllowedBecause {
+    fn from_cli(cli: &BridgeCli) -> Option<Self> {
+        if cli.insecure {
+            Some(Self::Insecure)
+        } else if cli.require_mtls {
+            Some(Self::Mtls)
+        } else if is_dedicated_sockets_path(&cli.varlink_sockets_path) {
+            Some(Self::DedicatedSockets)
+        } else {
+            None
+        }
+    }
+}
+
 /// The middleware accepts a request as soon as one of these accepts it, so an
 /// empty list rejects everything.
 ///
@@ -1960,8 +1997,7 @@ fn unread_credentials_warning(creds: &CredentialsLoader, cli: &BridgeCli) -> Opt
 #[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
 fn build_authenticators(
     auth: &[AuthMechanism],
-    insecure: bool,
-    require_mtls: bool,
+    auth_none_allowed_because: Option<AuthNoneAllowedBecause>,
     authorized_keys: Option<&std::path::Path>,
     api_keys: Option<&std::path::Path>,
     creds: Option<&CredentialsLoader>,
@@ -1987,23 +2023,26 @@ fn build_authenticators(
                      /etc/varlink-httpd/api-keys (see gen-api-key)",
                 )?,
             )),
-            AuthMechanism::None if insecure => {
-                warn!("running without authentication");
-                authenticators.push(Box::new(AllowAllAuthenticator {
-                    reason: "--insecure",
-                }));
-            }
-            // Every other way of having no per-request mechanism needs mTLS to
-            // carry the authentication, so refuse to serve without it.
-            AuthMechanism::None if require_mtls => {
-                authenticators.push(Box::new(AllowAllAuthenticator {
-                    reason: "--auth=none, client verified at TLS layer",
-                }));
-            }
             AuthMechanism::None => {
-                bail!(
-                    "--auth=none needs mTLS (--require-mtls) to authenticate clients, or --insecure"
-                );
+                let reason = match auth_none_allowed_because {
+                    Some(AuthNoneAllowedBecause::Insecure) => {
+                        warn!("running without authentication");
+                        "--insecure"
+                    }
+                    Some(AuthNoneAllowedBecause::Mtls) => {
+                        "--auth=none, client verified at TLS layer"
+                    }
+                    Some(AuthNoneAllowedBecause::DedicatedSockets) => {
+                        warn!("running without authentication for the given sockets");
+                        "--auth=none for dedicated sockets"
+                    }
+                    None => bail!(
+                        "--auth=none needs mTLS (--require-mtls) to authenticate clients, \
+                         a socket or directory other than {DEFAULT_SOCKETS_PATH} given \
+                         explicitly, or --insecure"
+                    ),
+                };
+                authenticators.push(Box::new(AllowAllAuthenticator { reason }));
             }
         }
     }
@@ -2035,8 +2074,7 @@ async fn main() -> anyhow::Result<()> {
 
     let authenticators = build_authenticators(
         &cli.auth,
-        cli.insecure,
-        cli.require_mtls,
+        AuthNoneAllowedBecause::from_cli(&cli),
         cli.authorized_keys.as_deref(),
         cli.api_keys.as_deref(),
         creds.as_ref(),
