@@ -15,6 +15,10 @@ path = "src/bin/varlink-httpd/main.rs"
 name = "varlinkctl-http"
 path = "src/bin/varlinkctl-http/main.rs"
 
+[[bin]]
+name = "varlink-relayd"
+path = "src/bin/varlink-relayd/main.rs"
+
 [features]
 default = ["sshauth"]
 sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import"]
@@ -29,6 +33,7 @@ axum = { version = "0.8.8", features = ["ws"] }
 http = "1"
 # 0.4.15 made poll_capacity() stop returning Some(Ok(0)), which tunnel::TunnelStream relies on
 h2 = "0.4.15"
+httparse = "1"
 futures-core = "0.3"
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }

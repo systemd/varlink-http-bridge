@@ -43,6 +43,8 @@ mod auth_ssh;
 mod import_ssh;
 mod openapi;
 mod tls_cert;
+mod tunnel_dialout;
+mod tunnel_listener;
 mod ws_framing;
 
 use ws_framing::VarlinkFramer;
@@ -333,7 +335,7 @@ fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
         .join(", ")
 }
 
-fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &std::net::SocketAddr) {
+fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &impl std::fmt::Display) {
     match ssl.peer_certificate() {
         Some(cert) => {
             let subject = format_x509_subject(&cert);
@@ -1402,6 +1404,7 @@ async fn shutdown_signal() {
 enum Transport {
     Tcp(TcpListener),
     Vsock(VsockListener),
+    Relay(tunnel_listener::TunnelListener),
 }
 
 impl std::fmt::Display for Transport {
@@ -1414,6 +1417,10 @@ impl std::fmt::Display for Transport {
             Transport::Vsock(l) => {
                 let addr = l.local_addr().map_err(|_| std::fmt::Error)?;
                 write!(f, "vsock:{}:{}", addr.cid(), addr.port())
+            }
+            Transport::Relay(l) => {
+                let tunnel = axum::serve::Listener::local_addr(l).map_err(|_| std::fmt::Error)?;
+                write!(f, "relay {tunnel}")
             }
         }
     }
@@ -1486,6 +1493,14 @@ async fn serve_listener(
             axum::serve(PlainListener { inner: l }, make_svc)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
+        }
+        (Transport::Relay(l), Some(config)) => {
+            axum::serve(AsyncTlsListener::new(l, config)?, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        (Transport::Relay(_), None) => {
+            unreachable!("--relay is refused together with --insecure");
         }
     }
 
@@ -1598,6 +1613,8 @@ struct BridgeCli {
     auth: Vec<AuthMechanism>,
     api_keys: Option<std::path::PathBuf>,
     insecure: bool,
+    relay: Option<String>,
+    instance: Option<String>,
 }
 
 fn print_help() {
@@ -1622,6 +1639,8 @@ fn print_help() {
                                             default: 0.0.0.0:{DEFAULT_PORT}, or
                                             127.0.0.1:{DEFAULT_PORT} with --insecure)
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
+                                            use none to serve only via --relay
+                                            or socket activation
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
                                             mTLS is enabled separately and applies
@@ -1641,6 +1660,12 @@ fn print_help() {
                                             authentication (DANGEROUS); listens
                                             on localhost only unless --bind= says
                                             otherwise
+          --relay=URL                       additionally serve through a
+                                            varlink-relayd tunnel; ws://HOST[:PORT]
+                                            or wss://HOST[:PORT]; TLS only, refused
+                                            together with --insecure (experimental)
+          --instance=LABEL                  register the tunnel under a
+                                            per-instance node id (with --relay)
           --help                            display this help and exit
     ",
             auth = AuthMechanism::names(),
@@ -1713,6 +1738,8 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut auth = None;
     let mut api_keys = None;
     let mut insecure = false;
+    let mut relay = None;
+    let mut instance = None;
     let mut got_positional = false;
 
     let mut parser = lexopt::Parser::from_env();
@@ -1727,6 +1754,8 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("api-keys") => api_keys = Some(parser.value()?.into()),
             Long("insecure") => insecure = true,
+            Long("relay") => relay = Some(parser.value()?.parse()?),
+            Long("instance") => instance = Some(parser.value()?.parse()?),
             Long("help") => {
                 print_help();
                 std::process::exit(0);
@@ -1750,7 +1779,13 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
-    if bind_strs.is_empty() {
+    let bind_none = bind_strs.iter().any(|s| s == "none");
+    if bind_none && bind_strs.len() > 1 {
+        bail!("--bind=none cannot be combined with other --bind addresses");
+    }
+    if bind_none {
+        bind_strs.clear();
+    } else if bind_strs.is_empty() {
         let (bind, note) = default_bind(insecure);
         if let Some(note) = note {
             warn!("{note}");
@@ -1777,6 +1812,14 @@ fn parse_cli() -> anyhow::Result<Command> {
                 bail!("--insecure serves plain HTTP and can't be combined with {name}");
             }
         }
+        // plaintext through the relay is readable and forgeable by
+        // anyone who knows the node id, and node ids are not secret
+        if relay.is_some() {
+            bail!("--insecure serves plain HTTP and can't be combined with --relay=");
+        }
+    }
+    if instance.is_some() && relay.is_none() {
+        bail!("--instance only makes sense together with --relay");
     }
 
     if let Some(path) = trust.as_deref() {
@@ -1817,6 +1860,8 @@ fn parse_cli() -> anyhow::Result<Command> {
         auth,
         api_keys,
         insecure,
+        relay,
+        instance,
     }))
 }
 
@@ -2075,13 +2120,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if listeners.is_empty() {
-        // No socket activation: bind explicitly based on --bind (or default)
+        // No socket activation: bind explicitly based on --bind (or
+        // default); --bind=none leaves the list empty on purpose
+        if cli.binds.is_empty() && cli.relay.is_none() {
+            bail!("--bind=none without --relay= or socket activation leaves nothing to serve");
+        }
         for bind in cli.binds {
             let listener = listener_from_bind_addr(bind).await?;
             listeners.push((listener, tls_config.clone()));
         }
     } else {
         eprintln!("Varlink proxy started (socket-activated)");
+    }
+
+    // the tunnel is one more listener, TLS and auth included
+    if let Some(url) = &cli.relay {
+        warn!("--relay is EXPERIMENTAL and subject to change without advance notice");
+        let node_id = varlink_http_bridge::node_id::local_node_id(cli.instance.as_deref())?;
+        let listener = tunnel_listener::TunnelListener::start(url, node_id)?;
+        listeners.push((Transport::Relay(listener), tls_config.clone()));
     }
 
     let mut join_set = tokio::task::JoinSet::new();

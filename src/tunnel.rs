@@ -24,11 +24,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::ws::drain;
 
-/// What a stream's CONNECT names. [`TunnelStream::server`] refuses any
-/// other request, so a relay and a node from different protocol
-/// generations fail at the first stream instead of talking past each
-/// other.
-pub const TUNNEL_PROTOCOL: &str = "varlink-tunnel-v1";
+// a macro so that the paths derived from it are built at compile time
+macro_rules! tunnel_protocol {
+    () => {
+        "varlink-tunnel-v1"
+    };
+}
+
+/// The tunnel protocol's name and version, which every stream's
+/// CONNECT names. [`TunnelStream::server`] refuses any other request,
+/// so a relay and a node from different protocol generations fail at
+/// the first stream instead of talking past each other.
+pub const TUNNEL_PROTOCOL: &str = tunnel_protocol!();
 
 /// Per-stream h2 receive window. It caps what one caller can push
 /// through a stream at roughly window/RTT. Measured copying 16MiB one
@@ -64,6 +71,28 @@ pub const CONNECTION_WINDOW: u32 = STREAM_WINDOW * MAX_TUNNEL_STREAMS;
 /// new caller forever, and each of those waits is also a stream slot
 /// taken on the connection.
 pub const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The error for a stream the peer did not answer within
+/// [`STREAM_OPEN_TIMEOUT`]: `WouldBlock` if the peer is at its stream
+/// limit and the stream was never sent, `TimedOut` otherwise.
+fn open_timeout_error(h2: &mut h2::client::SendRequest<Bytes>) -> io::Error {
+    // h2 keeps the handle not ready while its stream is queued behind
+    // the peer's limit
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    if h2.poll_ready(&mut cx).is_pending() {
+        return io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "peer at its limit of {} streams for {STREAM_OPEN_TIMEOUT:?}",
+                h2.current_max_send_streams()
+            ),
+        );
+    }
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("no answer to the stream within {STREAM_OPEN_TIMEOUT:?}"),
+    )
+}
 
 /// The h2 server's end of a tunnel connection.
 ///
@@ -119,6 +148,10 @@ pub type ClientEnd<T> = (
     h2::client::Connection<T, Bytes>,
 );
 
+/// The path on the relay a node dials to open its tunnel, named after
+/// [`TUNNEL_PROTOCOL`] so that the two ends agree on one version.
+pub const TUNNEL_PATH: &str = concat!("/", tunnel_protocol!());
+
 /// One h2 stream of a tunnel, carrying one caller, as a byte stream.
 /// The relay pipes the caller's TCP connection through it with
 /// `copy_bidirectional`; the node accepts it as an incoming connection.
@@ -148,27 +181,21 @@ impl TunnelStream {
     /// # Errors
     /// If the connection is gone, the stream fails before it is
     /// answered, the peer does not answer within
-    /// [`STREAM_OPEN_TIMEOUT`], or it answers with anything but 200.
+    /// [`STREAM_OPEN_TIMEOUT`], or it answers with anything but 200. A
+    /// peer that is at [`MAX_TUNNEL_STREAMS`] for that long is reported
+    /// as [`io::ErrorKind::WouldBlock`] rather than as not answering.
     pub async fn client(h2: h2::client::SendRequest<Bytes>) -> io::Result<Self> {
-        let open = async {
-            let mut h2 = h2.ready().await.map_err(io::Error::other)?;
-            let request = http::Request::connect(TUNNEL_PROTOCOL)
-                .body(())
-                .map_err(io::Error::other)?;
-            let (response, send) = h2.send_request(request, false).map_err(io::Error::other)?;
-            let response = response.await.map_err(io::Error::other)?;
-            Ok::<_, io::Error>((response, send))
+        let mut h2 = h2.ready().await.map_err(io::Error::other)?;
+        let request = http::Request::connect(TUNNEL_PROTOCOL)
+            .body(())
+            .map_err(io::Error::other)?;
+        let (mut response, send) = h2.send_request(request, false).map_err(io::Error::other)?;
+        let Ok(response) = tokio::time::timeout(STREAM_OPEN_TIMEOUT, &mut response).await else {
+            // dropping (response, send) via return here resets the
+            // stream, so the node sees the caller is gone
+            return Err(open_timeout_error(&mut h2));
         };
-        // dropping the open future on timeout drops the stream handles,
-        // which resets the stream so the node sees the caller is gone
-        let (response, send) = tokio::time::timeout(STREAM_OPEN_TIMEOUT, open)
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("no answer to the stream within {STREAM_OPEN_TIMEOUT:?}"),
-                )
-            })??;
+        let response = response.map_err(io::Error::other)?;
         if response.status() != http::StatusCode::OK {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
