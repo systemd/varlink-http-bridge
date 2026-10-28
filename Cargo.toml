@@ -5,7 +5,7 @@ edition = "2024"
 license = "LGPL-2.1-or-later"
 
 [workspace]
-members = [".", "crates/ssh-key-import"]
+members = [".", "crates/http-fetch", "crates/ssh-key-import"]
 
 [[bin]]
 name = "varlink-httpd"
@@ -16,8 +16,9 @@ name = "varlinkctl-http"
 path = "src/bin/varlinkctl-http/main.rs"
 
 [features]
-default = ["sshauth"]
+default = ["sshauth", "jwtauth"]
 sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import"]
+jwtauth = ["dep:jsonwebtoken", "dep:http-fetch"]
 # never enable directly: pulled in via the self dev-dependency so that
 # test-only constructors exist in test builds but not in release builds
 test-helpers = []
@@ -65,6 +66,16 @@ ssh-key = { version = "0.6", optional = true }
 sshauth = { git = "https://github.com/mvo5/sshauth.git", branch = "add-support-for-SkEd25519", optional = true }
 tempfile = "3.27"
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
+# 11.x fixes CVE-2026-25537 (malformed exp/nbf silently skipped the time
+# check) and drops its ring backend, so a provider must be picked explicitly.
+# rust_crypto shares p256/ed25519-dalek/sha2/hmac with ssh-key; aws_lc_rs
+# would add a fresh C/assembly stack and measured ~2.1MB larger.
+# rust_crypto pulls in `rsa`, which carries the unfixed RUSTSEC-2023-0071
+# (Marvin timing sidechannel, https://rustsec.org/advisories/RUSTSEC-2023-0071).
+# That attacks RSA *private* key operations; we only ever verify with public
+# keys from a JWKS, so it does not apply to us.
+jsonwebtoken = { version = "11.1.0", optional = true, default-features = false, features = ["use_pem", "rust_crypto"] }
+http-fetch = { path = "crates/http-fetch", optional = true }
 
 [dev-dependencies]
 varlink-http-bridge = { path = ".", default-features = false, features = ["test-helpers"] }

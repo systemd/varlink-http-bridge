@@ -9,4 +9,4 @@ anyhow = "1.0.100"
 ssh-key = "0.6"
 sshauth = "0.1"
 tempfile = "3.27"
-ureq = { version = "3", default-features = false, features = ["native-tls"] }
+http-fetch = { path = "../http-fetch" }

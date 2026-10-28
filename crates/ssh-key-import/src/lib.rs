@@ -8,6 +8,7 @@
 
 use anyhow::{Context, bail};
 use std::io::Write as _;
+use std::time::Duration;
 
 pub use ssh_key;
 
@@ -38,6 +39,12 @@ pub fn resolve_key_url(source: &str) -> anyhow::Result<String> {
     }
 }
 
+/// 640KB ought to be enough for anybody (ureq's default of 10MB is a bit much).
+const BODY_LIMIT: u64 = 640 * 1024;
+
+/// Bounds the whole exchange so a stalled endpoint cannot hang the import.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetch authorized keys from `source`, validate them, and return the raw
 /// text together with the parsed keys.
 ///
@@ -48,23 +55,11 @@ pub fn resolve_key_url(source: &str) -> anyhow::Result<String> {
 pub fn fetch(source: &str) -> anyhow::Result<AuthorizedKeys> {
     let url = resolve_key_url(source)?;
 
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .build();
-    let agent = ureq::config::Config::builder()
-        .tls_config(tls)
-        .build()
-        .new_agent();
-    let text = agent
-        .get(&url)
-        .call()
-        .with_context(|| format!("failed to fetch keys from {url}"))?
-        .body_mut()
-        .with_config()
-        // 640KB ought to be enough for anybody (default of 10mb is a bit much)
-        .limit(640 * 1024)
-        .read_to_string()
-        .with_context(|| format!("failed to read response body from {url}"))?;
+    // resolve_key_url has already guaranteed https; https_only keeps a
+    // redirect from downgrading away from it, which matters because the keys
+    // below are trusted verbatim.
+    let text =
+        http_fetch::Fetcher::new(true, FETCH_TIMEOUT, BODY_LIMIT).get(&url, "authorized keys")?;
 
     let keys = validate(&text)
         .with_context(|| format!("response from {url} contains invalid SSH public keys"))?;
