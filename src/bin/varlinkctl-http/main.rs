@@ -377,9 +377,16 @@ async fn connect_tcp(url: &str) -> Result<(BoxedStream, String, Option<TlsChanne
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
     debug!("connecting to {host}:{port} (tls: {use_tls})");
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+    // mptcp::connect blocks on DNS and the handshake, like tokio's own
+    // connect does internally for DNS
+    let target = host.clone();
+    let tcp =
+        tokio::task::spawn_blocking(move || varlink_http_bridge::mptcp::connect((target, port)))
+            .await
+            .context("TCP connect task failed")?
+            .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+    tcp.set_nonblocking(true)?;
+    let tcp = tokio::net::TcpStream::from_std(tcp)?;
     varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp).context("configure client socket")?;
 
     if use_tls {

@@ -1451,16 +1451,18 @@ fn listener_from_activated_fd(
 }
 
 /// Create a [`Transport`] from an explicit `--bind` address.
-async fn listener_from_bind_addr(bind: BindAddr) -> anyhow::Result<Transport> {
+fn listener_from_bind_addr(bind: &BindAddr) -> anyhow::Result<Transport> {
     match bind {
         BindAddr::Vsock { cid, port } => {
-            let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(cid, port))
+            let listener = VsockListener::bind(tokio_vsock::VsockAddr::new(*cid, *port))
                 .with_context(|| format!("vsock bind to CID {cid}, port {port}"))?;
             Ok(Transport::Vsock(listener))
         }
-        BindAddr::Tcp(ref addr) => {
-            let listener = TcpListener::bind(addr).await?;
-            Ok(Transport::Tcp(listener))
+        BindAddr::Tcp(addr) => {
+            let std_listener = varlink_http_bridge::mptcp::bind(addr)?;
+            // needed or tokio panics, see https://github.com/mitsuhiko/listenfd/pull/23
+            std_listener.set_nonblocking(true)?;
+            Ok(Transport::Tcp(TcpListener::from_std(std_listener)?))
         }
     }
 }
@@ -2169,7 +2171,7 @@ async fn main() -> anyhow::Result<()> {
             bail!("--bind=none without --relay= or socket activation leaves nothing to serve");
         }
         for bind in cli.binds {
-            let listener = listener_from_bind_addr(bind).await?;
+            let listener = listener_from_bind_addr(&bind)?;
             listeners.push((listener, tls_config.clone()));
         }
     } else {

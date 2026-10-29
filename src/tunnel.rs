@@ -772,12 +772,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_clean_close_ends_the_accept_loop() {
         let (client_ws, server_ws) = ws_pair().await;
-        let node = tokio::spawn(async move {
-            let mut conn = server_handshake(server_ws).await.unwrap();
-            TunnelStream::server(&mut conn).await
-        });
-
         let (client_conn, send_request) = h2_connect(client_ws).await;
+        // handshake first: a goodbye that lands before the node has sent
+        // its SETTINGS is a broken pipe to it, not a GOAWAY
+        let mut conn = server_handshake(server_ws).await.unwrap();
+        let node = tokio::spawn(async move { TunnelStream::server(&mut conn).await });
+
         // the last handle going is what makes the h2 client say goodbye
         drop(send_request);
         let step = std::time::Duration::from_secs(3);

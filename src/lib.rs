@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 pub mod listen;
+pub mod mptcp;
 pub mod node_id;
 pub mod secret_file;
 #[cfg(feature = "sshauth")]
