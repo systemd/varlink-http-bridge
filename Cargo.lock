@@ -2797,9 +2797,29 @@ dependencies = [
  "tokio-vsock",
  "tower",
  "varlink-http-bridge",
+ "varlink-http-client",
  "varlink-http-core",
  "vsock",
  "zlink",
+]
+
+[[package]]
+name = "varlink-http-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "http",
+ "log",
+ "openssl",
+ "ssh-key",
+ "sshauth 0.1.2 (git+https://github.com/mvo5/sshauth.git?branch=add-support-for-SkEd25519)",
+ "tempfile",
+ "tokio",
+ "tokio-openssl",
+ "tokio-tungstenite 0.30.0",
+ "tokio-vsock",
+ "varlink-http-core",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ edition = "2024"
 license = "LGPL-2.1-or-later"
 
 [workspace]
-members = [".", "crates/ssh-key-import", "crates/varlink-http-core"]
+members = [".", "crates/ssh-key-import", "crates/varlink-http-core", "crates/varlink-http-client"]
 
 [[bin]]
 name = "varlink-httpd"
@@ -21,14 +21,16 @@ path = "src/bin/varlink-relayd/main.rs"
 
 [features]
 default = ["sshauth"]
-sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import", "varlink-http-core/sshauth"]
+sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import", "varlink-http-core/sshauth", "varlink-http-client/sshauth"]
 # never enable directly: pulled in via the self dev-dependency so that
 # test-only constructors exist in test builds but not in release builds
 test-helpers = ["varlink-http-core/test-helpers"]
 
 [dependencies]
-# default-features off so that --no-default-features reaches it too
+# default-features off so that --no-default-features reaches them too;
+# the client crate is only for the varlinkctl-http binary
 varlink-http-core = { path = "crates/varlink-http-core", default-features = false }
+varlink-http-client = { path = "crates/varlink-http-client", default-features = false }
 anyhow = "1.0.100"
 async-stream = "0.3"
 axum = { version = "0.8.8", features = ["ws"] }

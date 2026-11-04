@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures_util::future::LocalBoxFuture;
 use log::debug;
 
-use varlink_http_bridge::secret_file::{SecretAccess, read_secret_file};
+use varlink_http_core::secret_file::{SecretAccess, read_secret_file};
 
 use crate::client_auth::ClientAuth;
 

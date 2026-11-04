@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
-use varlink_http_bridge::TlsChannelBinding;
-use varlink_http_bridge::sshauth_token::{
+use varlink_http_core::TlsChannelBinding;
+use varlink_http_core::sshauth_token::{
     SSHAUTH_NONCE_HEADER, SignedParts, signer_from_agent, signer_from_private_key,
 };
 
