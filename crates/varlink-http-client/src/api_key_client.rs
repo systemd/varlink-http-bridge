@@ -79,12 +79,11 @@ async fn connect_with_api_key(url: &str) -> Result<Option<crate::Ws>> {
     };
 
     let (stream, mut request, tcb) = crate::connect_transport(url).await?;
-    request.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {api_key}")
-            .parse()
-            .context("the API key is not a valid HTTP header value")?,
-    );
+    let mut value: http::HeaderValue = format!("Bearer {api_key}")
+        .parse()
+        .context("the API key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    request.headers_mut().insert("Authorization", value);
     let ws = crate::ws_upgrade(request, stream, tcb.is_some()).await?;
     Ok(Some(ws))
 }
