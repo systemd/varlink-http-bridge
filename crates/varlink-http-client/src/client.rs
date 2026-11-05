@@ -114,12 +114,14 @@ fn is_http_rejection(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::ServerTrust;
 
     #[test]
     fn debug_output_names_the_methods_and_keeps_the_secrets() {
         let transport = Transport {
-            config_dir: None,
+            server_trust: ServerTrust::SystemCas,
             known_hosts: None,
+            client_cert: None,
         };
         let client = Client {
             methods: vec![Box::new(crate::api_key_client::ApiKeyBearer {
