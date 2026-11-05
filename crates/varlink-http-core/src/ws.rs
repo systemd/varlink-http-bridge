@@ -197,26 +197,28 @@ where
     }
 }
 
-pub(crate) fn drain(readbuf: &mut Bytes, buf: &mut ReadBuf<'_>) {
+/// Move as much of `readbuf` as fits into `buf`. Shared with the tunnel's
+/// stream, which buffers the same way.
+pub fn drain(readbuf: &mut Bytes, buf: &mut ReadBuf<'_>) {
     let n = readbuf.len().min(buf.remaining());
     buf.put_slice(&readbuf[..n]);
     readbuf.advance(n);
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
+/// Test-only: connected WebSocket pairs over an in-memory duplex.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers {
     use super::{WsByteStream, config_for_h2};
     use tokio::io::{DuplexStream, duplex};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    pub(crate) async fn raw_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>)
-    {
+    pub async fn raw_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
         raw_pair_with_config(None).await
     }
 
-    pub(crate) async fn raw_pair_with_config(
+    pub async fn raw_pair_with_config(
         config: Option<WebSocketConfig>,
     ) -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
         let (a, b) = duplex(4096);
@@ -228,7 +230,7 @@ pub(crate) mod test_helpers {
 
     /// With the production limit, so that the h2 tests over it fail if
     /// h2 ever writes more than [`super::MAX_MESSAGE`] at once.
-    pub(crate) async fn ws_pair() -> (WsByteStream<DuplexStream>, WsByteStream<DuplexStream>) {
+    pub async fn ws_pair() -> (WsByteStream<DuplexStream>, WsByteStream<DuplexStream>) {
         let (client, server) = raw_pair_with_config(Some(config_for_h2())).await;
         (WsByteStream::new(client), WsByteStream::new(server))
     }

@@ -58,7 +58,22 @@ fn is_http_rejection(err: &anyhow::Error) -> bool {
     )
 }
 
-pub(crate) async fn connect_ws(url: &str) -> Result<crate::Ws> {
+/// Dial a varlink-httpd and return the WebSocket that carries raw varlink.
+///
+/// `url` is the full endpoint, `https://host:1031/ws/services/io.systemd.Hostname`
+/// (`/ws/sockets/` is the older spelling); `http` and `vsock://cid:port` work
+/// the same way. How the server is trusted and which credential is sent
+/// follow `varlinkctl-http`'s environment variables and config dir, see the
+/// bridge README; the ssh-agent path may wait for a hardware key to be
+/// touched. The future is not `Send`.
+///
+/// Binary frames carry the varlink messages; [`ws::WsByteStream`](crate::ws::WsByteStream)
+/// reads them as a byte stream.
+///
+/// # Errors
+/// Returns an error if the transport cannot be set up, the server rejects the
+/// credential, or the WebSocket handshake fails.
+pub async fn connect_ws(url: &str) -> Result<crate::Ws> {
     for (env, feature, enabled) in METHOD_FEATURES {
         if !enabled && std::env::var_os(env).is_some() {
             warn!("{env} is set but this build lacks the '{feature}' feature; ignoring it");

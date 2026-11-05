@@ -1,0 +1,35 @@
+[package]
+name = "varlink-http-core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+description = "What the varlink-http-bridge daemons and their client share: the WebSocket byte stream, TLS channel binding, sshauth tokens and secret file checks"
+
+[features]
+default = ["sshauth"]
+sshauth = ["dep:sshauth"]
+# never enable directly: pulled in via the dev-dependency so that
+# test-only constructors exist in test builds but not in release builds
+test-helpers = []
+
+[dependencies]
+anyhow = "1.0.100"
+http = "1"
+tokio = { version = "1.49.0", features = ["io-util"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", features = ["sink"] }
+bytes = "1"
+rustix = { version = "1.0", features = ["process"] }
+socket2 = "0.6"
+# using openssl here to keep size small, rusttls adds ~1.8MB binary size
+# and nativetls does not support mTLS
+openssl = "0.10.81"
+# TODO: switch back to crates.io once SkEd25519 (hardware key) support is
+# merged and released (https://github.com/mvo5/sshauth/tree/add-support-for-SkEd25519)
+# (see https://github.com/oxidecomputer/sshauth/pull/8)
+sshauth = { git = "https://github.com/mvo5/sshauth.git", branch = "add-support-for-SkEd25519", optional = true }
+
+[dev-dependencies]
+varlink-http-core = { path = ".", default-features = false, features = ["test-helpers"] }
+tempfile = "3.27"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
