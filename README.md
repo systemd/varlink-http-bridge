@@ -206,8 +206,8 @@ Everything `varlinkctl-http` does to reach a bridge (TCP or vsock,
 TLS with the trust rules above, the WebSocket upgrade and the auth
 methods) is also available as the `varlink-http-client` crate in
 `crates/`. It has none of the server dependencies, so another
-program can dial a varlink-httpd with `connect_ws(url)` and read
-the raw varlink on the WebSocket through `ws::WsByteStream`. What
+program can dial a varlink-httpd with `Client::from_env()?.connect(url)`
+and gets the raw varlink back as a byte stream. What
 the client and the daemons share, the WebSocket byte stream, the
 TLS channel binding and the sshauth token format, sits underneath
 in `varlink-http-core`.
