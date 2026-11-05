@@ -1,21 +1,56 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 //! The client configuration: the transport settings and the auth methods
-//! with their credentials. [`Client::from_env`] assembles it the way
-//! `varlinkctl-http` always has, each part reading its own variables, and
-//! [`Client::connect`] dials with it, the first applicable method winning.
+//! with their credentials. [`ClientBuilder`] takes them from the program,
+//! [`Client::from_env`] the way `varlinkctl-http` always has, each part
+//! reading its own variables. [`Client::connect`] dials with it, the first
+//! applicable method winning.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
 
 use crate::client_auth::ClientAuth;
-use crate::transport::Transport;
+use crate::transport::{ClientCert, ServerTrust, Transport};
 use crate::ws::WsByteStream;
 
-/// A configured client, see [`Client::from_env`].
+/// A credential and the method that presents it.
+#[non_exhaustive]
+pub enum Auth {
+    /// `Authorization: Bearer <key>`, the key as `varlink-httpd gen-api-key`
+    /// printed it.
+    ApiKey(String),
+    /// A signature with the key file at `path`: a private key directly, or
+    /// a `.pub` or hardware key through the agent at `agent`.
+    SshKey {
+        /// The private key, or its `.pub` when only the agent can sign.
+        path: PathBuf,
+        /// The ssh-agent socket, needed for a `.pub` or hardware key.
+        agent: Option<PathBuf>,
+    },
+    /// A signature with any key the agent at `path` holds, tried in turn.
+    SshAgent(PathBuf),
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // manual so that the key stays out of logs
+        match self {
+            Self::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
+            Self::SshKey { path, agent } => f
+                .debug_struct("SshKey")
+                .field("path", path)
+                .field("agent", agent)
+                .finish(),
+            Self::SshAgent(path) => f.debug_tuple("SshAgent").field(path).finish(),
+        }
+    }
+}
+
+/// A configured client, see [`Client::builder`] and [`Client::from_env`].
 ///
 /// Read-only once built so that a connection cannot find its configuration
 /// changed under it halfway through a retry loop.
@@ -26,6 +61,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Returns a builder with nothing set.
+    #[must_use]
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::default()
+    }
+
     /// The configuration `varlinkctl-http` uses: the trust files from the
     /// first existing of `$XDG_CONFIG_HOME/varlinkctl-http`,
     /// `~/.config/varlinkctl-http` and `/etc/varlinkctl-http`, the API key
@@ -37,16 +78,14 @@ impl Client {
     /// Returns an error if the `api-key` file exists but cannot be used,
     /// e.g. because it is readable by others.
     pub fn from_env() -> Result<Self> {
-        let transport = Transport::from_env();
-        let mut methods: Vec<Box<dyn ClientAuth>> = Vec::new();
-        if let Some(api_key) = crate::api_key_client::ApiKeyBearer::from_env(transport.clone())? {
-            methods.push(Box::new(api_key));
+        let mut auths = Vec::new();
+        auths.extend(crate::api_key_client::auth_from_env()?);
+        auths.extend(crate::sshauth_client::auth_from_env());
+        ClientBuilder {
+            transport: Transport::from_env(),
+            auths,
         }
-        if let Some(ssh) = crate::sshauth_client::SshSignature::from_env(transport.clone()) {
-            methods.push(Box::new(ssh));
-        }
-
-        Ok(Self { transport, methods })
+        .build()
     }
 
     /// Dial a varlink-httpd and return the raw varlink as a byte stream.
@@ -111,25 +150,148 @@ fn is_http_rejection(err: &anyhow::Error) -> bool {
     )
 }
 
+/// Builds a [`Client`] from values the program holds, see [`Client::builder`].
+#[derive(Debug, Default)]
+pub struct ClientBuilder {
+    /// The trust and client certificate settings.
+    transport: Transport,
+    /// In the order given, which is the precedence.
+    auths: Vec<Auth>,
+}
+
+impl ClientBuilder {
+    /// How the server is trusted; the default is the system CAs.
+    #[must_use]
+    pub fn trust(mut self, trust: ServerTrust) -> Self {
+        self.transport.server_trust = trust;
+        self
+    }
+
+    /// Trust a self-signed server on first contact and remember its key in
+    /// this file; without it, only [`trust`](Self::trust) decides.
+    #[must_use]
+    pub fn known_hosts(mut self, path: impl Into<PathBuf>) -> Self {
+        self.transport.known_hosts = Some(path.into());
+        self
+    }
+
+    /// The certificate and key to present, for servers that require mTLS.
+    #[must_use]
+    pub fn client_cert(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
+        self.transport.client_cert = Some(ClientCert {
+            cert: cert.into(),
+            key: key.into(),
+        });
+        self
+    }
+
+    /// A credential to offer; the first one given that applies is used.
+    #[must_use]
+    pub fn auth(mut self, auth: Auth) -> Self {
+        self.auths.push(auth);
+        self
+    }
+
+    /// The client with these settings, ready to connect.
+    ///
+    /// # Errors
+    /// Returns an error if a credential asks for an auth method this build
+    /// lacks, or cannot be used as given.
+    pub fn build(self) -> Result<Client> {
+        let mut methods: Vec<Box<dyn ClientAuth>> = Vec::with_capacity(self.auths.len());
+        for auth in self.auths {
+            let transport = self.transport.clone();
+            methods.push(match auth {
+                Auth::ApiKey(key) => {
+                    Box::new(crate::api_key_client::ApiKeyBearer::new(key, transport))
+                }
+                Auth::SshKey { path, agent } => Box::new(crate::sshauth_client::SshSignature::new(
+                    Some(path),
+                    agent,
+                    transport,
+                )?),
+                Auth::SshAgent(path) => Box::new(crate::sshauth_client::SshSignature::new(
+                    None,
+                    Some(path),
+                    transport,
+                )?),
+            });
+        }
+        Ok(Client {
+            transport: self.transport,
+            methods,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::ServerTrust;
 
     #[test]
-    fn debug_output_names_the_methods_and_keeps_the_secrets() {
-        let transport = Transport {
-            server_trust: ServerTrust::SystemCas,
-            known_hosts: None,
-            client_cert: None,
-        };
-        let client = Client {
-            methods: vec![Box::new(crate::api_key_client::ApiKeyBearer {
-                key: "vhb_secret".to_string(),
-                transport: transport.clone(),
-            })],
-            transport,
-        };
+    fn builder_keeps_the_settings_and_the_auth_order() {
+        let client = Client::builder()
+            .trust(ServerTrust::Pin("sha256//AAAA=".to_string()))
+            .known_hosts("/tmp/kh")
+            .client_cert("/tmp/cert.pem", "/tmp/key.pem")
+            .auth(Auth::ApiKey("vhb_x".to_string()))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.transport.server_trust,
+            ServerTrust::Pin("sha256//AAAA=".to_string())
+        );
+        assert_eq!(
+            client.transport.known_hosts.as_deref(),
+            Some("/tmp/kh".as_ref())
+        );
+        assert_eq!(
+            client.transport.client_cert.as_ref().map(|c| &c.key),
+            Some(&PathBuf::from("/tmp/key.pem"))
+        );
+        let names: Vec<&str> = client.methods.iter().map(|m| m.name()).collect();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].starts_with("API key auth"), "{names:?}");
+    }
+
+    #[test]
+    fn an_empty_builder_is_strict_pki_without_credentials() {
+        let client = Client::builder().build().unwrap();
+        assert_eq!(client.transport.server_trust, ServerTrust::SystemCas);
+        assert_eq!(client.transport.known_hosts, None);
+        assert!(client.transport.client_cert.is_none());
+        assert!(client.methods.is_empty());
+    }
+
+    #[cfg(feature = "sshauth")]
+    #[test]
+    fn ssh_credentials_come_after_the_api_key_when_given_so() {
+        let client = Client::builder()
+            .auth(Auth::ApiKey("vhb_x".to_string()))
+            .auth(Auth::SshAgent("/tmp/agent.sock".into()))
+            .build()
+            .unwrap();
+        let names: Vec<&str> = client.methods.iter().map(|m| m.name()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names[1].starts_with("SSH signature auth"), "{names:?}");
+    }
+
+    #[cfg(not(feature = "sshauth"))]
+    #[test]
+    fn ssh_credentials_are_an_error_without_the_feature() {
+        let err = Client::builder()
+            .auth(Auth::SshAgent("/tmp/agent.sock".into()))
+            .build()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("sshauth"), "{err:#}");
+    }
+
+    #[test]
+    fn debug_output_keeps_the_secrets() {
+        let auth = Auth::ApiKey("vhb_secret".to_string());
+        assert_eq!(format!("{auth:?}"), "ApiKey(<redacted>)");
+
+        let client = Client::builder().auth(auth).build().unwrap();
         let shown = format!("{client:?}");
         assert!(!shown.contains("vhb_secret"), "{shown}");
         assert!(shown.contains("API key auth"), "{shown}");

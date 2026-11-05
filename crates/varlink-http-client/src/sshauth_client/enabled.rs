@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
@@ -18,7 +18,7 @@ use crate::client_auth::ClientAuth;
 use crate::transport::Transport;
 
 /// The ssh-agent socket, the same variable ssh itself uses.
-const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
+pub(super) const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
 
 /// An SSH key that can be used for authentication.
 enum SshKey {
@@ -113,16 +113,25 @@ pub(crate) struct SshSignature {
 }
 
 impl SshSignature {
-    /// `None` when neither `VARLINK_SSH_KEY` nor `SSH_AUTH_SOCK` is set.
-    pub(crate) fn from_env(transport: Transport) -> Option<Self> {
-        let key_path = std::env::var(VARLINK_SSH_KEY_ENV).ok();
-        let auth_sock = std::env::var(SSH_AUTH_SOCK_ENV).ok();
-        if key_path.is_none() && auth_sock.is_none() {
-            return None;
-        }
-        Some(Self {
-            key_path,
-            auth_sock,
+    /// Signs with the key file at `key_path`, or with every key the agent at
+    /// `auth_sock` holds.
+    ///
+    /// # Errors
+    /// Returns an error if a path is not valid UTF-8.
+    pub(crate) fn new(
+        key_path: Option<PathBuf>,
+        auth_sock: Option<PathBuf>,
+        transport: Transport,
+    ) -> Result<Self> {
+        // the key readers and the agent protocol take strings
+        let utf8 = |path: PathBuf| {
+            path.into_os_string()
+                .into_string()
+                .map_err(|p| anyhow::anyhow!("{} is not valid UTF-8", p.to_string_lossy()))
+        };
+        Ok(Self {
+            key_path: key_path.map(utf8).transpose()?,
+            auth_sock: auth_sock.map(utf8).transpose()?,
             transport,
         })
     }

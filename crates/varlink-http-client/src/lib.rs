@@ -6,8 +6,9 @@
 //! A [`Client`] holds the trust and credentials, the CA or pinned key for
 //! the server and the API key or SSH key for the client. [`Client::from_env`]
 //! takes them from the same environment variables and config dir as
-//! `varlinkctl-http` uses, see the bridge README. [`Client::connect`] then
-//! dials the URL of one of a bridge's endpoints, e.g.
+//! `varlinkctl-http` uses, see the bridge README; [`Client::builder`] takes
+//! them from the program. [`Client::connect`] then dials the URL of one of a
+//! bridge's endpoints, e.g.
 //! `https://host:1031/ws/services/<name>`, and returns the varlink as an
 //! `AsyncRead + AsyncWrite` byte stream, the same NUL-terminated JSON as on
 //! the unix socket. That is the form a varlink implementation such as zlink
@@ -26,6 +27,22 @@
 //! # }
 //! ```
 //!
+//! A program that knows the server key and holds its own credential pins
+//! the one and offers the other, nothing is read from the environment or
+//! the filesystem:
+//!
+//! ```no_run
+//! # fn example(server_pin: String, api_key: String) -> anyhow::Result<()> {
+//! use varlink_http_client::{Auth, Client, ServerTrust};
+//!
+//! let client = Client::builder()
+//!     .trust(ServerTrust::Pin(server_pin))
+//!     .auth(Auth::ApiKey(api_key))
+//!     .build()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Features
 //!
 //! * `sshauth` (default): the SSH signature auth method.
@@ -36,7 +53,8 @@ mod client_auth;
 mod sshauth_client;
 mod transport;
 
-pub use client::Client;
+pub use client::{Auth, Client, ClientBuilder};
+pub use transport::ServerTrust;
 #[cfg(feature = "sshauth")]
 pub(crate) use transport::url_is_tls;
 pub(crate) use transport::{config_dir, ws_upgrade};
