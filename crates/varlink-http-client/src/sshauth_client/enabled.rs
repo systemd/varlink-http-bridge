@@ -12,7 +12,13 @@ use varlink_http_core::sshauth_token::{
     SSHAUTH_NONCE_HEADER, SignedParts, signer_from_agent, signer_from_private_key,
 };
 
+use super::VARLINK_SSH_KEY_ENV;
+use crate::WebSocket;
 use crate::client_auth::ClientAuth;
+use crate::transport::Transport;
+
+/// The ssh-agent socket, the same variable ssh itself uses.
+const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
 
 /// An SSH key that can be used for authentication.
 enum SshKey {
@@ -97,7 +103,63 @@ async fn add_auth_headers(
     Ok(())
 }
 
-pub(crate) struct SshSignature;
+/// Signs with the key file at `key_path`, or with any key the agent at
+/// `auth_sock` holds. Only the path is explicit user intent; an agent socket
+/// is ambient state that every desktop has.
+pub(crate) struct SshSignature {
+    key_path: Option<String>,
+    auth_sock: Option<String>,
+    transport: Transport,
+}
+
+impl SshSignature {
+    /// `None` when neither `VARLINK_SSH_KEY` nor `SSH_AUTH_SOCK` is set.
+    pub(crate) fn from_env(transport: Transport) -> Option<Self> {
+        let key_path = std::env::var(VARLINK_SSH_KEY_ENV).ok();
+        let auth_sock = std::env::var(SSH_AUTH_SOCK_ENV).ok();
+        if key_path.is_none() && auth_sock.is_none() {
+            return None;
+        }
+        Some(Self {
+            key_path,
+            auth_sock,
+            transport,
+        })
+    }
+
+    /// Try connecting with each available SSH key, retrying on 401;
+    /// `Ok(None)` when no key is available.
+    ///
+    /// When keys exist but none was ever presented to the server (all
+    /// failed to sign), one unauthenticated attempt is made and the
+    /// server decides whether to allow that.
+    async fn connect_with_retry(&self, url: &str) -> Result<Option<WebSocket>> {
+        if !crate::url_is_tls(url) {
+            if self.configured() {
+                bail!("{VARLINK_SSH_KEY_ENV} is set but {url} is not TLS, SSH auth needs TLS");
+            }
+            debug!("plain transport, not offering SSH auth");
+            return Ok(None);
+        }
+
+        let keys = list_ssh_keys(self.key_path.as_deref(), self.auth_sock.as_deref()).await?;
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let ws = try_each_key(&keys, async |key| {
+            let (stream, mut request, tcb) = self.transport.connect(url).await?;
+            if let Some(key) = key {
+                let tcb = tcb
+                    .as_ref()
+                    .context("TLS connection without channel binding")?;
+                add_auth_headers(&mut request, key, tcb).await?;
+            }
+            crate::ws_upgrade(request, stream, true).await
+        })
+        .await?;
+        Ok(Some(ws))
+    }
+}
 
 impl ClientAuth for SshSignature {
     fn name(&self) -> &'static str {
@@ -105,45 +167,12 @@ impl ClientAuth for SshSignature {
     }
 
     fn configured(&self) -> bool {
-        std::env::var_os("VARLINK_SSH_KEY").is_some()
+        self.key_path.is_some()
     }
 
-    fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<crate::Ws>>> {
-        Box::pin(connect_with_ssh_retry(url))
+    fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<WebSocket>>> {
+        Box::pin(self.connect_with_retry(url))
     }
-}
-
-/// Try connecting with each available SSH key, retrying on 401;
-/// `Ok(None)` when no key is available.
-///
-/// When keys exist but none was ever presented to the server (all
-/// failed to sign), one unauthenticated attempt is made and the
-/// server decides whether to allow that.
-async fn connect_with_ssh_retry(url: &str) -> Result<Option<crate::Ws>> {
-    if !crate::url_is_tls(url) {
-        if SshSignature.configured() {
-            bail!("VARLINK_SSH_KEY is set but {url} is not TLS, SSH auth needs TLS");
-        }
-        debug!("plain transport, not offering SSH auth");
-        return Ok(None);
-    }
-
-    let keys = list_ssh_keys().await?;
-    if keys.is_empty() {
-        return Ok(None);
-    }
-    let ws = try_each_key(&keys, async |key| {
-        let (stream, mut request, tcb) = crate::connect_transport(url).await?;
-        if let Some(key) = key {
-            let tcb = tcb
-                .as_ref()
-                .context("TLS connection without channel binding")?;
-            add_auth_headers(&mut request, key, tcb).await?;
-        }
-        crate::ws_upgrade(request, stream, true).await
-    })
-    .await?;
-    Ok(Some(ws))
 }
 
 /// Generic retry loop: try `connect` for each key.
@@ -204,35 +233,34 @@ pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
 
 /// Return all available SSH keys for authentication.
 ///
-/// - `VARLINK_SSH_KEY` with a normal private key: a single `PrivateKey`.
-/// - `VARLINK_SSH_KEY` with a hardware token or public-key-only file: a
-///   single `AgentKey` (signed through `SSH_AUTH_SOCK`).
-/// - `SSH_AUTH_SOCK` only: every non-RSA key from the agent.
+/// - `key_path` with a normal private key: a single `PrivateKey`.
+/// - `key_path` with a hardware token or public-key-only file: a single
+///   `AgentKey` (signed through the agent at `auth_sock`).
+/// - `auth_sock` only: every non-RSA key from the agent.
 /// - Neither: an empty vec (no auth).
-async fn list_ssh_keys() -> Result<Vec<SshKey>> {
-    let key_path = std::env::var("VARLINK_SSH_KEY").ok();
-    let auth_sock = std::env::var("SSH_AUTH_SOCK").ok();
-
+async fn list_ssh_keys(key_path: Option<&str>, auth_sock: Option<&str>) -> Result<Vec<SshKey>> {
     if let Some(key_path) = key_path {
         // If a normal (non-hardware-token) private key exists, sign directly.
-        if let Some(privkey) = read_private_key(&key_path)?
+        if let Some(privkey) = read_private_key(key_path)?
             && !requires_agent(&privkey.algorithm())
         {
             return Ok(vec![SshKey::PrivateKey {
-                path: key_path,
+                path: key_path.to_owned(),
                 key: Box::new(privkey),
             }]);
         }
 
         // Otherwise delegate to the SSH agent: either the key is a
         // hardware token (sk-*) or only the .pub file exists on disk.
-        let pubkey = read_public_key(&key_path)?;
-        let auth_sock = auth_sock.context(
-            "VARLINK_SSH_KEY requires agent-based signing (hardware token \
-             or public key only); set SSH_AUTH_SOCK",
-        )?;
+        let pubkey = read_public_key(key_path)?;
+        let auth_sock = auth_sock.with_context(|| {
+            format!(
+                "{VARLINK_SSH_KEY_ENV} requires agent-based signing (hardware token \
+                 or public key only); set {SSH_AUTH_SOCK_ENV}"
+            )
+        })?;
         let fp = pubkey.fingerprint(ssh_key::HashAlg::Sha256);
-        let agent_keys = sshauth::agent::list_keys(&auth_sock)
+        let agent_keys = sshauth::agent::list_keys(auth_sock)
             .await
             .context("listing ssh-agent keys")?;
         if !agent_keys
@@ -240,18 +268,18 @@ async fn list_ssh_keys() -> Result<Vec<SshKey>> {
             .any(|k| k.fingerprint(ssh_key::HashAlg::Sha256) == fp)
         {
             bail!(
-                "VARLINK_SSH_KEY key {fp} not found in ssh-agent; \
+                "{VARLINK_SSH_KEY_ENV} key {fp} not found in ssh-agent; \
                  add it with ssh-add or provide the private key"
             );
         }
         return Ok(vec![SshKey::AgentKey {
-            auth_sock,
+            auth_sock: auth_sock.to_owned(),
             key: pubkey,
         }]);
     }
 
     if let Some(auth_sock) = auth_sock {
-        let all_keys = sshauth::agent::list_keys(&auth_sock)
+        let all_keys = sshauth::agent::list_keys(auth_sock)
             .await
             .context("listing ssh-agent keys")?;
 
@@ -265,7 +293,7 @@ async fn list_ssh_keys() -> Result<Vec<SshKey>> {
                 );
             } else {
                 keys.push(SshKey::AgentKey {
-                    auth_sock: auth_sock.clone(),
+                    auth_sock: auth_sock.to_owned(),
                     key: k,
                 });
             }

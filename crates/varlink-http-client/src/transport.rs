@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite;
 
 use varlink_http_core::{AsyncStream, BoxedStream, TlsChannelBinding};
 
-use crate::Ws;
+use crate::WebSocket;
 
 /// Candidate client configuration directories, most specific first:
 /// 1. `$XDG_CONFIG_HOME/varlinkctl-http/`
@@ -458,18 +458,6 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
-/// The environment's transport, until a `Client` holds one; see
-/// [`Transport::connect`].
-pub(crate) async fn connect_transport(
-    url: &str,
-) -> Result<(
-    BoxedStream,
-    tungstenite::http::Request<()>,
-    Option<TlsChannelBinding>,
-)> {
-    Transport::from_env().connect(url).await
-}
-
 /// Whether `url` selects a TLS transport, mirroring the scheme handling
 /// in [`Transport::connect`] and [`Transport::connect_tcp`].
 ///
@@ -488,7 +476,7 @@ pub(crate) async fn ws_upgrade(
     request: tungstenite::http::Request<()>,
     stream: BoxedStream,
     is_tls: bool,
-) -> Result<Ws> {
+) -> Result<WebSocket> {
     // anyhow keeps the tungstenite::Error downcastable through context():
     // the SSH-retry logic detects a 401 via downcast_ref.
     let (ws, _) = tokio_tungstenite::client_async(request, stream)
