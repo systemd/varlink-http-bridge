@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use std::fmt;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
@@ -299,17 +300,15 @@ fn generate_nonce() -> String {
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn read_private_key(key_path: &str) -> Result<Option<ssh_key::PrivateKey>> {
     let privkey_path = key_path.strip_suffix(".pub").unwrap_or(key_path);
-    let pem = match std::fs::read_to_string(privkey_path) {
-        Ok(pem) => pem,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let privkey = match ssh_key::PrivateKey::read_openssh_file(Path::new(privkey_path)) {
+        Ok(privkey) => privkey,
+        Err(ssh_key::Error::Io(std::io::ErrorKind::NotFound)) => return Ok(None),
         Err(e) => {
             return Err(
-                anyhow::Error::new(e).context(format!("reading private key from {privkey_path}"))
+                anyhow::Error::new(e).context(format!("loading private key from {privkey_path}"))
             );
         }
     };
-    let privkey = ssh_key::PrivateKey::from_openssh(pem.trim())
-        .with_context(|| format!("parsing private key from {privkey_path}"))?;
     ensure_supported_algorithm(&privkey.algorithm(), key_path)?;
     Ok(Some(privkey))
 }
