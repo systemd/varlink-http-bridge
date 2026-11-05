@@ -13,6 +13,7 @@ use log::debug;
 use varlink_http_core::secret_file::{SecretAccess, read_secret_file};
 
 use crate::WebSocket;
+use crate::client::Auth;
 use crate::client_auth::ClientAuth;
 use crate::transport::Transport;
 
@@ -58,18 +59,22 @@ fn api_key() -> Result<Option<String>> {
 }
 
 pub(crate) struct ApiKeyBearer {
-    pub(crate) key: String,
-    pub(crate) transport: Transport,
+    key: String,
+    transport: Transport,
+}
+
+/// The key from `VARLINK_API_KEY` or the `api-key` config file, if any.
+///
+/// # Errors
+/// Returns an error if the file exists but cannot be used, e.g. because it
+/// is readable by others.
+pub(crate) fn auth_from_env() -> Result<Option<Auth>> {
+    Ok(api_key()?.map(Auth::ApiKey))
 }
 
 impl ApiKeyBearer {
-    /// `None` when no key is set.
-    ///
-    /// # Errors
-    /// Returns an error if the `api-key` file exists but cannot be used,
-    /// e.g. because it is readable by others.
-    pub(crate) fn from_env(transport: Transport) -> Result<Option<Self>> {
-        Ok(api_key()?.map(|key| Self { key, transport }))
+    pub(crate) fn new(key: String, transport: Transport) -> Self {
+        Self { key, transport }
     }
 
     /// One credential only, so unlike the SSH method there is nothing to

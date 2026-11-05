@@ -154,7 +154,8 @@ enum Tofu {
     Recorded(KnownHost),
 }
 
-/// Whether the server key is `pin`; `mismatch` is the refusal otherwise.
+/// Whether the server key is `pin`, with or without the `sha256//` prefix;
+/// `mismatch` is the refusal otherwise.
 fn pin_matches(
     cert: &openssl::x509::X509Ref,
     pin: &str,
@@ -162,15 +163,20 @@ fn pin_matches(
 ) -> Result<(), &'static str> {
     let actual =
         varlink_http_core::public_key_pin(cert).map_err(|_| "cannot fingerprint the server key")?;
-    if pin == actual { Ok(()) } else { Err(mismatch) }
+    if pin.strip_prefix("sha256//").unwrap_or(pin) == actual {
+        Ok(())
+    } else {
+        Err(mismatch)
+    }
 }
 
 /// Decide whether the server's certificate is acceptable.
 ///
-/// PKI is the real signal, so a validated certificate is always accepted, and
-/// `known-hosts` only governs the certificates nothing vouches for. Accepting
-/// early is also what lets a [`KnownHost::TrustAuthority`] peer rotate its
-/// key: the new certificate validates and never reaches the rules below.
+/// A pinned key decides alone. Otherwise PKI is the real signal, so a
+/// validated certificate is always accepted, and `known-hosts` only governs
+/// the certificates nothing vouches for. Accepting early is also what lets a
+/// [`KnownHost::TrustAuthority`] peer rotate its key: the new certificate
+/// validates and never reaches the rules below.
 ///
 /// The refusal reason is a message, not an error, because the OpenSSL verify
 /// callback can only answer yes or no and stores it for the caller.
@@ -180,11 +186,15 @@ fn verify_server_cert(
     trust: &ServerTrust,
     tofu: &Tofu,
 ) -> Result<(), &'static str> {
-    if chain_ok {
-        // A stale pin is left alone; it still catches a later downgrade.
-        return Ok(());
-    }
     match trust {
+        // Before chain_ok: a certificate some CA vouches for is still not
+        // the pinned server unless it carries the pinned key.
+        ServerTrust::Pin(pin) => {
+            return pin_matches(cert, pin, "the server key does not match the pinned one");
+        }
+        // A stale known-hosts pin is left alone; it still catches a later
+        // downgrade.
+        _ if chain_ok => return Ok(()),
         ServerTrust::Ca(_) => {
             return Err("certificate does not validate against the configured server-ca-file");
         }
@@ -213,15 +223,22 @@ fn verify_server_cert(
     }
 }
 
-/// Who may vouch for the server's certificate. With a CA file nothing else
-/// is accepted; with the system store a self-signed certificate can still be
-/// trusted through `known-hosts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ServerTrust {
+/// Who may vouch for the server's certificate. With a CA file or a pinned
+/// key nothing else is accepted; with the system store a self-signed
+/// certificate can still be trusted through `known-hosts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerTrust {
     /// The system CA store vouches for the server.
+    #[default]
     SystemCas,
     /// Only this CA (a PEM file) vouches for the server.
     Ca(PathBuf),
+    /// The key of a server with a self-signed certificate, `sha256//…` as
+    /// varlink-httpd prints it at startup for the certificate it generates.
+    /// Not for a certificate a private CA issued; use [`ServerTrust::Ca`]
+    /// for that.
+    Pin(String),
 }
 
 /// The client's certificate and key, for servers that require mTLS.
@@ -235,7 +252,7 @@ pub(crate) struct ClientCert {
 
 /// How a bridge is reached: TCP or vsock, and for TLS how the server is
 /// trusted and who the client is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Transport {
     /// Who may vouch for the server.
     pub(crate) server_trust: ServerTrust,
@@ -743,6 +760,38 @@ mod pin_tests {
         let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
         let err = verify_server_cert(&id.0, false, &system, &wrong).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
+    }
+
+    /// A pin accepts its key whether the certificate is self-signed or issued
+    /// by a CA we do not have, and refuses any other key.
+    #[test]
+    fn a_pin_decides_by_the_key_alone() {
+        let (id, pin) = self_signed_pin();
+        // as varlink-httpd prints it, and bare
+        let printed = ServerTrust::Pin(format!("sha256//{pin}"));
+        assert!(verify_server_cert(&id.0, false, &printed, &Tofu::Off).is_ok());
+        let pinned = ServerTrust::Pin(pin);
+        assert!(verify_server_cert(&id.0, false, &pinned, &Tofu::Off).is_ok());
+
+        let ca = identity("ca", None, true);
+        let leaf = identity("leaf", Some(&ca), false);
+        let leaf_pin = ServerTrust::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
+        assert!(verify_server_cert(&leaf.0, false, &leaf_pin, &Tofu::Off).is_ok());
+
+        let err = verify_server_cert(&leaf.0, false, &pinned, &Tofu::Off).unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+    }
+
+    /// A certificate that validates, e.g. one a public CA issued to someone
+    /// else, must not get past a pin for another key.
+    #[test]
+    fn a_pin_refuses_another_key_even_when_the_chain_validates() {
+        let (id, pin) = self_signed_pin();
+        let (other, _) = self_signed_pin();
+        let pinned = ServerTrust::Pin(pin);
+        let err = verify_server_cert(&other.0, true, &pinned, &Tofu::Off).unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+        assert!(verify_server_cert(&id.0, true, &pinned, &Tofu::Off).is_ok());
     }
 
     /// Without a `known-hosts` file there is no first contact to trust.
