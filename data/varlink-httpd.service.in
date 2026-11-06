@@ -30,6 +30,13 @@ StateDirectory=varlink-httpd
 Sockets=varlink-httpd.socket varlink-httpd-vsock.socket
 
 # Hardening
+# Nothing in the bridge needs root: every privileged operation happens in the
+# varlink service on the other side of the socket, which authorizes the caller
+# via polkit.
+DynamicUser=yes
+# systemd-journal for journal access, varlink-httpd for the secrets in
+# /etc/varlink-httpd/, which the transient uid cannot own.
+SupplementaryGroups=systemd-journal varlink-httpd
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
