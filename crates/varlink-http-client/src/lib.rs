@@ -33,14 +33,14 @@
 
 mod api_key_client;
 mod client_auth;
-mod connect;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
+mod transport;
 
 pub use client_auth::connect_ws;
 #[cfg(feature = "sshauth")]
-pub(crate) use connect::url_is_tls;
-pub(crate) use connect::{config_dir, connect_transport, ws_upgrade};
+pub(crate) use transport::url_is_tls;
+pub(crate) use transport::{config_dir, connect_transport, ws_upgrade};
 // What a caller needs to use the WebSocket this crate dials, so that one
 // dependency is enough.
 pub use varlink_http_core::{AsyncStream, BoxedStream, ws};
