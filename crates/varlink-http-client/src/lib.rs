@@ -3,48 +3,68 @@
 //! Client side of the varlink-http-bridge: dial a varlink-httpd
 //! bridge server and get a WebSocket that carries raw varlink.
 //!
-//! [`connect_ws`] takes the URL of one of a bridge's endpoints, e.g.
-//! `https://host:1031/ws/services/<name>`, and returns the WebSocket. Every
-//! binary frame on it is one varlink message, NUL-terminated JSON as on the
-//! unix socket, and [`ws::WsByteStream`] reads it as an
-//! `AsyncRead + AsyncWrite` byte stream. That is the form a varlink
-//! implementation such as zlink or varlink-rs wants a transport in, so the
-//! usual way to use this crate is to hand the stream to one of them rather
-//! than to speak the protocol yourself:
+//! A [`Client`] holds the trust and credentials, the CA or pinned key for
+//! the server and the API key or SSH key for the client. [`Client::from_env`]
+//! takes them from the same environment variables and config dir as
+//! `varlinkctl-http` uses, see the bridge README; [`Client::builder`] takes
+//! them from the program. [`Client::connect`] then dials the URL of one of a
+//! bridge's endpoints, e.g.
+//! `https://host:1031/ws/services/<name>`, and returns the varlink as an
+//! `AsyncRead + AsyncWrite` byte stream, the same NUL-terminated JSON as on
+//! the unix socket. That is the form a varlink implementation such as zlink
+//! or varlink-rs wants a transport in, so the usual way to use this crate is
+//! to hand the stream to one of them rather than to speak the protocol
+//! yourself:
 //!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
+//! use varlink_http_client::Client;
+//!
 //! let url = "https://host:1031/ws/services/io.systemd.Hostname";
-//! let ws = varlink_http_client::connect_ws(url).await?;
-//! let varlink = varlink_http_client::ws::WsByteStream::new(ws);
+//! let varlink = Client::from_env()?.connect(url).await?;
 //! // `varlink` is the byte stream to give to the varlink client of your choice
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Trust and credentials, the CA or pinned key for the server and the API
-//! key or SSH key for the client, come from the same environment variables
-//! and config dir as `varlinkctl-http` uses; see the bridge README. An API
-//! to set them from the program is planned.
+//! A program that knows the server key and holds its own credential pins
+//! the one and offers the other, nothing is read from the environment or
+//! the filesystem:
+//!
+//! ```no_run
+//! # fn example(server_pin: String, api_key: String) -> anyhow::Result<()> {
+//! use varlink_http_client::{Auth, Client, ServerTrust};
+//!
+//! let client = Client::builder()
+//!     .trust(ServerTrust::Pin(server_pin))
+//!     .auth(Auth::ApiKey(api_key))
+//!     .build()?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Features
 //!
 //! * `sshauth` (default): the SSH signature auth method.
 
 mod api_key_client;
+mod client;
 mod client_auth;
-mod connect;
-#[cfg(feature = "sshauth")]
 mod sshauth_client;
+mod transport;
 
-pub use client_auth::connect_ws;
+pub use client::{Auth, Client, ClientBuilder};
+pub use transport::ServerTrust;
 #[cfg(feature = "sshauth")]
-pub(crate) use connect::url_is_tls;
-pub(crate) use connect::{config_dir, connect_transport, ws_upgrade};
-// What a caller needs to use the WebSocket this crate dials, so that one
+pub(crate) use transport::url_is_tls;
+pub(crate) use transport::{config_dir, ws_upgrade};
+// What a caller needs to use the stream this crate dials, so that one
 // dependency is enough.
 pub use varlink_http_core::{AsyncStream, BoxedStream, ws};
 
-/// A dialed bridge: raw varlink in binary frames, see [`ws::WsByteStream`]
-/// to read it as a byte stream.
-pub type Ws = tokio_tungstenite::WebSocketStream<BoxedStream>;
+/// A dialed bridge: raw varlink as a byte stream. Underneath, each message
+/// travels in one binary WebSocket frame, see [`ws::WsByteStream`].
+pub type VarlinkStream = ws::WsByteStream<BoxedStream>;
+
+/// The WebSocket before it is wrapped, as the auth methods hand it around.
+pub(crate) type WebSocket = tokio_tungstenite::WebSocketStream<BoxedStream>;

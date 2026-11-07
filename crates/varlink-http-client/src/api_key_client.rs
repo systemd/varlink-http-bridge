@@ -12,7 +12,10 @@ use log::debug;
 
 use varlink_http_core::secret_file::{SecretAccess, read_secret_file};
 
+use crate::WebSocket;
+use crate::client::Auth;
 use crate::client_auth::ClientAuth;
+use crate::transport::Transport;
 
 /// Environment variable carrying the API key itself (not a path, unlike
 /// `VARLINK_SSH_KEY`); surrounding whitespace is trimmed so a key piped in
@@ -55,7 +58,38 @@ fn api_key() -> Result<Option<String>> {
     Ok(key)
 }
 
-pub(crate) struct ApiKeyBearer;
+pub(crate) struct ApiKeyBearer {
+    pub(crate) key: String,
+    pub(crate) transport: Transport,
+}
+
+/// The key from `VARLINK_API_KEY` or the `api-key` config file, if any.
+///
+/// # Errors
+/// Returns an error if the file exists but cannot be used, e.g. because it
+/// is readable by others.
+pub(crate) fn auth_from_env() -> Result<Option<Auth>> {
+    Ok(api_key()?.map(Auth::ApiKey))
+}
+
+impl ApiKeyBearer {
+    pub(crate) fn new(key: String, transport: Transport) -> Self {
+        Self { key, transport }
+    }
+
+    /// One credential only, so unlike the SSH method there is nothing to
+    /// retry.
+    async fn connect_with_key(&self, url: &str) -> Result<Option<WebSocket>> {
+        let (stream, mut request, tcb) = self.transport.connect(url).await?;
+        let mut value: http::HeaderValue = format!("Bearer {}", self.key)
+            .parse()
+            .context("the API key is not a valid HTTP header value")?;
+        value.set_sensitive(true);
+        request.headers_mut().insert("Authorization", value);
+        let ws = crate::ws_upgrade(request, stream, tcb.is_some()).await?;
+        Ok(Some(ws))
+    }
+}
 
 impl ClientAuth for ApiKeyBearer {
     fn name(&self) -> &'static str {
@@ -63,29 +97,12 @@ impl ClientAuth for ApiKeyBearer {
     }
 
     fn configured(&self) -> bool {
-        std::env::var_os(VARLINK_API_KEY_ENV).is_some() || api_key_path().is_some()
+        true
     }
 
-    fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<crate::Ws>>> {
-        Box::pin(connect_with_api_key(url))
+    fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<WebSocket>>> {
+        Box::pin(self.connect_with_key(url))
     }
-}
-
-/// `Ok(None)` when no API key is set. One credential only, so unlike the
-/// SSH method there is nothing to retry.
-async fn connect_with_api_key(url: &str) -> Result<Option<crate::Ws>> {
-    let Some(api_key) = api_key()? else {
-        return Ok(None);
-    };
-
-    let (stream, mut request, tcb) = crate::connect_transport(url).await?;
-    let mut value: http::HeaderValue = format!("Bearer {api_key}")
-        .parse()
-        .context("the API key is not a valid HTTP header value")?;
-    value.set_sensitive(true);
-    request.headers_mut().insert("Authorization", value);
-    let ws = crate::ws_upgrade(request, stream, tcb.is_some()).await?;
-    Ok(Some(ws))
 }
 
 #[cfg(test)]

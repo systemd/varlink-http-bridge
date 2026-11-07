@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite;
 
 use varlink_http_core::{AsyncStream, BoxedStream, TlsChannelBinding};
 
-use crate::Ws;
+use crate::WebSocket;
 
 /// Candidate client configuration directories, most specific first:
 /// 1. `$XDG_CONFIG_HOME/varlinkctl-http/`
@@ -143,6 +143,33 @@ fn is_self_signed(cert: &openssl::x509::X509Ref) -> bool {
         .is_ok_and(std::cmp::Ordering::is_eq)
 }
 
+/// What `known-hosts` has to say about the peer, if a file is in use at all.
+#[derive(Debug)]
+enum Tofu {
+    /// No file: only [`ServerTrust`] decides.
+    Off,
+    /// Nothing recorded for the peer yet.
+    FirstContact,
+    /// What the peer presented last time; it must present the same again.
+    Recorded(KnownHost),
+}
+
+/// Whether the server key is `pin`, with or without the `sha256//` prefix;
+/// `mismatch` is the refusal otherwise.
+fn pin_matches(
+    cert: &openssl::x509::X509Ref,
+    pin: &str,
+    mismatch: &'static str,
+) -> Result<(), &'static str> {
+    let actual =
+        varlink_http_core::public_key_pin(cert).map_err(|_| "cannot fingerprint the server key")?;
+    if pin.strip_prefix("sha256//").unwrap_or(pin) == actual {
+        Ok(())
+    } else {
+        Err(mismatch)
+    }
+}
+
 /// Decide whether the server's certificate is acceptable.
 ///
 /// PKI is the real signal, so a validated certificate is always accepted, and
@@ -155,157 +182,326 @@ fn is_self_signed(cert: &openssl::x509::X509Ref) -> bool {
 fn verify_server_cert(
     cert: &openssl::x509::X509Ref,
     chain_ok: bool,
-    recorded: Option<&KnownHost>,
-    ca_configured: bool,
+    trust: &ServerTrust,
+    tofu: &Tofu,
 ) -> Result<(), &'static str> {
     if chain_ok {
         // A stale pin is left alone; it still catches a later downgrade.
         return Ok(());
     }
-    if ca_configured {
-        return Err("certificate does not validate against the configured server-ca-file");
+    match trust {
+        ServerTrust::Ca(_) => {
+            return Err("certificate does not validate against the configured server-ca-file");
+        }
+        ServerTrust::Pin(pin) => {
+            return pin_matches(cert, pin, "the server key does not match the pinned one");
+        }
+        ServerTrust::SystemCas => {}
     }
     if !is_self_signed(cert) {
         return Err("certificate does not validate against trust authority");
     }
 
-    match recorded {
-        // No record yet: first contact, connect_tls learns the key afterwards.
-        None => Ok(()),
-        Some(KnownHost::TrustAuthority) => Err(
+    match tofu {
+        Tofu::Off => {
+            Err("certificate is self-signed and no known-hosts file is in use to trust it")
+        }
+        Tofu::FirstContact => Ok(()),
+        Tofu::Recorded(KnownHost::TrustAuthority) => Err(
             "this peer was reached before with a certificate signed by a trust authority \
              and now presents a self-signed one. Refusing the downgrade. If the server \
              really stopped using a CA cert, delete its known-hosts line.",
         ),
-        Some(KnownHost::Pin(pin)) => {
-            let actual = varlink_http_core::public_key_pin(cert)
-                .map_err(|_| "cannot fingerprint the server key")?;
-            if *pin != actual {
-                return Err(
-                    "the server key does not match the one recorded in known-hosts. \
-                     Either the server was reinstalled, or this is not the same server.",
-                );
-            }
-            Ok(())
-        }
+        Tofu::Recorded(KnownHost::Pin(pin)) => pin_matches(
+            cert,
+            pin,
+            "the server key does not match the one recorded in known-hosts. \
+             Either the server was reinstalled, or this is not the same server.",
+        ),
     }
 }
 
-/// Build an `SslConnector` with client certs and the system trust store.
-///
-/// Any refusal reason lands in `refusal`; OpenSSL drops the peer certificate
-/// when it aborts, so the caller cannot work it out afterwards.
-fn build_ssl_connector(
-    recorded: Option<KnownHost>,
-    ca_configured: bool,
-    refusal: Arc<OnceLock<&'static str>>,
-) -> Result<SslConnector> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
-    // We need tls channel binding per RFC 9266 ("tls-exporter") which
-    // is only guaranteed unique with TLS 1.3.
-    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+/// Who may vouch for the server's certificate. With a CA file or a pinned
+/// key nothing else is accepted; with the system store a self-signed
+/// certificate can still be trusted through `known-hosts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerTrust {
+    /// The system CA store vouches for the server.
+    #[default]
+    SystemCas,
+    /// Only this CA (a PEM file) vouches for the server.
+    Ca(PathBuf),
+    /// This server key, `sha256//…` as varlink-httpd prints it at startup,
+    /// whatever signed the certificate.
+    Pin(String),
+}
 
-    if let Some(dir) = config_dir() {
-        let cert = dir.join("client-cert-file");
-        let key = dir.join("client-key-file");
-        let ca = dir.join("server-ca-file");
+/// The client's certificate and key, for servers that require mTLS.
+#[derive(Debug, Clone)]
+pub(crate) struct ClientCert {
+    /// The certificate chain, PEM.
+    pub(crate) cert: PathBuf,
+    /// The private key for it, PEM.
+    pub(crate) key: PathBuf,
+}
 
-        if cert.exists() && key.exists() {
+/// How a bridge is reached: TCP or vsock, and for TLS how the server is
+/// trusted and who the client is.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Transport {
+    /// Who may vouch for the server.
+    pub(crate) server_trust: ServerTrust,
+    /// The `known-hosts` file for trust on first use of self-signed servers;
+    /// `None` turns that off.
+    pub(crate) known_hosts: Option<PathBuf>,
+    /// Presented when set; servers that require mTLS refuse without it.
+    pub(crate) client_cert: Option<ClientCert>,
+}
+
+impl Transport {
+    /// The settings from `varlinkctl-http`'s config dir: `server-ca-file`,
+    /// `client-cert-file` with `client-key-file`, and `known-hosts`, each
+    /// used if present.
+    pub(crate) fn from_env() -> Self {
+        let dir = config_dir();
+        let file = |name: &str| dir.as_ref().map(|d| d.join(name)).filter(|p| p.exists());
+        let server_trust = file("server-ca-file").map_or(ServerTrust::SystemCas, ServerTrust::Ca);
+        let client_cert = match (file("client-cert-file"), file("client-key-file")) {
+            (Some(cert), Some(key)) => Some(ClientCert { cert, key }),
+            _ => None,
+        };
+        Self {
+            server_trust,
+            known_hosts: known_hosts_path(),
+            client_cert,
+        }
+    }
+
+    /// An `SslConnector` for this transport. If the server certificate is
+    /// refused, the reason lands in `refusal` for the error message.
+    fn ssl_connector(
+        &self,
+        tofu: Tofu,
+        refusal: Arc<OnceLock<&'static str>>,
+    ) -> Result<SslConnector> {
+        let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+        // the RFC 9266 channel binding is only guaranteed unique with TLS 1.3
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+
+        if let Some(ClientCert { cert, key }) = &self.client_cert {
             builder
-                .set_certificate_chain_file(&cert)
+                .set_certificate_chain_file(cert)
                 .with_context(|| format!("loading client certificate {}", cert.display()))?;
             builder
-                .set_private_key_file(&key, SslFiletype::PEM)
+                .set_private_key_file(key, SslFiletype::PEM)
                 .with_context(|| format!("loading client key {}", key.display()))?;
             builder
                 .check_private_key()
                 .context("client certificate and key do not match")?;
         }
 
-        if ca.exists() {
+        if let ServerTrust::Ca(ca) = &self.server_trust {
             builder.set_cert_store(
-                varlink_http_core::exclusive_ca_store(&ca)
+                varlink_http_core::exclusive_ca_store(ca)
                     .with_context(|| format!("loading CA certificate {}", ca.display()))?,
             );
         }
-    }
 
-    builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
-        // errors above the leaf abort on their own
-        if ctx.error_depth() != 0 {
-            return chain_ok;
-        }
-        let Some(cert) = ctx.current_cert() else {
-            return false;
-        };
-        match verify_server_cert(cert, chain_ok, recorded.as_ref(), ca_configured) {
-            Ok(()) => true,
-            Err(why) => {
-                let _ = refusal.set(why);
-                false
+        let trust = self.server_trust.clone();
+        builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
+            // errors above the leaf abort on their own
+            if ctx.error_depth() != 0 {
+                return chain_ok;
             }
-        }
-    });
+            let Some(cert) = ctx.current_cert() else {
+                return false;
+            };
+            match verify_server_cert(cert, chain_ok, &trust, &tofu) {
+                Ok(()) => true,
+                Err(why) => {
+                    // The callback can only answer yes or no, and OpenSSL
+                    // drops the certificate when it aborts, so the reason
+                    // has to be kept here.
+                    let _ = refusal.set(why);
+                    false
+                }
+            }
+        });
 
-    Ok(builder.build())
-}
-
-/// TLS-handshake `stream`, returning it with the RFC 9266 channel binding.
-///
-/// `peer` identifies the server in `known-hosts` and must be stable and
-/// unique per endpoint (`host:port`, or `vsock:CID:PORT`).
-///
-/// `verify_hostname=false` is for vsock where there is no hostname; the
-/// peer certificate is still verified against the CA chain.
-async fn connect_tls<S: AsyncStream + 'static>(
-    peer: &str,
-    domain: &str,
-    verify_hostname: bool,
-    stream: S,
-    error_context: &'static str,
-) -> Result<(BoxedStream, Option<TlsChannelBinding>)> {
-    let known_hosts = known_hosts_path().context("no configuration directory for known-hosts")?;
-    let recorded = lookup_known_host(&known_hosts, peer)?;
-    let first_contact = recorded.is_none();
-    let ca_configured = config_dir().is_some_and(|d| d.join("server-ca-file").exists());
-
-    let refusal = Arc::new(OnceLock::new());
-    let connector = build_ssl_connector(recorded, ca_configured, Arc::clone(&refusal))?;
-    let mut config = connector.configure().context("SSL configure")?;
-    // Left on so CA-issued certificates are still name-checked; self-signed
-    // ones fail here too, which verify_server_cert tolerates.
-    config.set_verify_hostname(verify_hostname);
-    let ssl = config.into_ssl(domain).context("SSL setup")?;
-    let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)?;
-
-    if let Err(e) = Pin::new(&mut tls_stream).connect().await {
-        return Err(anyhow::Error::new(e).context(match refusal.get() {
-            Some(why) => format!("{peer}: {why}"),
-            None => error_context.to_string(),
-        }));
+        Ok(builder.build())
     }
 
-    if first_contact && let Some(cert) = tls_stream.ssl().peer_certificate() {
-        let observed = if tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK {
-            KnownHost::TrustAuthority
-        } else {
-            KnownHost::Pin(varlink_http_core::public_key_pin(&cert)?)
+    /// TLS-handshake `stream`, returning it with the RFC 9266 channel binding.
+    ///
+    /// `peer` identifies the server in `known-hosts` and must be stable and
+    /// unique per endpoint (`host:port`, or `vsock:CID:PORT`).
+    ///
+    /// `verify_hostname=false` is for vsock where there is no hostname; the
+    /// peer certificate is still verified against the CA chain.
+    async fn handshake<S: AsyncStream + 'static>(
+        &self,
+        peer: &str,
+        domain: &str,
+        verify_hostname: bool,
+        stream: S,
+        error_context: &'static str,
+    ) -> Result<(BoxedStream, Option<TlsChannelBinding>)> {
+        let tofu = match &self.known_hosts {
+            None => Tofu::Off,
+            Some(path) => match lookup_known_host(path, peer)? {
+                None => Tofu::FirstContact,
+                Some(recorded) => Tofu::Recorded(recorded),
+            },
         };
-        record_known_host(&known_hosts, peer, &observed)
-            .with_context(|| format!("recording what {peer} presented"))?;
+        let first_contact = matches!(tofu, Tofu::FirstContact);
+
+        let refusal = Arc::new(OnceLock::new());
+        let connector = self.ssl_connector(tofu, Arc::clone(&refusal))?;
+        let mut config = connector.configure().context("SSL configure")?;
+        // Left on so CA-issued certificates are still name-checked; self-signed
+        // ones fail here too, which verify_server_cert tolerates.
+        config.set_verify_hostname(verify_hostname);
+        let ssl = config.into_ssl(domain).context("SSL setup")?;
+        let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)?;
+
+        if let Err(e) = Pin::new(&mut tls_stream).connect().await {
+            return Err(anyhow::Error::new(e).context(match refusal.get() {
+                Some(why) => format!("{peer}: {why}"),
+                None => error_context.to_string(),
+            }));
+        }
+
+        if first_contact
+            && let Some(known_hosts) = &self.known_hosts
+            && let Some(cert) = tls_stream.ssl().peer_certificate()
+        {
+            let observed =
+                if tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK {
+                    KnownHost::TrustAuthority
+                } else {
+                    KnownHost::Pin(varlink_http_core::public_key_pin(&cert)?)
+                };
+            record_known_host(known_hosts, peer, &observed)
+                .with_context(|| format!("recording what {peer} presented"))?;
+        }
+
+        let tls_channel_binding = varlink_http_core::export_tls_channel_binding(tls_stream.ssl());
+        Ok((Box::new(tls_stream), Some(tls_channel_binding)))
     }
 
-    let tls_channel_binding = varlink_http_core::export_tls_channel_binding(tls_stream.ssl());
-    Ok((Box::new(tls_stream), Some(tls_channel_binding)))
+    async fn connect_vsock(
+        &self,
+        url: &str,
+    ) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
+        let (cid, port, path, use_tls) = parse_vsock_url(url)?;
+        debug!("connecting to vsock CID {cid}:{port} (tls: {use_tls})");
+        let raw_stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
+            .await
+            .with_context(|| format!("vsock connect to CID {cid}:{port} failed"))?;
+
+        if use_tls {
+            let (stream, tls_channel_binding) = self
+                .handshake(
+                    &format!("vsock:{cid}:{port}"),
+                    "vsock",
+                    false,
+                    raw_stream,
+                    "TLS handshake over vsock failed: check client cert if server requires mTLS",
+                )
+                .await?;
+            Ok((stream, format!("wss://vsock{path}"), tls_channel_binding))
+        } else {
+            Ok((Box::new(raw_stream), format!("ws://vsock{path}"), None))
+        }
+    }
+
+    async fn connect_tcp(
+        &self,
+        url: &str,
+    ) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
+        let ws_url = if let Some(rest) = url.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            url.to_string()
+        };
+        let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
+        let use_tls = uri.scheme_str() == Some("wss");
+        let host = uri.host().context("URL has no host")?;
+        // Uri::host() keeps the brackets on IPv6 literals ("[::1]") but
+        // TcpStream::connect and TLS verification need the bare address
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string();
+        let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
+
+        debug!("connecting to {host}:{port} (tls: {use_tls})");
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+        varlink_http_core::set_tcp_keepalive_and_nodelay(&tcp)
+            .context("configure client socket")?;
+
+        if use_tls {
+            let (stream, tls_channel_binding) = self
+                .handshake(
+                    &format!("{host}:{port}"),
+                    &host,
+                    true,
+                    tcp,
+                    "TLS handshake failed: check client certificate if server requires mTLS",
+                )
+                .await?;
+            Ok((stream, ws_url, tls_channel_binding))
+        } else {
+            Ok((Box::new(tcp), ws_url, None))
+        }
+    }
+
+    /// The TLS channel binding is returned so auth headers can be signed
+    /// over it before the WebSocket upgrade.
+    pub(crate) async fn connect(
+        &self,
+        url: &str,
+    ) -> Result<(
+        BoxedStream,
+        tungstenite::http::Request<()>,
+        Option<TlsChannelBinding>,
+    )> {
+        use tungstenite::client::IntoClientRequest;
+
+        let (stream, ws_url, tls_channel_binding) =
+            if url.starts_with("vsock://") || url.starts_with("vsock+tls://") {
+                self.connect_vsock(url).await?
+            } else {
+                self.connect_tcp(url).await?
+            };
+
+        // Use into_client_request() here as it auto-generates standard WS upgrade headers,
+        // then we add our auth headers too
+        let request = ws_url
+            .into_client_request()
+            .context("building WS request")?;
+        Ok((stream, request, tls_channel_binding))
+    }
 }
 
-/// Parse a `vsock://CID:PORT/path` URL.
+/// Parse a `vsock://CID:PORT/path` or `vsock+tls://CID:PORT/path` URL into
+/// CID, port, path and whether the scheme asks for TLS.
 ///
 /// The port defaults to [`varlink_http_core::DEFAULT_PORT`] if omitted (`vsock://CID/path`).
-fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
-    let rest = url
-        .strip_prefix("vsock://")
-        .ok_or_else(|| anyhow::anyhow!("not a vsock:// URL"))?;
+fn parse_vsock_url(url: &str) -> Result<(u32, u32, String, bool)> {
+    let (rest, use_tls) = if let Some(rest) = url.strip_prefix("vsock+tls://") {
+        (rest, true)
+    } else if let Some(rest) = url.strip_prefix("vsock://") {
+        (rest, false)
+    } else {
+        anyhow::bail!("not a vsock:// URL");
+    };
 
     // Split authority from path
     let (authority, path) = match rest.find('/') {
@@ -314,73 +510,7 @@ fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
     };
 
     let (cid, port) = varlink_http_core::parse_vsock_cid_port(authority)?;
-    Ok((cid, port, path.to_string()))
-}
-
-async fn connect_vsock(
-    url: &str,
-    use_tls: bool,
-) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
-    let (cid, port, path) = parse_vsock_url(url)?;
-    debug!("connecting to vsock CID {cid}:{port} (tls: {use_tls})");
-    let raw_stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
-        .await
-        .with_context(|| format!("vsock connect to CID {cid}:{port} failed"))?;
-
-    if use_tls {
-        let (stream, tls_channel_binding) = connect_tls(
-            &format!("vsock:{cid}:{port}"),
-            "vsock",
-            false,
-            raw_stream,
-            "TLS handshake over vsock failed: check client cert if server requires mTLS",
-        )
-        .await?;
-        Ok((stream, format!("wss://vsock{path}"), tls_channel_binding))
-    } else {
-        Ok((Box::new(raw_stream), format!("ws://vsock{path}"), None))
-    }
-}
-
-async fn connect_tcp(url: &str) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
-    let ws_url = if let Some(rest) = url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        url.to_string()
-    };
-    let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
-    let use_tls = uri.scheme_str() == Some("wss");
-    let host = uri.host().context("URL has no host")?;
-    // Uri::host() keeps the brackets on IPv6 literals ("[::1]") but
-    // TcpStream::connect and TLS verification need the bare address
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-        .to_string();
-    let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
-
-    debug!("connecting to {host}:{port} (tls: {use_tls})");
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
-    varlink_http_core::set_tcp_keepalive_and_nodelay(&tcp).context("configure client socket")?;
-
-    if use_tls {
-        let (stream, tls_channel_binding) = connect_tls(
-            &format!("{host}:{port}"),
-            &host,
-            true,
-            tcp,
-            "TLS handshake failed: check client certificate if server requires mTLS",
-        )
-        .await?;
-        Ok((stream, ws_url, tls_channel_binding))
-    } else {
-        Ok((Box::new(tcp), ws_url, None))
-    }
+    Ok((cid, port, path.to_string(), use_tls))
 }
 
 fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option<String> {
@@ -391,7 +521,7 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
 }
 
 /// Whether `url` selects a TLS transport, mirroring the scheme handling
-/// in [`connect_transport`] and [`connect_tcp`].
+/// in [`Transport::connect`] and [`Transport::connect_tcp`].
 ///
 /// Schemes are case-insensitive (RFC 3986 section 3.1), so `HTTPS://` has
 /// to count as TLS here too.
@@ -404,39 +534,11 @@ pub(crate) fn url_is_tls(url: &str) -> bool {
         .any(|tls_scheme| scheme.eq_ignore_ascii_case(tls_scheme))
 }
 
-/// The TLS channel binding is returned so auth headers can be signed
-/// over it before the WebSocket upgrade.
-pub(crate) async fn connect_transport(
-    url: &str,
-) -> Result<(
-    BoxedStream,
-    tungstenite::http::Request<()>,
-    Option<TlsChannelBinding>,
-)> {
-    use tungstenite::client::IntoClientRequest;
-
-    let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")
-    {
-        connect_vsock(&format!("vsock://{rest}"), true).await?
-    } else if url.starts_with("vsock://") {
-        connect_vsock(url, false).await?
-    } else {
-        connect_tcp(url).await?
-    };
-
-    // Use into_client_request() here as it auto-generates standard WS upgrade headers,
-    // then we add our auth headers too
-    let request = ws_url
-        .into_client_request()
-        .context("building WS request")?;
-    Ok((stream, request, tls_channel_binding))
-}
-
 pub(crate) async fn ws_upgrade(
     request: tungstenite::http::Request<()>,
     stream: BoxedStream,
     is_tls: bool,
-) -> Result<Ws> {
+) -> Result<WebSocket> {
     // anyhow keeps the tungstenite::Error downcastable through context():
     // the SSH-retry logic detects a 401 via downcast_ref.
     let (ws, _) = tokio_tungstenite::client_async(request, stream)
@@ -628,29 +730,61 @@ mod pin_tests {
     fn a_validated_chain_wins_and_known_hosts_is_not_consulted() {
         let (id, _) = self_signed_pin();
         // a deliberately wrong recorded key must not veto the CA
-        let wrong = KnownHost::Pin("AAAA=".to_string());
-        assert!(verify_server_cert(&id.0, true, Some(&wrong), false).is_ok());
+        let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
+        assert!(verify_server_cert(&id.0, true, &ServerTrust::SystemCas, &wrong).is_ok());
     }
 
     #[test]
     fn an_unprovable_issuer_is_refused_even_with_a_recorded_key() {
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let pin = KnownHost::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
-        let err = verify_server_cert(&leaf.0, false, Some(&pin), false).unwrap_err();
+        let pin = Tofu::Recorded(KnownHost::Pin(
+            varlink_http_core::public_key_pin(&leaf.0).unwrap(),
+        ));
+        let err = verify_server_cert(&leaf.0, false, &ServerTrust::SystemCas, &pin).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
     }
 
     #[test]
     fn self_signed_is_governed_by_known_hosts() {
         let (id, pin) = self_signed_pin();
-        // first contact, connect_tls records afterwards
-        assert!(verify_server_cert(&id.0, false, None, false).is_ok());
-        let recorded = KnownHost::Pin(pin);
-        assert!(verify_server_cert(&id.0, false, Some(&recorded), false).is_ok());
-        let wrong = KnownHost::Pin("AAAA=".to_string());
-        let err = verify_server_cert(&id.0, false, Some(&wrong), false).unwrap_err();
+        let system = ServerTrust::SystemCas;
+        // first contact, Transport::handshake records afterwards
+        assert!(verify_server_cert(&id.0, false, &system, &Tofu::FirstContact).is_ok());
+        let recorded = Tofu::Recorded(KnownHost::Pin(pin));
+        assert!(verify_server_cert(&id.0, false, &system, &recorded).is_ok());
+        let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
+        let err = verify_server_cert(&id.0, false, &system, &wrong).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
+    }
+
+    /// A pin accepts its key whether the certificate is self-signed or issued
+    /// by a CA we do not have, and refuses any other key.
+    #[test]
+    fn a_pin_decides_by_the_key_alone() {
+        let (id, pin) = self_signed_pin();
+        // as varlink-httpd prints it, and bare
+        let printed = ServerTrust::Pin(format!("sha256//{pin}"));
+        assert!(verify_server_cert(&id.0, false, &printed, &Tofu::Off).is_ok());
+        let pinned = ServerTrust::Pin(pin);
+        assert!(verify_server_cert(&id.0, false, &pinned, &Tofu::Off).is_ok());
+
+        let ca = identity("ca", None, true);
+        let leaf = identity("leaf", Some(&ca), false);
+        let leaf_pin = ServerTrust::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
+        assert!(verify_server_cert(&leaf.0, false, &leaf_pin, &Tofu::Off).is_ok());
+
+        let err = verify_server_cert(&leaf.0, false, &pinned, &Tofu::Off).unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+    }
+
+    /// Without a `known-hosts` file there is no first contact to trust.
+    #[test]
+    fn without_known_hosts_a_self_signed_server_is_refused() {
+        let (id, _) = self_signed_pin();
+        let err =
+            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &Tofu::Off).unwrap_err();
+        assert!(err.contains("known-hosts"), "{err}");
     }
 
     /// The downgrade the `ca` record exists to catch: a peer only ever reached
@@ -659,8 +793,9 @@ mod pin_tests {
     #[test]
     fn a_ca_backed_peer_refuses_a_later_self_signed_certificate() {
         let (id, _) = self_signed_pin();
+        let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
         let err =
-            verify_server_cert(&id.0, false, Some(&KnownHost::TrustAuthority), false).unwrap_err();
+            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &ca_backed).unwrap_err();
         assert!(err.contains("Refusing the downgrade"), "{err}");
     }
 
@@ -672,8 +807,9 @@ mod pin_tests {
         for cn in ["leaf", "leaf-after-rotation"] {
             // a fresh keypair each time round, so this is a real rotation
             let leaf = identity(cn, Some(&ca), false);
+            let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
             assert!(
-                verify_server_cert(&leaf.0, true, Some(&KnownHost::TrustAuthority), false).is_ok(),
+                verify_server_cert(&leaf.0, true, &ServerTrust::SystemCas, &ca_backed).is_ok(),
                 "{cn} must be accepted"
             );
         }
@@ -682,7 +818,8 @@ mod pin_tests {
     #[test]
     fn a_configured_ca_disables_first_contact_trust() {
         let (id, _) = self_signed_pin();
-        let err = verify_server_cert(&id.0, false, None, true).unwrap_err();
+        let ca = ServerTrust::Ca("/etc/varlinkctl-http/server-ca-file".into());
+        let err = verify_server_cert(&id.0, false, &ca, &Tofu::FirstContact).unwrap_err();
         assert!(err.contains("server-ca-file"), "{err}");
     }
 }
@@ -693,8 +830,9 @@ mod tests {
 
     #[test]
     fn test_parse_vsock_url_cid_and_port() {
-        let (cid, port, path) =
+        let (cid, port, path, use_tls) =
             parse_vsock_url("vsock://2:1031/io.systemd.Manager/Describe").unwrap();
+        assert!(!use_tls);
         assert_eq!(cid, 2);
         assert_eq!(port, 1031);
         assert_eq!(path, "/io.systemd.Manager/Describe");
@@ -702,7 +840,8 @@ mod tests {
 
     #[test]
     fn test_parse_vsock_url_default_port() {
-        let (cid, port, path) = parse_vsock_url("vsock://2/io.systemd.Manager/Describe").unwrap();
+        let (cid, port, path, _) =
+            parse_vsock_url("vsock://2/io.systemd.Manager/Describe").unwrap();
         assert_eq!(cid, 2);
         assert_eq!(port, varlink_http_core::DEFAULT_PORT);
         assert_eq!(path, "/io.systemd.Manager/Describe");
@@ -710,10 +849,19 @@ mod tests {
 
     #[test]
     fn test_parse_vsock_url_no_path() {
-        let (cid, port, path) = parse_vsock_url("vsock://3:5000").unwrap();
+        let (cid, port, path, _) = parse_vsock_url("vsock://3:5000").unwrap();
         assert_eq!(cid, 3);
         assert_eq!(port, 5000);
         assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn test_parse_vsock_url_tls_scheme() {
+        let (cid, port, path, use_tls) = parse_vsock_url("vsock+tls://2:1031/path").unwrap();
+        assert_eq!(
+            (cid, port, path.as_str(), use_tls),
+            (2, 1031, "/path", true)
+        );
     }
 
     #[test]

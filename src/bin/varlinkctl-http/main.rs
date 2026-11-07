@@ -12,8 +12,7 @@ use log::{debug, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
-use varlink_http_client::ws::WsByteStream;
-use varlink_http_client::{BoxedStream, Ws, connect_ws};
+use varlink_http_client::{Client, VarlinkStream};
 
 // Time to wait until a close needs to be complete before giving up.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,7 +23,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Our half of the close handshake, bounded so a stuck peer cannot
 /// hang the exit.
-async fn close_ws(ws: &mut WsByteStream<BoxedStream>) {
+async fn close_ws(ws: &mut VarlinkStream) {
     match tokio::time::timeout(CLOSE_TIMEOUT, ws.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("WebSocket close failed: {e:#}"),
@@ -38,10 +37,9 @@ async fn close_ws(ws: &mut WsByteStream<BoxedStream>) {
 /// Whichever side closes first, the other is drained until it closes
 /// too. varlinkctl closes fd3 and then sends SIGTERM, so a peer that
 /// never answers our close is cut short by the signal branch.
-async fn run_proxy(ws: Ws, mut fd3: UnixStream) -> Result<()> {
+async fn run_proxy(mut ws: VarlinkStream, mut fd3: UnixStream) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
-    let mut ws = WsByteStream::new(ws);
 
     tokio::select! {
         r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => {
@@ -99,7 +97,8 @@ async fn main() -> Result<()> {
     fd3.set_nonblocking(true)?;
     let fd3 = UnixStream::from_std(fd3)?;
 
-    let ws = tokio::time::timeout(CONNECT_TIMEOUT, connect_ws(&bridge_url))
+    let client = Client::from_env()?;
+    let ws = tokio::time::timeout(CONNECT_TIMEOUT, client.connect(&bridge_url))
         .await
         .with_context(|| format!("timed out connecting to '{bridge_url}'"))??;
 
@@ -113,6 +112,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
+    use varlink_http_client::BoxedStream;
+    use varlink_http_client::ws::WsByteStream;
 
     type ServerWs = WebSocketStream<tokio::net::TcpStream>;
 
@@ -134,7 +135,7 @@ mod tests {
                 .await
                 .unwrap();
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let proxy = tokio::spawn(run_proxy(ws, theirs));
+        let proxy = tokio::spawn(run_proxy(WsByteStream::new(ws), theirs));
         (accept.await.unwrap(), ours, proxy)
     }
 
