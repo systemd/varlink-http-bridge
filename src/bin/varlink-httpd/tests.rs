@@ -294,15 +294,11 @@ async fn test_integration_real_systemd_service_interface_get() {
         );
     }
     // the full list grows with systemd releases, Describe has always been there
-    let describe = body["methods"]
-        .as_array()
-        .and_then(|methods| methods.iter().find(|m| m["name"] == json!("Describe")))
-        .unwrap_or_else(|| panic!("unexpected methods: {body}"));
     assert!(
-        describe["description"]
-            .as_str()
-            .is_some_and(|d| !d.is_empty()),
-        "hostnamed documents Describe, so its IDL comment must be carried over: {describe}"
+        body["methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|m| m["name"] == json!("Describe"))),
+        "unexpected methods: {body}"
     );
 
     for (key, expected) in [
@@ -3144,6 +3140,37 @@ mod sshauth_tests {
         assert_describe_reply(&output);
     }
 } // mod sshauth_tests
+
+#[test]
+fn service_interface_get_carries_the_idl_comments() {
+    let iface: zlink::idl::Interface = "\
+interface com.example.doc
+
+# Says hello
+method Hello() -> ()
+
+# Streams events
+# [Requires 'more' flag]
+method Watch() -> (event: string)
+
+method Undocumented() -> ()
+"
+    .try_into()
+    .expect("failed to parse IDL");
+    let methods: Vec<Value> = iface
+        .methods()
+        .map(|m| described(m.name(), openapi::method_description(m)))
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            json!({"name": "Hello", "description": "Says hello"}),
+            // the more marker is a varlink convention, not documentation
+            json!({"name": "Watch", "description": "Streams events"}),
+            json!({"name": "Undocumented"}),
+        ]
+    );
+}
 
 // A varlink IDL that exercises all type features: methods with typed
 // input/output, a struct typedef, an enum typedef, an error with
