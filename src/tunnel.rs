@@ -777,7 +777,12 @@ mod tests {
             TunnelStream::server(&mut conn).await
         });
 
-        let (client_conn, send_request) = h2_connect(client_ws).await;
+        let (send_request, mut conn) = client_handshake(client_ws).await.unwrap();
+        let mut ping_pong = conn.ping_pong().unwrap();
+        let client_conn = tokio::spawn(conn);
+        // wait until the node finished its side of the handshake, closing
+        // before that gives it a broken pipe instead of a clean close
+        ping_pong.ping(h2::Ping::opaque()).await.unwrap();
         // the last handle going is what makes the h2 client say goodbye
         drop(send_request);
         let step = std::time::Duration::from_secs(3);
