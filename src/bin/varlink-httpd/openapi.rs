@@ -2,7 +2,7 @@
 
 use log::warn;
 use serde_json::{Value, json};
-use zlink::idl::{Comment, CustomType, EnumVariant, Field, Interface, Type};
+use zlink::idl::{Comment, CustomType, Field, Interface, Type};
 
 /// Widen a schema to also accept JSON `null`.
 ///
@@ -55,7 +55,7 @@ fn type_to_schema(ty: &Type) -> Value {
         }
         Type::Object(fields) => fields_to_schema(fields.iter()),
         Type::Enum(variants) => {
-            let names: Vec<&str> = variants.iter().map(EnumVariant::name).collect();
+            let names: Vec<&str> = variants.iter().map(|v| v.name().as_str()).collect();
             json!({"type": "string", "enum": names})
         }
     }
@@ -257,7 +257,7 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
                 comments_to_string(obj.comments()),
             ),
             CustomType::Enum(e) => {
-                let names: Vec<&str> = e.variants().map(EnumVariant::name).collect();
+                let names: Vec<&str> = e.variants().map(|v| v.name().as_str()).collect();
                 (
                     json!({"type": "string", "enum": names}),
                     comments_to_string(e.comments()),

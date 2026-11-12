@@ -700,7 +700,7 @@ async fn test_integration_idl_matches_openapi_title() {
     let iface: zlink::idl::Interface<'_> = body.as_str().try_into().expect("unparsable IDL");
 
     let doc = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
-    assert_eq!(doc["info"]["title"], iface.name());
+    assert_eq!(doc["info"]["title"], iface.name().as_str());
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
