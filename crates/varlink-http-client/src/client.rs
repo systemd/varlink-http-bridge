@@ -129,7 +129,19 @@ impl Client {
 
         // No method applicable: connect unauthenticated, the server decides.
         let (stream, request, tcb) = self.transport.connect(url).await?;
-        let ws = crate::ws_upgrade(request, stream, tcb.is_some()).await?;
+        let ws = crate::ws_upgrade(request, stream, tcb.is_some())
+            .await
+            .map_err(|e| {
+                if !is_http_rejection(&e) {
+                    return e;
+                }
+                // the methods are always listed, so ask which ones the user set
+                e.context(if self.methods.iter().any(|m| m.configured()) {
+                    "none of the configured credentials applied, so none was sent"
+                } else {
+                    "no credential configured"
+                })
+            })?;
         Ok(WsByteStream::new(ws))
     }
 }
@@ -237,7 +249,84 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::future::LocalBoxFuture;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    /// A method that does not apply, like an agent without a usable key.
+    struct NotApplicable {
+        configured: bool,
+    }
+
+    impl ClientAuth for NotApplicable {
+        fn name(&self) -> &'static str {
+            "test auth"
+        }
+
+        fn configured(&self) -> bool {
+            self.configured
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> LocalBoxFuture<'a, Result<Option<crate::WebSocket>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// A server that answers the upgrade with `status` and hangs up.
+    async fn rejecting_server(status: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            // consume the request so the reply is not lost to a reset
+            let mut buf = [0u8; 4096];
+            let _ = tcp.read(&mut buf).await;
+            let response = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/ws/services/x")
+    }
+
+    /// The error of connecting to a server that answers `status`.
+    async fn rejection(status: &'static str, configured: bool) -> String {
+        let url = rejecting_server(status).await;
+        let client = Client {
+            transport: Transport::default(),
+            methods: vec![Box::new(NotApplicable { configured })],
+        };
+        let Err(err) = client.connect(&url).await else {
+            panic!("the server rejected the upgrade");
+        };
+        format!("{err:#}")
+    }
+
+    #[tokio::test]
+    async fn a_rejection_without_any_credential_says_so() {
+        let shown = rejection("401 Unauthorized", false).await;
+        assert!(shown.starts_with("no credential configured"), "{shown}");
+        assert!(shown.contains("401"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_no_credential_applied_says_so() {
+        let shown = rejection("403 Forbidden", true).await;
+        assert!(
+            shown.starts_with("none of the configured credentials applied"),
+            "{shown}"
+        );
+        assert!(shown.contains("403"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn other_failures_keep_their_own_message() {
+        let shown = rejection("500 Internal Server Error", true).await;
+        assert!(!shown.contains("credential"), "{shown}");
+        assert!(shown.contains("500"), "{shown}");
+    }
 
     #[test]
     fn builder_keeps_the_settings_and_the_auth_order() {
