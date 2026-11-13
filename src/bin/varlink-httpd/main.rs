@@ -91,7 +91,8 @@ impl From<zlink::Error> for AppError {
             | zlink::Error::UnexpectedEof
             | zlink::Error::Io(..) => StatusCode::BAD_GATEWAY,
             zlink::Error::VarlinkService(owned) => match owned.inner() {
-                varlink_service::Error::InvalidParameter { .. } => StatusCode::BAD_REQUEST,
+                varlink_service::Error::InvalidParameter { .. }
+                | varlink_service::Error::ExpectedUpgrade => StatusCode::BAD_REQUEST,
                 varlink_service::Error::ExpectedMore => {
                     message = Some(
                         "This method requires the varlink 'more' flag. \
@@ -104,6 +105,7 @@ impl From<zlink::Error> for AppError {
                 | varlink_service::Error::InterfaceNotFound { .. } => StatusCode::NOT_FOUND,
                 varlink_service::Error::MethodNotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
                 varlink_service::Error::PermissionDenied => StatusCode::FORBIDDEN,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -164,14 +166,10 @@ impl From<DynReplyError<'_>> for AppError {
             Some(params) => format!("{}: {params:?}", e.error),
             None => e.error.to_string(),
         };
-        // the spec maps this standard error to 400 like ExpectedMore, but
-        // zlink does not know it, so it arrives here rather than as zlink::Error
-        let status = if e.error == "org.varlink.service.ExpectedUpgrade" {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        Self { status, message }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        }
     }
 }
 
@@ -925,6 +923,8 @@ impl InterfaceIdl {
         state: &AppState,
         conn_cache: &VarlinkConnCache,
     ) -> Result<Self, AppError> {
+        let interface = zlink::names::InterfaceName::try_from(interface)
+            .map_err(|e| AppError::bad_request(format!("invalid interface name: {e}")))?;
         let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
         let mut connection = conn_arc.lock().await;
 
@@ -960,7 +960,7 @@ async fn route_openapi_get(
     // the title and every generated path come from the returned description,
     // so a service that ignores the requested name would hand out a document
     // for a different API with nothing to indicate it
-    if iface.name() != interface {
+    if iface.name() != interface.as_str() {
         return Err(AppError::bad_gateway(format!(
             "upstream described interface '{}' but '{interface}' was requested",
             iface.name()
