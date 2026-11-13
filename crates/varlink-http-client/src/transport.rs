@@ -143,133 +143,197 @@ fn is_self_signed(cert: &openssl::x509::X509Ref) -> bool {
         .is_ok_and(std::cmp::Ordering::is_eq)
 }
 
+/// What `known-hosts` has to say about the peer, if a file is in use at all.
+#[derive(Debug)]
+enum Tofu {
+    /// No file: only [`ServerTrust`] decides.
+    Off,
+    /// Nothing recorded for the peer yet.
+    FirstContact,
+    /// What the peer presented last time; it must present the same again.
+    Recorded(KnownHost),
+}
+
+/// Whether the server key is `pin`, with or without the `sha256//` prefix;
+/// `mismatch` is the refusal otherwise.
+fn pin_matches(
+    cert: &openssl::x509::X509Ref,
+    pin: &str,
+    mismatch: &'static str,
+) -> Result<(), &'static str> {
+    let actual =
+        varlink_http_core::public_key_pin(cert).map_err(|_| "cannot fingerprint the server key")?;
+    if pin.strip_prefix("sha256//").unwrap_or(pin) == actual {
+        Ok(())
+    } else {
+        Err(mismatch)
+    }
+}
+
 /// Decide whether the server's certificate is acceptable.
 ///
-/// PKI is the real signal, so a validated certificate is always accepted, and
-/// `known-hosts` only governs the certificates nothing vouches for. Accepting
-/// early is also what lets a [`KnownHost::TrustAuthority`] peer rotate its
-/// key: the new certificate validates and never reaches the rules below.
+/// A pinned key decides alone. Otherwise PKI is the real signal, so a
+/// validated certificate is always accepted, and `known-hosts` only governs
+/// the certificates nothing vouches for. Accepting early is also what lets a
+/// [`KnownHost::TrustAuthority`] peer rotate its key: the new certificate
+/// validates and never reaches the rules below.
 ///
 /// The refusal reason is a message, not an error, because the OpenSSL verify
 /// callback can only answer yes or no and stores it for the caller.
 fn verify_server_cert(
     cert: &openssl::x509::X509Ref,
     chain_ok: bool,
-    recorded: Option<&KnownHost>,
-    ca_configured: bool,
+    trust: &ServerTrust,
+    tofu: &Tofu,
 ) -> Result<(), &'static str> {
-    if chain_ok {
-        // A stale pin is left alone; it still catches a later downgrade.
-        return Ok(());
-    }
-    if ca_configured {
-        return Err("certificate does not validate against the configured server-ca-file");
+    match trust {
+        // Before chain_ok: a certificate some CA vouches for is still not
+        // the pinned server unless it carries the pinned key.
+        ServerTrust::Pin(pin) => {
+            return pin_matches(cert, pin, "the server key does not match the pinned one");
+        }
+        // A stale known-hosts pin is left alone; it still catches a later
+        // downgrade.
+        _ if chain_ok => return Ok(()),
+        ServerTrust::Ca(_) => {
+            return Err("certificate does not validate against the configured server-ca-file");
+        }
+        ServerTrust::SystemCas => {}
     }
     if !is_self_signed(cert) {
         return Err("certificate does not validate against trust authority");
     }
 
-    match recorded {
-        // No record yet: first contact, Transport::handshake learns the key afterwards.
-        None => Ok(()),
-        Some(KnownHost::TrustAuthority) => Err(
+    match tofu {
+        Tofu::Off => {
+            Err("certificate is self-signed and no known-hosts file is in use to trust it")
+        }
+        Tofu::FirstContact => Ok(()),
+        Tofu::Recorded(KnownHost::TrustAuthority) => Err(
             "this peer was reached before with a certificate signed by a trust authority \
              and now presents a self-signed one. Refusing the downgrade. If the server \
              really stopped using a CA cert, delete its known-hosts line.",
         ),
-        Some(KnownHost::Pin(pin)) => {
-            let actual = varlink_http_core::public_key_pin(cert)
-                .map_err(|_| "cannot fingerprint the server key")?;
-            if *pin != actual {
-                return Err(
-                    "the server key does not match the one recorded in known-hosts. \
-                     Either the server was reinstalled, or this is not the same server.",
-                );
-            }
-            Ok(())
-        }
+        Tofu::Recorded(KnownHost::Pin(pin)) => pin_matches(
+            cert,
+            pin,
+            "the server key does not match the one recorded in known-hosts. \
+             Either the server was reinstalled, or this is not the same server.",
+        ),
     }
 }
 
-/// Build an `SslConnector` with the client certs and CA from `config_dir`
-/// and the system trust store.
-///
-/// Any refusal reason lands in `refusal`; OpenSSL drops the peer certificate
-/// when it aborts, so the caller cannot work it out afterwards.
-fn build_ssl_connector(
-    config_dir: Option<&Path>,
-    recorded: Option<KnownHost>,
-    ca_configured: bool,
-    refusal: Arc<OnceLock<&'static str>>,
-) -> Result<SslConnector> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
-    // We need tls channel binding per RFC 9266 ("tls-exporter") which
-    // is only guaranteed unique with TLS 1.3.
-    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+/// Who may vouch for the server's certificate. With a CA file or a pinned
+/// key nothing else is accepted; with the system store a self-signed
+/// certificate can still be trusted through `known-hosts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerTrust {
+    /// The system CA store vouches for the server.
+    #[default]
+    SystemCas,
+    /// Only this CA (a PEM file) vouches for the server.
+    Ca(PathBuf),
+    /// The key of a server with a self-signed certificate, `sha256//…` as
+    /// varlink-httpd prints it at startup for the certificate it generates.
+    /// Not for a certificate a private CA issued; use [`ServerTrust::Ca`]
+    /// for that.
+    Pin(String),
+}
 
-    if let Some(dir) = config_dir {
-        let cert = dir.join("client-cert-file");
-        let key = dir.join("client-key-file");
-        let ca = dir.join("server-ca-file");
+/// The client's certificate and key, for servers that require mTLS.
+#[derive(Debug, Clone)]
+pub(crate) struct ClientCert {
+    /// The certificate chain, PEM.
+    pub(crate) cert: PathBuf,
+    /// The private key for it, PEM.
+    pub(crate) key: PathBuf,
+}
 
-        if cert.exists() && key.exists() {
+/// How a bridge is reached: TCP or vsock, and for TLS how the server is
+/// trusted and who the client is.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Transport {
+    /// Who may vouch for the server.
+    pub(crate) server_trust: ServerTrust,
+    /// The `known-hosts` file for trust on first use of self-signed servers;
+    /// `None` turns that off.
+    pub(crate) known_hosts: Option<PathBuf>,
+    /// Presented when set; servers that require mTLS refuse without it.
+    pub(crate) client_cert: Option<ClientCert>,
+}
+
+impl Transport {
+    /// The settings from `varlinkctl-http`'s config dir: `server-ca-file`,
+    /// `client-cert-file` with `client-key-file`, and `known-hosts`, each
+    /// used if present.
+    pub(crate) fn from_env() -> Self {
+        let dir = config_dir();
+        let file = |name: &str| dir.as_ref().map(|d| d.join(name)).filter(|p| p.exists());
+        let server_trust = file("server-ca-file").map_or(ServerTrust::SystemCas, ServerTrust::Ca);
+        let client_cert = match (file("client-cert-file"), file("client-key-file")) {
+            (Some(cert), Some(key)) => Some(ClientCert { cert, key }),
+            _ => None,
+        };
+        Self {
+            server_trust,
+            known_hosts: known_hosts_path(),
+            client_cert,
+        }
+    }
+
+    /// An `SslConnector` for this transport. If the server certificate is
+    /// refused, the reason lands in `refusal` for the error message.
+    fn ssl_connector(
+        &self,
+        tofu: Tofu,
+        refusal: Arc<OnceLock<&'static str>>,
+    ) -> Result<SslConnector> {
+        let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+        // the RFC 9266 channel binding is only guaranteed unique with TLS 1.3
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+
+        if let Some(ClientCert { cert, key }) = &self.client_cert {
             builder
-                .set_certificate_chain_file(&cert)
+                .set_certificate_chain_file(cert)
                 .with_context(|| format!("loading client certificate {}", cert.display()))?;
             builder
-                .set_private_key_file(&key, SslFiletype::PEM)
+                .set_private_key_file(key, SslFiletype::PEM)
                 .with_context(|| format!("loading client key {}", key.display()))?;
             builder
                 .check_private_key()
                 .context("client certificate and key do not match")?;
         }
 
-        if ca.exists() {
+        if let ServerTrust::Ca(ca) = &self.server_trust {
             builder.set_cert_store(
-                varlink_http_core::exclusive_ca_store(&ca)
+                varlink_http_core::exclusive_ca_store(ca)
                     .with_context(|| format!("loading CA certificate {}", ca.display()))?,
             );
         }
-    }
 
-    builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
-        // errors above the leaf abort on their own
-        if ctx.error_depth() != 0 {
-            return chain_ok;
-        }
-        let Some(cert) = ctx.current_cert() else {
-            return false;
-        };
-        match verify_server_cert(cert, chain_ok, recorded.as_ref(), ca_configured) {
-            Ok(()) => true,
-            Err(why) => {
-                let _ = refusal.set(why);
-                false
+        let trust = self.server_trust.clone();
+        builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
+            // errors above the leaf abort on their own
+            if ctx.error_depth() != 0 {
+                return chain_ok;
             }
-        }
-    });
+            let Some(cert) = ctx.current_cert() else {
+                return false;
+            };
+            match verify_server_cert(cert, chain_ok, &trust, &tofu) {
+                Ok(()) => true,
+                Err(why) => {
+                    // The callback can only answer yes or no, and OpenSSL
+                    // drops the certificate when it aborts, so the reason
+                    // has to be kept here.
+                    let _ = refusal.set(why);
+                    false
+                }
+            }
+        });
 
-    Ok(builder.build())
-}
-
-/// How a bridge is reached: TCP or vsock, and for TLS the trust files and
-/// `known-hosts` to use.
-#[derive(Debug, Clone)]
-pub(crate) struct Transport {
-    /// Holds `client-cert-file`, `client-key-file` and `server-ca-file`,
-    /// each used if present.
-    pub(crate) config_dir: Option<PathBuf>,
-    /// Where the server keys seen on first contact are looked up and
-    /// recorded. TLS cannot be used without one.
-    pub(crate) known_hosts: Option<PathBuf>,
-}
-
-impl Transport {
-    pub(crate) fn from_env() -> Self {
-        Self {
-            config_dir: config_dir(),
-            known_hosts: known_hosts_path(),
-        }
+        Ok(builder.build())
     }
 
     /// TLS-handshake `stream`, returning it with the RFC 9266 channel binding.
@@ -287,18 +351,17 @@ impl Transport {
         stream: S,
         error_context: &'static str,
     ) -> Result<(BoxedStream, Option<TlsChannelBinding>)> {
-        let known_hosts = self
-            .known_hosts
-            .as_deref()
-            .context("no configuration directory for known-hosts")?;
-        let recorded = lookup_known_host(known_hosts, peer)?;
-        let first_contact = recorded.is_none();
-        let config_dir = self.config_dir.as_deref();
-        let ca_configured = config_dir.is_some_and(|d| d.join("server-ca-file").exists());
+        let tofu = match &self.known_hosts {
+            None => Tofu::Off,
+            Some(path) => match lookup_known_host(path, peer)? {
+                None => Tofu::FirstContact,
+                Some(recorded) => Tofu::Recorded(recorded),
+            },
+        };
+        let first_contact = matches!(tofu, Tofu::FirstContact);
 
         let refusal = Arc::new(OnceLock::new());
-        let connector =
-            build_ssl_connector(config_dir, recorded, ca_configured, Arc::clone(&refusal))?;
+        let connector = self.ssl_connector(tofu, Arc::clone(&refusal))?;
         let mut config = connector.configure().context("SSL configure")?;
         // Left on so CA-issued certificates are still name-checked; self-signed
         // ones fail here too, which verify_server_cert tolerates.
@@ -313,7 +376,10 @@ impl Transport {
             }));
         }
 
-        if first_contact && let Some(cert) = tls_stream.ssl().peer_certificate() {
+        if first_contact
+            && let Some(known_hosts) = &self.known_hosts
+            && let Some(cert) = tls_stream.ssl().peer_certificate()
+        {
             let observed =
                 if tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK {
                     KnownHost::TrustAuthority
@@ -668,29 +734,73 @@ mod pin_tests {
     fn a_validated_chain_wins_and_known_hosts_is_not_consulted() {
         let (id, _) = self_signed_pin();
         // a deliberately wrong recorded key must not veto the CA
-        let wrong = KnownHost::Pin("AAAA=".to_string());
-        assert!(verify_server_cert(&id.0, true, Some(&wrong), false).is_ok());
+        let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
+        assert!(verify_server_cert(&id.0, true, &ServerTrust::SystemCas, &wrong).is_ok());
     }
 
     #[test]
     fn an_unprovable_issuer_is_refused_even_with_a_recorded_key() {
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let pin = KnownHost::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
-        let err = verify_server_cert(&leaf.0, false, Some(&pin), false).unwrap_err();
+        let pin = Tofu::Recorded(KnownHost::Pin(
+            varlink_http_core::public_key_pin(&leaf.0).unwrap(),
+        ));
+        let err = verify_server_cert(&leaf.0, false, &ServerTrust::SystemCas, &pin).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
     }
 
     #[test]
     fn self_signed_is_governed_by_known_hosts() {
         let (id, pin) = self_signed_pin();
+        let system = ServerTrust::SystemCas;
         // first contact, Transport::handshake records afterwards
-        assert!(verify_server_cert(&id.0, false, None, false).is_ok());
-        let recorded = KnownHost::Pin(pin);
-        assert!(verify_server_cert(&id.0, false, Some(&recorded), false).is_ok());
-        let wrong = KnownHost::Pin("AAAA=".to_string());
-        let err = verify_server_cert(&id.0, false, Some(&wrong), false).unwrap_err();
+        assert!(verify_server_cert(&id.0, false, &system, &Tofu::FirstContact).is_ok());
+        let recorded = Tofu::Recorded(KnownHost::Pin(pin));
+        assert!(verify_server_cert(&id.0, false, &system, &recorded).is_ok());
+        let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
+        let err = verify_server_cert(&id.0, false, &system, &wrong).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
+    }
+
+    /// A pin accepts its key whether the certificate is self-signed or issued
+    /// by a CA we do not have, and refuses any other key.
+    #[test]
+    fn a_pin_decides_by_the_key_alone() {
+        let (id, pin) = self_signed_pin();
+        // as varlink-httpd prints it, and bare
+        let printed = ServerTrust::Pin(format!("sha256//{pin}"));
+        assert!(verify_server_cert(&id.0, false, &printed, &Tofu::Off).is_ok());
+        let pinned = ServerTrust::Pin(pin);
+        assert!(verify_server_cert(&id.0, false, &pinned, &Tofu::Off).is_ok());
+
+        let ca = identity("ca", None, true);
+        let leaf = identity("leaf", Some(&ca), false);
+        let leaf_pin = ServerTrust::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
+        assert!(verify_server_cert(&leaf.0, false, &leaf_pin, &Tofu::Off).is_ok());
+
+        let err = verify_server_cert(&leaf.0, false, &pinned, &Tofu::Off).unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+    }
+
+    /// A certificate that validates, e.g. one a public CA issued to someone
+    /// else, must not get past a pin for another key.
+    #[test]
+    fn a_pin_refuses_another_key_even_when_the_chain_validates() {
+        let (id, pin) = self_signed_pin();
+        let (other, _) = self_signed_pin();
+        let pinned = ServerTrust::Pin(pin);
+        let err = verify_server_cert(&other.0, true, &pinned, &Tofu::Off).unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+        assert!(verify_server_cert(&id.0, true, &pinned, &Tofu::Off).is_ok());
+    }
+
+    /// Without a `known-hosts` file there is no first contact to trust.
+    #[test]
+    fn without_known_hosts_a_self_signed_server_is_refused() {
+        let (id, _) = self_signed_pin();
+        let err =
+            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &Tofu::Off).unwrap_err();
+        assert!(err.contains("known-hosts"), "{err}");
     }
 
     /// The downgrade the `ca` record exists to catch: a peer only ever reached
@@ -699,8 +809,9 @@ mod pin_tests {
     #[test]
     fn a_ca_backed_peer_refuses_a_later_self_signed_certificate() {
         let (id, _) = self_signed_pin();
+        let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
         let err =
-            verify_server_cert(&id.0, false, Some(&KnownHost::TrustAuthority), false).unwrap_err();
+            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &ca_backed).unwrap_err();
         assert!(err.contains("Refusing the downgrade"), "{err}");
     }
 
@@ -712,8 +823,9 @@ mod pin_tests {
         for cn in ["leaf", "leaf-after-rotation"] {
             // a fresh keypair each time round, so this is a real rotation
             let leaf = identity(cn, Some(&ca), false);
+            let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
             assert!(
-                verify_server_cert(&leaf.0, true, Some(&KnownHost::TrustAuthority), false).is_ok(),
+                verify_server_cert(&leaf.0, true, &ServerTrust::SystemCas, &ca_backed).is_ok(),
                 "{cn} must be accepted"
             );
         }
@@ -722,7 +834,8 @@ mod pin_tests {
     #[test]
     fn a_configured_ca_disables_first_contact_trust() {
         let (id, _) = self_signed_pin();
-        let err = verify_server_cert(&id.0, false, None, true).unwrap_err();
+        let ca = ServerTrust::Ca("/etc/varlinkctl-http/server-ca-file".into());
+        let err = verify_server_cert(&id.0, false, &ca, &Tofu::FirstContact).unwrap_err();
         assert!(err.contains("server-ca-file"), "{err}");
     }
 }
