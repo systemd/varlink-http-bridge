@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use varlink_http_client::ws::WsByteStream;
@@ -25,7 +24,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Our half of the close handshake, bounded so a stuck peer cannot
 /// hang the exit.
 async fn close_ws(ws: &mut WsByteStream<BoxedStream>) {
-    match tokio::time::timeout(CLOSE_TIMEOUT, ws.shutdown()).await {
+    match tokio::time::timeout(CLOSE_TIMEOUT, ws.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("WebSocket close failed: {e:#}"),
         Err(_) => warn!("timed out closing WebSocket"),
@@ -36,27 +35,35 @@ async fn close_ws(ws: &mut WsByteStream<BoxedStream>) {
 /// both sides have closed or we get SIGINT/SIGTERM.
 ///
 /// Whichever side closes first, the other is drained until it closes
-/// too. varlinkctl closes fd3 and then sends SIGTERM, so a peer that
-/// never answers our close is cut short by the signal branch.
+/// too. The end of fd3 is passed on as a half-close, so that the peer
+/// can still send what it has, e.g. the reply to piped input of an
+/// upgraded call. varlinkctl closes fd3 and then sends SIGTERM, so a
+/// peer that never closes is cut short by the signal branch.
+///
+/// A peer that keeps sending after the half-close, like a streaming
+/// call, may also get us there before the signal does: with nobody left
+/// on fd3 the next write to it fails. That is a normal end as well.
 async fn run_proxy(ws: Ws, mut fd3: UnixStream) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut ws = WsByteStream::new(ws);
 
     tokio::select! {
-        r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => {
-            let (up, down) = r.context("proxy")?;
-            debug!("done after {up} bytes fd3 -> WebSocket, {down} bytes back");
-        }
-        _ = sigint.recv() => {
-            debug!("SIGINT, closing WebSocket");
-            close_ws(&mut ws).await;
-        }
-        _ = sigterm.recv() => {
-            debug!("SIGTERM, closing WebSocket");
-            close_ws(&mut ws).await;
-        }
+        r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => match r {
+            Ok((up, down)) => {
+                debug!("done after {up} bytes fd3 -> WebSocket, {down} bytes back");
+            }
+            // only fd3 fails like this, WsByteStream has other kinds
+            // for the errors of the WebSocket
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                debug!("fd3 is gone, closing WebSocket");
+            }
+            Err(e) => return Err(e).context("proxy"),
+        },
+        _ = sigint.recv() => debug!("SIGINT, closing WebSocket"),
+        _ = sigterm.recv() => debug!("SIGTERM, closing WebSocket"),
     }
+    close_ws(&mut ws).await;
     Ok(())
 }
 
@@ -110,7 +117,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -148,10 +155,13 @@ mod tests {
             // stall so the client's kernel send buffer fills up
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut received = Vec::new();
-            // reading on past the close frame is what sends the reply
+            // ends with the client's reply to our close frame
             while let Some(msg) = ws.next().await {
-                if let Message::Binary(data) = msg.unwrap() {
-                    received.extend_from_slice(&data);
+                match msg.unwrap() {
+                    // the end of the upload, nothing to send back
+                    Message::Binary(data) if data.is_empty() => ws.close(None).await.unwrap(),
+                    Message::Binary(data) => received.extend_from_slice(&data),
+                    _ => {}
                 }
             }
             received
@@ -163,7 +173,7 @@ mod tests {
             .collect();
         let (_ours_read, mut ours_write) = ours.into_split();
         ours_write.write_all(&payload).await.unwrap();
-        // EOF makes run_proxy close the WebSocket and return
+        // EOF is passed on, the server closes and run_proxy returns
         drop(ours_write);
 
         proxy.await.unwrap().expect("run_proxy failed");
@@ -192,8 +202,12 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // idle until the close handshake is done
-            while ws.next().await.is_some() {}
+            // idle until the client is done, then close
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(&msg, Message::Binary(data) if data.is_empty()) {
+                    ws.close(None).await.unwrap();
+                }
+            }
         });
 
         // let the proxy run into fd3 backpressure while the server floods
@@ -207,10 +221,81 @@ mod tests {
             .expect("read download");
         assert!(received == expected, "downloaded payload differs");
 
-        // EOF makes run_proxy close the WebSocket and return
+        // EOF is passed on, the server closes and run_proxy returns
         drop(ours_write);
         proxy.await.unwrap().expect("run_proxy failed");
         server.await.unwrap();
+    }
+
+    /// The end of fd3 must not end the other direction: a peer that
+    /// only answers once its input is over, like a service that got
+    /// its request piped in, still gets its reply through.
+    #[tokio::test]
+    async fn test_run_proxy_half_close_keeps_the_reply() {
+        let (mut ws, mut ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Binary(data) if data.is_empty() => break,
+                    Message::Binary(data) => received.extend_from_slice(&data),
+                    other => panic!("unexpected message {other:?}"),
+                }
+            }
+            ws.send(Message::Binary(b"late reply".to_vec().into()))
+                .await
+                .unwrap();
+            ws.close(None).await.unwrap();
+            while ws.next().await.is_some() {}
+            received
+        });
+
+        ours.write_all(b"request").await.unwrap();
+        ours.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        ours.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"late reply");
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert_eq!(server.await.unwrap(), b"request");
+    }
+
+    /// A peer that ignores the half-close and keeps sending, like a
+    /// streaming call, runs the proxy into a write on an fd3 that nobody
+    /// reads anymore. That must end in a clean close and exit 0, and not
+    /// in a "Broken pipe" error.
+    #[tokio::test]
+    async fn test_run_proxy_fd3_gone_while_peer_keeps_sending() {
+        let (mut ws, ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            let mut got_end_of_input = false;
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Binary(data))) if data.is_empty() => {
+                            got_end_of_input = true;
+                        }
+                        // the loop only ends with the close frame
+                        Some(Ok(Message::Close(_))) => break,
+                        other => panic!("unexpected message {other:?}"),
+                    },
+                    _ = tick.tick() => {
+                        ws.send(Message::Binary(b"more".to_vec().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            // reading on is what sends our reply to the close frame
+            while ws.next().await.is_some() {}
+            got_end_of_input
+        });
+
+        drop(ours);
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert!(server.await.unwrap(), "server never got the half-close");
     }
 
     /// When the peer closes first the proxy must pass the EOF on to fd3,

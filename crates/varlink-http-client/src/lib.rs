@@ -22,6 +22,10 @@
 //! # }
 //! ```
 //!
+//! A shutdown of the stream is a half-close: it tells the bridge that our
+//! input has ended, and the service can still send its reply. It does not
+//! close the WebSocket, [`ws::WsByteStream::close`] does that.
+//!
 //! Trust and credentials, the CA or pinned key for the server and the API
 //! key or SSH key for the client, come from the same environment variables
 //! and config dir as `varlinkctl-http` uses; see the bridge README. An API
