@@ -86,7 +86,7 @@ async fn handle_node(stream: BoxedStream, nodes: &Nodes, peer: SocketAddr) -> Re
     let reservation = reservation.expect("the upgrade callback ran");
     let id = reservation.id;
 
-    let (h2, mut conn) = client_handshake(WsByteStream::new(ws))
+    let (h2, mut conn) = client_handshake(WsByteStream::new(ws).close_on_shutdown())
         .await
         .context("h2 handshake with node")?;
     let mut ping_pong = conn.ping_pong().expect("first ping_pong handle");

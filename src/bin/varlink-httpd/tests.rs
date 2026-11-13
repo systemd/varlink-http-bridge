@@ -860,6 +860,124 @@ async fn test_ws_close_from_client_is_answered() {
     assert_ws_closed_cleanly(&mut ws).await;
 }
 
+/// An empty message is the client's end of input: the service sees EOF
+/// and what it sends after that still reaches the client.
+#[tokio::test]
+async fn test_ws_empty_message_half_closes_the_varlink_socket() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let path = tmpdir.path().join("io.test.Stub");
+    let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind stub socket");
+    // answers only once its input has ended
+    let service = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut input = Vec::new();
+        conn.read_to_end(&mut input).await.unwrap();
+        conn.write_all(b"got: ").await.unwrap();
+        conn.write_all(&input).await.unwrap();
+    });
+    let server = run_test_server(path.to_str().expect("stub path not utf8")).await;
+    let url = format!("ws://{}/ws/services/io.test.Stub", server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS connect failed");
+
+    ws.send(WsMsg::Binary(b"request".to_vec().into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Binary(Vec::new().into())).await.unwrap();
+
+    let mut got = Vec::new();
+    loop {
+        match ws.next().await.expect("no close frame").expect("WS recv") {
+            WsMsg::Binary(data) => got.extend_from_slice(&data),
+            WsMsg::Close(_) => break,
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    assert_eq!(got, b"got: request");
+    service.await.unwrap();
+}
+
+/// The half-close on an upgraded connection, which is what a piped
+/// `varlinkctl call --upgrade` does.
+#[tokio::test]
+async fn test_ws_empty_message_half_closes_an_upgraded_connection() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Collect binary messages until `want` bytes are there.
+    async fn ws_read_bytes(ws: &mut WsStream, want: usize) -> Vec<u8> {
+        let mut got = Vec::new();
+        while got.len() < want {
+            match ws.next().await.expect("WS ended early").expect("WS recv") {
+                WsMsg::Binary(data) => got.extend_from_slice(&data),
+                other => panic!("unexpected message {other:?}"),
+            }
+        }
+        got
+    }
+
+    const UPGRADE_REQUEST: &[u8] = b"{\"method\":\"io.test.Stub.Upload\",\"upgrade\":true}\0";
+    const UPGRADE_REPLY: &[u8] = b"{\"parameters\":{}}\0";
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let path = tmpdir.path().join("io.test.Stub");
+    let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind stub socket");
+    let service = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; UPGRADE_REQUEST.len()];
+        conn.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, UPGRADE_REQUEST);
+        conn.write_all(UPGRADE_REPLY).await.unwrap();
+        // from here on it is raw bytes without any NUL
+        let mut ping = [0; 4];
+        conn.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"ping");
+        conn.write_all(b"pong").await.unwrap();
+        // answers only once its input has ended
+        let mut input = Vec::new();
+        conn.read_to_end(&mut input).await.unwrap();
+        conn.write_all(b"got: ").await.unwrap();
+        conn.write_all(&input).await.unwrap();
+    });
+    let server = run_test_server(path.to_str().expect("stub path not utf8")).await;
+    let url = format!("ws://{}/ws/services/io.test.Stub", server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS connect failed");
+
+    ws.send(WsMsg::Binary(UPGRADE_REQUEST.to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_read_bytes(&mut ws, UPGRADE_REPLY.len()).await,
+        UPGRADE_REPLY
+    );
+    // The "pong" has no NUL, so it only gets here before the service is
+    // done if the bridge really took the connection as upgraded.
+    ws.send(WsMsg::Binary(b"ping".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(ws_read_bytes(&mut ws, 4).await, b"pong");
+
+    ws.send(WsMsg::Binary(b"payload".to_vec().into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Binary(Vec::new().into())).await.unwrap();
+
+    let mut got = Vec::new();
+    loop {
+        match ws.next().await.expect("no close frame").expect("WS recv") {
+            WsMsg::Binary(data) => got.extend_from_slice(&data),
+            WsMsg::Close(_) => break,
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    assert_eq!(got, b"got: payload");
+    service.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_ws_close_when_varlink_socket_closes() {
     let stub = run_stub_varlink_socket(false);

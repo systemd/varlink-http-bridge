@@ -30,8 +30,14 @@ pub fn config_for_h2() -> WebSocketConfig {
 
 /// Binary payloads are the stream, a close frame is EOF and a text
 /// frame is an error, since only a confused peer or middlebox sends
-/// one. Shutdown sends a close frame so the peer sees EOF rather than
-/// a dropped connection.
+/// one.
+///
+/// Shutdown ends only our direction, as it does on a socket. A
+/// WebSocket has no half-close, so the end of our data is an empty
+/// message, which varlink-httpd passes on to the varlink service as
+/// the end of its input. The peer then closes once it has sent all it
+/// has. [`WsByteStream::close_on_shutdown`] is for a peer that does not
+/// know the empty message.
 pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
     readbuf: Bytes,
@@ -41,6 +47,18 @@ pub struct WsByteStream<S> {
     /// with a GOAWAY before it shuts down, and an error there would turn
     /// a clean close into a failed one.
     peer_closed: bool,
+    on_shutdown: OnShutdown,
+}
+
+/// What shutdown sends.
+#[derive(PartialEq)]
+enum OnShutdown {
+    /// A close frame, see [`WsByteStream::close_on_shutdown`].
+    Close,
+    /// An empty message.
+    EndOfInput,
+    /// Nothing, the empty message is on its way already.
+    Nothing,
 }
 
 impl<S> WsByteStream<S>
@@ -55,6 +73,7 @@ where
             readbuf: Bytes::new(),
             abrupt_close_is_eof: false,
             peer_closed: false,
+            on_shutdown: OnShutdown::EndOfInput,
         }
     }
 
@@ -65,6 +84,35 @@ where
     pub fn abrupt_close_as_eof(mut self) -> Self {
         self.abrupt_close_is_eof = true;
         self
+    }
+
+    /// Let shutdown send a close frame, which ends both directions. For
+    /// a peer that reads with a `WsByteStream` as well, such as the other
+    /// end of the h2 tunnel: it skips an empty message and so would
+    /// never see the end of our data.
+    #[must_use]
+    pub fn close_on_shutdown(mut self) -> Self {
+        self.on_shutdown = OnShutdown::Close;
+        self
+    }
+
+    /// Close the WebSocket for good, which shutdown alone does not:
+    /// send our close frame, or the reply to the one the peer sent.
+    ///
+    /// # Errors
+    ///
+    /// When the close frame cannot be sent to a peer that is still there.
+    pub async fn close(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_close(cx)).await
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match ready!(Pin::new(&mut self.ws).poll_close(cx)) {
+            // the peer closed first and tungstenite already answered
+            Ok(()) | Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => Poll::Ready(Ok(())),
+            Err(_) if self.peer_closed => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(io::Error::other(e))),
+        }
     }
 }
 
@@ -135,7 +183,9 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.peer_closed {
+        // an empty message is the end of our data, so an empty write
+        // must not send one
+        if this.peer_closed || buf.is_empty() {
             return Poll::Ready(Ok(buf.len()));
         }
         ready!(Pin::new(&mut this.ws).poll_ready(cx)).map_err(io::Error::other)?;
@@ -186,14 +236,18 @@ where
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match ready!(Pin::new(&mut this.ws).poll_close(cx)) {
-            // the peer closed first and tungstenite already answered
-            Ok(()) | Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => Poll::Ready(Ok(())),
-            Err(_) if this.peer_closed => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(io::Error::other(e))),
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.on_shutdown == OnShutdown::EndOfInput && !self.peer_closed {
+            ready!(Pin::new(&mut self.ws).poll_ready(cx)).map_err(io::Error::other)?;
+            Pin::new(&mut self.ws)
+                .start_send(Message::Binary(Bytes::new()))
+                .map_err(io::Error::other)?;
+            self.on_shutdown = OnShutdown::Nothing;
         }
+        if self.on_shutdown != OnShutdown::Close {
+            return self.poll_flush(cx);
+        }
+        self.get_mut().poll_close(cx)
     }
 }
 
@@ -232,7 +286,10 @@ pub mod test_helpers {
     /// h2 ever writes more than [`super::MAX_MESSAGE`] at once.
     pub async fn ws_pair() -> (WsByteStream<DuplexStream>, WsByteStream<DuplexStream>) {
         let (client, server) = raw_pair_with_config(Some(config_for_h2())).await;
-        (WsByteStream::new(client), WsByteStream::new(server))
+        (
+            WsByteStream::new(client).close_on_shutdown(),
+            WsByteStream::new(server).close_on_shutdown(),
+        )
     }
 }
 
@@ -257,7 +314,8 @@ mod tests {
     async fn roundtrip_and_eof() {
         // unlimited, a plain write_all is one message of any size
         let (client, server) = raw_pair().await;
-        let (mut client, mut server) = (WsByteStream::new(client), WsByteStream::new(server));
+        let mut client = WsByteStream::new(client).close_on_shutdown();
+        let mut server = WsByteStream::new(server);
 
         client.write_all(b"ping").await.unwrap();
         client.flush().await.unwrap();
@@ -325,6 +383,54 @@ mod tests {
             server.flush().await.unwrap();
             server.shutdown().await.unwrap();
         }
+    }
+
+    /// An empty message means the end of the data, so a write of
+    /// nothing must not turn into one.
+    #[tokio::test]
+    async fn an_empty_write_sends_no_message() {
+        use futures_util::StreamExt as _;
+
+        let (client, mut server) = raw_pair().await;
+        let mut client = WsByteStream::new(client);
+        assert_eq!(client.write(b"").await.unwrap(), 0);
+        client.write_all(b"data").await.unwrap();
+        client.flush().await.unwrap();
+
+        let msg = server.next().await.unwrap().unwrap();
+        assert_eq!(msg, Message::Binary(Bytes::from_static(b"data")));
+    }
+
+    /// The peer gets an empty message and no close frame, and what it
+    /// sends afterwards still arrives.
+    #[tokio::test]
+    async fn a_half_close_keeps_the_other_direction_open() {
+        use futures_util::StreamExt as _;
+
+        let (client, mut server) = raw_pair().await;
+        let mut client = WsByteStream::new(client);
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        // a second shutdown must not send a second end of input
+        client.shutdown().await.unwrap();
+
+        let msg = server.next().await.unwrap().unwrap();
+        assert_eq!(msg, Message::Binary(Bytes::from_static(b"request")));
+        let msg = server.next().await.unwrap().unwrap();
+        assert_eq!(msg, Message::Binary(Bytes::new()));
+
+        server
+            .send(Message::Binary(Bytes::from_static(b"late reply")))
+            .await
+            .unwrap();
+        server.close(None).await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"late reply");
+
+        // and close() still does the close handshake
+        client.close().await.unwrap();
+        assert!(matches!(server.next().await, Some(Ok(Message::Close(_)))));
     }
 
     #[tokio::test]

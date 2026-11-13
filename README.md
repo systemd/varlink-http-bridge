@@ -54,6 +54,15 @@ The websocket endpoint is a transparent proxy that forwards raw bytes
 between the websocket and the varlink unix socket in both directions.
 Clients are expected to speak raw varlink wire protocol.
 
+An empty binary message is the client's end of input: the bridge shuts
+down its write side to the service and keeps forwarding what the
+service still sends. A WebSocket cannot close one direction only, and a
+close frame ends the connection both ways.
+
+This holds at any point of the connection, before and after a varlink
+protocol upgrade. The client must not send any data after its end of
+input, the bridge ends the connection if it does.
+
 This makes the bridge compatible with libvarlink `varlink --bridge`
 via `websocat --binary`, enabling full varlink features (including
 `--more`) over the network.
