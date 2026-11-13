@@ -1296,6 +1296,16 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                     break;
                 };
                 let data = match msg {
+                    // The client's half-close, see WsByteStream: the
+                    // service gets its EOF and we go on sending what it
+                    // still has.
+                    Message::Binary(bin) if bin.is_empty() => {
+                        debug!("ws recv end of input");
+                        if let Err(e) = unix_write.shutdown().await {
+                            warn!("varlink shutdown error: {e}");
+                        }
+                        continue;
+                    }
                     Message::Binary(bin) => {
                         debug!("ws recv binary: {} bytes", bin.len());
                         bin.to_vec()

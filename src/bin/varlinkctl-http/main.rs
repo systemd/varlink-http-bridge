@@ -4,12 +4,15 @@
 //! socketpair on fd 3 and the bridge URL, we dial the varlink-httpd
 //! with varlink-http-client and copy bytes in both directions.
 
+use std::io;
 use std::os::fd::BorrowedFd;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail};
 use log::{debug, warn};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use varlink_http_client::{Client, VarlinkStream};
@@ -24,38 +27,103 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Our half of the close handshake, bounded so a stuck peer cannot
 /// hang the exit.
 async fn close_ws(ws: &mut VarlinkStream) {
-    match tokio::time::timeout(CLOSE_TIMEOUT, ws.shutdown()).await {
+    match tokio::time::timeout(CLOSE_TIMEOUT, ws.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("WebSocket close failed: {e:#}"),
         Err(_) => warn!("timed out closing WebSocket"),
     }
 }
 
+/// fd3 with a reset reported as `BrokenPipe`, so that there is a single
+/// error kind for "varlinkctl is gone".
+struct Fd3(UnixStream);
+
+impl AsyncRead for Fd3 {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // We get an ECONNRESET from the kernel if varlinkctl exits
+        // while data we wrote to fd3 is still unread on its end. It
+        // does mean the pipe is broken, so we map this error to
+        // BrokenPipe (which normally can only happen on write) so that
+        // we can differentiate between "fd3 pipe broken" and the
+        // WebSocket, which can also report ECONNRESET
+        // (copy_bidirectional() will not tell us which end of the
+        // connection caused the error).
+        Pin::new(&mut self.0).poll_read(cx, buf).map_err(|e| {
+            if e.kind() == io::ErrorKind::ConnectionReset {
+                io::Error::new(io::ErrorKind::BrokenPipe, e)
+            } else {
+                e
+            }
+        })
+    }
+}
+
+impl AsyncWrite for Fd3 {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 /// Forward data between fd3 and the WebSocket in both directions until
-/// both sides have closed or we get SIGINT/SIGTERM.
+/// both sides have closed or we get SIGINT/SIGTERM. The WebSocket is
+/// closed in any case, also when the proxy fails.
 ///
 /// Whichever side closes first, the other is drained until it closes
-/// too. varlinkctl closes fd3 and then sends SIGTERM, so a peer that
-/// never answers our close is cut short by the signal branch.
-async fn run_proxy(mut ws: VarlinkStream, mut fd3: UnixStream) -> Result<()> {
+/// too. The end of fd3 is passed on as a half-close, so that the peer
+/// can still send what it has, e.g. the reply to piped input of an
+/// upgraded call. varlinkctl closes fd3 and then sends SIGTERM, so a
+/// peer that never closes is cut short by the signal branch.
+///
+/// A peer that keeps sending after the half-close, like a streaming
+/// call, may also get us there before the signal does: with nobody left
+/// on fd3 the next write to it fails, or the read if varlinkctl left
+/// replies unread. That is a normal end as well.
+async fn run_proxy(mut ws: VarlinkStream, fd3: UnixStream) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut fd3 = Fd3(fd3);
 
-    tokio::select! {
-        r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => {
-            let (up, down) = r.context("proxy")?;
-            debug!("done after {up} bytes fd3 -> WebSocket, {down} bytes back");
-        }
+    let result = tokio::select! {
+        r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => match r {
+            Ok((up, down)) => {
+                debug!("done after {up} bytes fd3 -> WebSocket, {down} bytes back");
+                Ok(())
+            }
+            // copy_bidirectional() does not say which side failed, but
+            // this kind can only be fd3: WsByteStream never returns it
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                debug!("fd3 is gone, closing WebSocket");
+                Ok(())
+            }
+            Err(e) => Err(e).context("proxy"),
+        },
         _ = sigint.recv() => {
             debug!("SIGINT, closing WebSocket");
-            close_ws(&mut ws).await;
+            Ok(())
         }
         _ = sigterm.recv() => {
             debug!("SIGTERM, closing WebSocket");
-            close_ws(&mut ws).await;
+            Ok(())
         }
-    }
-    Ok(())
+    };
+    close_ws(&mut ws).await;
+    result
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -109,7 +177,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
     use varlink_http_client::BoxedStream;
@@ -149,10 +217,13 @@ mod tests {
             // stall so the client's kernel send buffer fills up
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut received = Vec::new();
-            // reading on past the close frame is what sends the reply
+            // ends with the client's reply to our close frame
             while let Some(msg) = ws.next().await {
-                if let Message::Binary(data) = msg.unwrap() {
-                    received.extend_from_slice(&data);
+                match msg.unwrap() {
+                    // the end of the upload, nothing to send back
+                    Message::Binary(data) if data.is_empty() => ws.close(None).await.unwrap(),
+                    Message::Binary(data) => received.extend_from_slice(&data),
+                    _ => {}
                 }
             }
             received
@@ -164,7 +235,7 @@ mod tests {
             .collect();
         let (_ours_read, mut ours_write) = ours.into_split();
         ours_write.write_all(&payload).await.unwrap();
-        // EOF makes run_proxy close the WebSocket and return
+        // EOF is passed on, the server closes and run_proxy returns
         drop(ours_write);
 
         proxy.await.unwrap().expect("run_proxy failed");
@@ -193,8 +264,12 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // idle until the close handshake is done
-            while ws.next().await.is_some() {}
+            // idle until the client is done, then close
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(&msg, Message::Binary(data) if data.is_empty()) {
+                    ws.close(None).await.unwrap();
+                }
+            }
         });
 
         // let the proxy run into fd3 backpressure while the server floods
@@ -208,10 +283,128 @@ mod tests {
             .expect("read download");
         assert!(received == expected, "downloaded payload differs");
 
-        // EOF makes run_proxy close the WebSocket and return
+        // EOF is passed on, the server closes and run_proxy returns
         drop(ours_write);
         proxy.await.unwrap().expect("run_proxy failed");
         server.await.unwrap();
+    }
+
+    /// The end of fd3 must not end the other direction: a peer that
+    /// only answers once its input is over, like a service that got
+    /// its request piped in, still gets its reply through.
+    #[tokio::test]
+    async fn test_run_proxy_half_close_keeps_the_reply() {
+        let (mut ws, mut ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Binary(data) if data.is_empty() => break,
+                    Message::Binary(data) => received.extend_from_slice(&data),
+                    other => panic!("unexpected message {other:?}"),
+                }
+            }
+            ws.send(Message::Binary(b"late reply".to_vec().into()))
+                .await
+                .unwrap();
+            ws.close(None).await.unwrap();
+            while ws.next().await.is_some() {}
+            received
+        });
+
+        ours.write_all(b"request").await.unwrap();
+        ours.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        ours.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"late reply");
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert_eq!(server.await.unwrap(), b"request");
+    }
+
+    /// A peer that keeps sending no matter what, like a streaming call,
+    /// until it gets the close frame. Returns if it saw the half-close.
+    fn spawn_streaming_server(mut ws: ServerWs) -> tokio::task::JoinHandle<bool> {
+        tokio::spawn(async move {
+            let mut got_end_of_input = false;
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Binary(data))) if data.is_empty() => {
+                            got_end_of_input = true;
+                        }
+                        // the loop only ends with the close frame
+                        Some(Ok(Message::Close(_))) => break,
+                        other => panic!("unexpected message {other:?}"),
+                    },
+                    _ = tick.tick() => {
+                        ws.send(Message::Binary(b"more".to_vec().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            // reading on is what sends our reply to the close frame
+            while ws.next().await.is_some() {}
+            got_end_of_input
+        })
+    }
+
+    /// A peer that ignores the half-close and keeps sending, like a
+    /// streaming call, runs the proxy into a write on an fd3 that nobody
+    /// reads anymore. That must end in a clean close and exit 0, and not
+    /// in a "Broken pipe" error.
+    #[tokio::test]
+    async fn test_run_proxy_fd3_gone_while_peer_keeps_sending() {
+        let (ws, ours, proxy) = proxy_fixture().await;
+        let server = spawn_streaming_server(ws);
+
+        drop(ours);
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert!(server.await.unwrap(), "server never got the half-close");
+    }
+
+    /// varlinkctl going away with replies it never read, as on Ctrl-C
+    /// in a streaming call, resets fd3 instead of just ending it. That
+    /// must end in a clean close and exit 0 as well, and not in a
+    /// "Connection reset by peer" error.
+    #[tokio::test]
+    async fn test_run_proxy_fd3_reset_with_unread_replies() {
+        let (ws, mut ours, proxy) = proxy_fixture().await;
+        let server = spawn_streaming_server(ws);
+
+        let mut chunk = [0u8; 4];
+        ours.read_exact(&mut chunk).await.unwrap();
+        // the kernel only resets when there is unread data on fd3
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(ours);
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        // no half-close here, a reset ends both directions at once
+        server.await.unwrap();
+    }
+
+    /// An error of the proxy must not just drop the connection, the
+    /// peer still gets a close frame.
+    #[tokio::test]
+    async fn test_run_proxy_error_still_closes_the_websocket() {
+        let (mut ws, _ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            // not allowed on a varlink connection, the proxy fails on it
+            ws.send(Message::Text("bad".into())).await.unwrap();
+            let mut got_close = false;
+            while let Some(msg) = ws.next().await {
+                if matches!(msg, Ok(Message::Close(_))) {
+                    got_close = true;
+                }
+            }
+            got_close
+        });
+
+        proxy.await.unwrap().expect_err("run_proxy must fail");
+        assert!(server.await.unwrap(), "server never got a close frame");
     }
 
     /// When the peer closes first the proxy must pass the EOF on to fd3,

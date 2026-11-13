@@ -198,9 +198,13 @@ async fn dial(
         .context("tunnel WebSocket upgrade")?;
         // middleboxes reap long-lived connections without a close frame,
         // that is a routine end of a tunnel and not an error
-        server_handshake(WsByteStream::new(ws).abrupt_close_as_eof())
-            .await
-            .context("h2 handshake with relay")
+        server_handshake(
+            WsByteStream::new(ws)
+                .close_on_shutdown()
+                .abrupt_close_as_eof(),
+        )
+        .await
+        .context("h2 handshake with relay")
     };
     tokio::time::timeout(timeouts.dial_timeout, prelude)
         .await

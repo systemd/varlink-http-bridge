@@ -27,6 +27,10 @@
 //! # }
 //! ```
 //!
+//! A shutdown of the stream is a half-close: it tells the bridge that our
+//! input has ended, and the service can still send its reply. It does not
+//! close the WebSocket, [`ws::WsByteStream::close`] does that.
+//!
 //! A program that knows the server key and holds its own credential pins
 //! the one and offers the other; the variables and the config dir above are
 //! not read then:
