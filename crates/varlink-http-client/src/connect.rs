@@ -84,13 +84,14 @@ fn known_hosts_path() -> Option<PathBuf> {
     Some(dir.join("known-hosts"))
 }
 
-/// What is recorded for `peer` in the `known-hosts` file at `path`.
-fn lookup_known_host(path: &Path, peer: &str) -> Result<Option<KnownHost>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+/// Find the entry for `peer` in the open `known-hosts` file `f`, which the
+/// caller must have locked. `path` only names that file in errors.
+fn find_known_host(f: &mut std::fs::File, path: &Path, peer: &str) -> Result<Option<KnownHost>> {
+    use std::io::Read as _;
+
+    let mut text = String::new();
+    f.read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
     for line in text.lines() {
         let line = line
             .split_once('#')
@@ -108,7 +109,23 @@ fn lookup_known_host(path: &Path, peer: &str) -> Result<Option<KnownHost>> {
     Ok(None)
 }
 
-/// Append what `peer` proved on first contact to the `known-hosts` file.
+/// Look up what the `known-hosts` file at `path` records for `peer`.
+/// `None` if there is no entry or no file yet.
+fn lookup_known_host(path: &Path, peer: &str) -> Result<Option<KnownHost>> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    // A concurrent record_known_host() could otherwise show us half a line,
+    // which would parse as a wrong pin.
+    f.lock_shared()
+        .with_context(|| format!("locking {}", path.display()))?;
+    find_known_host(&mut f, path, peer)
+}
+
+/// Record what `peer` proved on first contact in the `known-hosts` file.
+/// Fails if an entry for `peer` exists that contradicts `host`.
 fn record_known_host(path: &Path, peer: &str, host: &KnownHost) -> Result<()> {
     use std::io::Write as _;
 
@@ -117,10 +134,27 @@ fn record_known_host(path: &Path, peer: &str, host: &KnownHost) -> Result<()> {
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(f, "{peer}\t{host}").with_context(|| format!("writing {}", path.display()))?;
+    // This can run concurrently so we need the flock
+    f.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    if let Some(recorded) = find_known_host(&mut f, path, peer)? {
+        if recorded != *host {
+            anyhow::bail!(
+                "another client recorded {recorded} in {} meanwhile, but this \
+                 connection saw {host}. One of the two did not reach the real server.",
+                path.display()
+            );
+        }
+        debug!("{peer}: another client recorded {recorded} meanwhile, keeping that.");
+        return Ok(());
+    }
+    let line = format!("{peer}\t{host}\n");
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
 
     match host {
         KnownHost::Pin(_) => warn!(
@@ -523,6 +557,58 @@ mod pin_tests {
         for (peer, host) in &entries {
             assert_eq!(lookup_known_host(&path, peer).unwrap().as_ref(), Some(host));
         }
+    }
+
+    #[test]
+    fn concurrent_first_contacts_record_a_peer_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known-hosts");
+        let pin = "A".repeat(43) + "=";
+        // every thread meets every peer, as if 16 clients contacted 8 servers at once
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                let host = KnownHost::Pin(pin.clone());
+                std::thread::spawn(move || {
+                    for i in 0..8 {
+                        record_known_host(&path, &format!("peer{i}:1031"), &host).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<_> = text.lines().collect();
+        lines.sort_unstable();
+        let expected: Vec<_> = (0..8)
+            .map(|i| format!("peer{i}:1031\tsha256//{pin}"))
+            .collect();
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn recording_refuses_what_a_concurrent_client_contradicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known-hosts");
+        let pin = |s: &str| KnownHost::Pin(s.to_string());
+
+        record_known_host(&path, "a:1031", &pin("AAAA=")).unwrap();
+        record_known_host(&path, "a:1031", &pin("AAAA=")).unwrap();
+        // a different key means one of the two clients was intercepted
+        let err = record_known_host(&path, "a:1031", &pin("BBBB=")).unwrap_err();
+        assert!(err.to_string().contains("another client recorded"), "{err}");
+        record_known_host(&path, "a:1031", &KnownHost::TrustAuthority).unwrap_err();
+
+        record_known_host(&path, "b:1031", &KnownHost::TrustAuthority).unwrap();
+        // self-signed after a trust authority vouched is a downgrade
+        record_known_host(&path, "b:1031", &pin("AAAA=")).unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a:1031\tsha256//AAAA=\nb:1031\tca\n"
+        );
     }
 
     type Identity = (
