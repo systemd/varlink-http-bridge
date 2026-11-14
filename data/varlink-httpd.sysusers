@@ -1,0 +1,7 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of varlink-http-bridge.
+
+# The service runs with DynamicUser=yes, so its secrets in /etc/varlink-httpd/
+# need a group to belong to instead.
+g varlink-httpd -
