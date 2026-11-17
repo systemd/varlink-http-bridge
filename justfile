@@ -36,9 +36,9 @@ check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_bin
 	cargo clippy --all-targets --no-default-features --locked -- -W clippy::pedantic -D warnings
 
 test:
-	cargo test --locked
+	cargo test --workspace --locked
 	# without default features so that cfg(not(feature)) tests run too
-	cargo test --no-default-features --locked
+	cargo test --workspace --no-default-features --locked
 
 # the httpd service
 srv_binary := "target/release/varlink-httpd"

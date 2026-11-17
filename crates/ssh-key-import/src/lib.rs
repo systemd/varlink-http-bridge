@@ -84,7 +84,7 @@ pub fn validate(text: &str) -> anyhow::Result<Vec<ssh_key::PublicKey>> {
     let mut tmp = tempfile::NamedTempFile::new().context("failed to create tempfile")?;
     tmp.write_all(text.as_bytes())
         .context("failed to write tempfile")?;
-    sshauth::keyfile::parse_authorized_keys(tmp.path(), true)
+    sshauth::keyfile::parse_authorized_keys(tmp.path(), false)
         .context("failed to parse authorized keys")
 }
 
