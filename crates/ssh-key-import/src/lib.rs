@@ -46,8 +46,12 @@ pub fn resolve_key_url(source: &str) -> anyhow::Result<String> {
 /// response contains no valid SSH public keys (e.g. an HTML error page
 /// from a mistyped URL).
 pub fn fetch(source: &str) -> anyhow::Result<AuthorizedKeys> {
-    let url = resolve_key_url(source)?;
+    fetch_url(&resolve_key_url(source)?)
+}
 
+/// Fetch and validate the authorized keys at `url`, without the checks
+/// of [`resolve_key_url`].
+fn fetch_url(url: &str) -> anyhow::Result<AuthorizedKeys> {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();
@@ -56,7 +60,7 @@ pub fn fetch(source: &str) -> anyhow::Result<AuthorizedKeys> {
         .build()
         .new_agent();
     let text = agent
-        .get(&url)
+        .get(url)
         .call()
         .with_context(|| format!("failed to fetch keys from {url}"))?
         .body_mut()
@@ -91,6 +95,59 @@ pub fn validate(text: &str) -> anyhow::Result<Vec<ssh_key::PublicKey>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, BufReader};
+    use std::net::TcpListener;
+
+    const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDZYUGiotDpNU07XsWdzpzhocaq8GrWroAYBBjHkagdm alice@laptop";
+
+    /// Serve one HTTP reply with `status` and `body` and return its URL.
+    fn serve_once(status: &'static str, body: &str) -> String {
+        let body = body.to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/keys", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while request.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        url
+    }
+
+    #[test]
+    fn fetch_url_returns_the_served_keys() {
+        let body = format!("{ED25519_KEY}\n");
+        let imported = fetch_url(&serve_once("200 OK", &body)).unwrap();
+        assert_eq!(imported.text, body);
+        assert_eq!(imported.keys.len(), 1);
+        assert_eq!(imported.keys[0].to_openssh().unwrap(), ED25519_KEY);
+    }
+
+    #[test]
+    fn fetch_url_rejects_a_reply_without_keys() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                "<!DOCTYPE html><html>not a key</html>",
+                "SSH public keys",
+            ),
+            ("200 OK", "", "no valid SSH public keys"),
+            ("404 Not Found", "Not Found", "failed to fetch keys"),
+        ] {
+            let Err(err) = fetch_url(&serve_once(status, body)) else {
+                panic!("{status} {body:?} was accepted");
+            };
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
 
     #[test]
     fn resolve_gh_shorthand() {
