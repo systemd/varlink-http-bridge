@@ -2250,8 +2250,7 @@ fn test_call_mode_from_params() {
     use crate::CallMode;
 
     fn params(more: Option<&str>) -> HashMap<String, String> {
-        more.map(|v| HashMap::from([("more".to_string(), v.to_string())]))
-            .unwrap_or_default()
+        more.map_or_default(|v| HashMap::from([("more".to_string(), v.to_string())]))
     }
 
     fn oneway(oneway: &str, more: Option<&str>) -> HashMap<String, String> {
