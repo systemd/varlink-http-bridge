@@ -515,6 +515,9 @@ The varlinkctl-http uses two methods for signing, checked in order:
    $ export VARLINK_SSH_KEY=~/.ssh/id_ed25519
    ```
 
+   An encrypted private key can only sign through the SSH agent: add it
+   with `ssh-add`.
+
 2. **`SSH_AUTH_SOCK`** — fall back to the SSH agent, using the first
    Ed25519 or ECDSA key it finds. No setup required when the agent is
    running.

@@ -29,7 +29,8 @@ enum SshKey {
     },
     /// A public key signed through the ssh-agent.  Used both when only
     /// `SSH_AUTH_SOCK` is set and when `VARLINK_SSH_KEY` points to a
-    /// hardware token (sk-*) or a public-key-only file.
+    /// hardware token key (sk-*), an encrypted private key or a
+    /// public-key-only file.
     AgentKey {
         auth_sock: String,
         key: ssh_key::PublicKey,
@@ -243,29 +244,32 @@ pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
 /// Return all available SSH keys for authentication.
 ///
 /// - `key_path` with a normal private key: a single `PrivateKey`.
-/// - `key_path` with a hardware token or public-key-only file: a single
-///   `AgentKey` (signed through the agent at `auth_sock`).
+/// - `key_path` with a hardware token key, an encrypted private key or only
+///   a public key: a single `AgentKey` (signed through the agent at
+///   `auth_sock`).
 /// - `auth_sock` only: every non-RSA key from the agent.
 /// - Neither: an empty vec (no auth).
 async fn list_ssh_keys(key_path: Option<&str>, auth_sock: Option<&str>) -> Result<Vec<SshKey>> {
     if let Some(key_path) = key_path {
-        // If a normal (non-hardware-token) private key exists, sign directly.
-        if let Some(privkey) = read_private_key(key_path)?
-            && !requires_agent(&privkey.algorithm())
-        {
-            return Ok(vec![SshKey::PrivateKey {
-                path: key_path.to_owned(),
-                key: Box::new(privkey),
-            }]);
-        }
-
-        // Otherwise delegate to the SSH agent: either the key is a
-        // hardware token (sk-*) or only the .pub file exists on disk.
-        let pubkey = read_public_key(key_path)?;
+        let pubkey = match read_private_key(key_path)? {
+            // An unencrypted, non-hardware-token private key signs directly.
+            Some(privkey) if !privkey.is_encrypted() && !requires_agent(&privkey.algorithm()) => {
+                return Ok(vec![SshKey::PrivateKey {
+                    path: key_path.to_owned(),
+                    key: Box::new(privkey),
+                }]);
+            }
+            // A hardware token key (sk-*) and an encrypted key can only sign
+            // through the SSH agent. Their files store the public key
+            // unencrypted, so no .pub file is needed to find the key there.
+            Some(privkey) => privkey.public_key().clone(),
+            // Only the .pub file exists on disk.
+            None => read_public_key(key_path)?,
+        };
         let auth_sock = auth_sock.with_context(|| {
             format!(
-                "{VARLINK_SSH_KEY_ENV} requires agent-based signing (hardware token \
-                 or public key only); set {SSH_AUTH_SOCK_ENV}"
+                "{VARLINK_SSH_KEY_ENV} requires agent-based signing (hardware token key, \
+                 encrypted private key or public key only); set {SSH_AUTH_SOCK_ENV}"
             )
         })?;
         let fp = pubkey.fingerprint(ssh_key::HashAlg::Sha256);
@@ -398,6 +402,43 @@ mod tests {
 
     fn make_signing_error() -> anyhow::Error {
         anyhow::anyhow!("agent refused operation").context(SigningFailed)
+    }
+
+    const ENCRYPTED_OPENSSH_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAs4U5OTx
+pJQz9n5CC9hueiAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIJzpIVYSYi1HTRJk
+M5XaGJkYC6+fw2SICxlSJQC5WK+3AAAAkNe45MiHjROFtso/EbHFZ2jhoBMGe3kpqZDfNC
+3d8bK5jIRIHS9pDSTJOUN//0B9cWxSy+OHUX7r7bCfWUtDQkYMRZ/1ziXhHN4N/FP1GItL
+77ncfjF/caYGSnvbJerUH2HtUOHaImhtKleaqkEBo6/eZCBxiaOuhYCwWb1sNUgGlw9KlJ
+2GrS0ySFwa+i6eQA==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    #[tokio::test]
+    async fn test_encrypted_key_uses_agent() {
+        // An encrypted private key can only sign through the SSH agent, and
+        // its public key comes from the private key file, so no .pub file is
+        // needed. Without SSH_AUTH_SOCK, list_ssh_keys() must fail with an
+        // error that names SSH_AUTH_SOCK. With a socket that doesn't exist,
+        // it must fail listing the agent keys, which shows that it got the
+        // public key without a .pub file.
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        std::fs::write(&key_path, ENCRYPTED_OPENSSH_PRIVATE_KEY).unwrap();
+        let key_path = key_path.to_str().unwrap();
+        let sock = dir.path().join("agent.sock");
+
+        for (auth_sock, expected) in [
+            (None, SSH_AUTH_SOCK_ENV),
+            (sock.to_str(), "listing ssh-agent keys"),
+        ] {
+            let err = list_ssh_keys(Some(key_path), auth_sock)
+                .await
+                .err()
+                .expect("list_ssh_keys() returned keys for an encrypted key without an agent");
+            let err = format!("{err:#}");
+            assert!(err.contains(expected), "{err}");
+        }
     }
 
     #[test]
