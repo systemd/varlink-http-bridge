@@ -87,26 +87,36 @@ fn init_test_logger() {
 
 /// Build (if needed) and return the path to the varlinkctl-helper binary.
 fn helper_binary() -> std::path::PathBuf {
-    static BUILD: std::sync::Once = std::sync::Once::new();
+    static HELPER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-    let test_exe = std::env::current_exe().expect("failed to get test exe path");
-    // test binary is in target/debug/deps/, helper is in target/debug/
-    let helper = test_exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("varlinkctl-http");
+    HELPER
+        .get_or_init(|| {
+            // Ask cargo where it put the binary, the layout of the target
+            // directory is not stable so it cannot be derived from the
+            // path of the test executable.
+            let output = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--bin", "varlinkctl-http", "--message-format=json"])
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .expect("failed to run cargo build");
+            assert!(
+                output.status.success(),
+                "cargo build --bin varlinkctl-http failed"
+            );
 
-    BUILD.call_once(|| {
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--bin", "varlinkctl-http"])
-            .status()
-            .expect("failed to run cargo build");
-        assert!(status.success(), "cargo build --bin varlinkctl-http failed");
-    });
-
-    helper
+            std::str::from_utf8(&output.stdout)
+                .expect("cargo build output is not valid UTF-8")
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|msg| {
+                    msg["reason"] == "compiler-artifact"
+                        && msg["target"]["name"] == "varlinkctl-http"
+                        && msg["executable"].is_string()
+                })
+                .and_then(|msg| msg["executable"].as_str().map(std::path::PathBuf::from))
+                .expect("cargo build did not report the varlinkctl-http executable")
+        })
+        .clone()
 }
 
 /// Run `varlinkctl call <method> <params>` against `bridge_url`,
