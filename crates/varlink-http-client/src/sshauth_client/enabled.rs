@@ -258,7 +258,7 @@ impl fmt::Display for KeyInfo<'_> {
 /// - Neither: an empty vec (no auth).
 async fn list_ssh_keys(key_path: Option<&str>, auth_sock: Option<&str>) -> Result<Vec<SshKey>> {
     if let Some(key_path) = key_path {
-        let pubkey = match read_private_key(key_path)? {
+        let (pubkey, missing_hint) = match read_private_key(key_path)? {
             // An unencrypted, non-hardware-token private key signs directly.
             Some(privkey) if !privkey.is_encrypted() && !requires_agent(&privkey.algorithm()) => {
                 return Ok(vec![SshKey::PrivateKey {
@@ -266,12 +266,15 @@ async fn list_ssh_keys(key_path: Option<&str>, auth_sock: Option<&str>) -> Resul
                     key: Box::new(privkey),
                 }]);
             }
-            // A hardware token key (sk-*) and an encrypted key can only sign
-            // through the SSH agent. Their files store the public key
-            // unencrypted, so no .pub file is needed to find the key there.
-            Some(privkey) => privkey.public_key().clone(),
+            // A hardware token key and an encrypted key can only sign through
+            // the SSH agent. Their files store the public key unencrypted, so
+            // no .pub file is needed to find the key there.
+            Some(privkey) => (privkey.public_key().clone(), "add it with ssh-add"),
             // Only the .pub file exists on disk.
-            None => read_public_key(key_path)?,
+            None => (
+                read_public_key(key_path)?,
+                "add it with ssh-add or provide the private key",
+            ),
         };
         let auth_sock = auth_sock.with_context(|| {
             format!(
@@ -287,10 +290,7 @@ async fn list_ssh_keys(key_path: Option<&str>, auth_sock: Option<&str>) -> Resul
             .iter()
             .any(|k| k.fingerprint(ssh_key::HashAlg::Sha256) == fp)
         {
-            bail!(
-                "{VARLINK_SSH_KEY_ENV} key {fp} not found in ssh-agent; \
-                 add it with ssh-add or provide the private key"
-            );
+            bail!("{VARLINK_SSH_KEY_ENV} key {fp} not found in ssh-agent; {missing_hint}");
         }
         return Ok(vec![SshKey::AgentKey {
             auth_sock: auth_sock.to_owned(),
