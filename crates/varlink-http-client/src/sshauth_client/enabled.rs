@@ -42,24 +42,10 @@ impl fmt::Display for SshKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SshKey::PrivateKey { path, key } => {
-                write!(
-                    f,
-                    "{} {} ({}) from {}",
-                    key.algorithm(),
-                    key.fingerprint(ssh_key::HashAlg::Sha256),
-                    key.comment(),
-                    path,
-                )
+                write!(f, "{} from {path}", KeyInfo(key.public_key()))
             }
             SshKey::AgentKey { auth_sock, key } => {
-                write!(
-                    f,
-                    "{} {} ({}) from agent {}",
-                    key.algorithm(),
-                    key.fingerprint(ssh_key::HashAlg::Sha256),
-                    key.comment(),
-                    auth_sock,
-                )
+                write!(f, "{} from agent {auth_sock}", KeyInfo(key))
             }
         }
     }
@@ -240,6 +226,26 @@ fn is_signing_failure(err: &anyhow::Error) -> bool {
 pub(crate) fn is_http_unauthorized(err: &anyhow::Error) -> bool {
     err.downcast_ref::<tungstenite::Error>()
         .is_some_and(|e| matches!(e, tungstenite::Error::Http(r) if r.status() == 401))
+}
+
+/// Displays the algorithm and fingerprint of a key, and its comment if it has
+/// one.
+struct KeyInfo<'a>(&'a ssh_key::PublicKey);
+
+impl fmt::Display for KeyInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key = self.0;
+        write!(
+            f,
+            "{} {}",
+            key.algorithm(),
+            key.fingerprint(ssh_key::HashAlg::Sha256)
+        )?;
+        if key.comment().is_empty() {
+            return Ok(());
+        }
+        write!(f, " ({})", key.comment())
+    }
 }
 
 /// Return all available SSH keys for authentication.
@@ -444,15 +450,41 @@ M5XaGJkYC6+fw2SICxlSJQC5WK+3AAAAkNe45MiHjROFtso/EbHFZ2jhoBMGe3kpqZDfNC
         }
     }
 
+    /// An Ed25519 private key in PKCS#8, which has no comment.
+    const PKCS8_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJp/ivWBrtAi7u6Z72WTMWrpu1zVlz4Ls6+mJkD8mu2c
+-----END PRIVATE KEY-----
+";
+
+    #[test]
+    fn test_ssh_key_display_leaves_out_an_empty_comment() {
+        // A PKCS#8 key has no comment, and log lines must not show an empty
+        // pair of parentheses for it. A key with a comment still shows it.
+        let privkey = ssh_key_import::parse_private_key(PKCS8_PRIVATE_KEY).unwrap();
+        let fp = privkey.fingerprint(ssh_key::HashAlg::Sha256);
+        let mut pubkey = privkey.public_key().clone();
+        let key = SshKey::PrivateKey {
+            path: "/keys/id".to_string(),
+            key: Box::new(privkey),
+        };
+        assert_eq!(key.to_string(), format!("ssh-ed25519 {fp} from /keys/id"));
+
+        pubkey.set_comment("alice@laptop");
+        let key = SshKey::AgentKey {
+            auth_sock: "/run/agent.sock".to_string(),
+            key: pubkey,
+        };
+        assert_eq!(
+            key.to_string(),
+            format!("ssh-ed25519 {fp} (alice@laptop) from agent /run/agent.sock")
+        );
+    }
+
     #[tokio::test]
     async fn test_pkcs8_key_signs_without_agent() {
         // vmspawn writes its private keys as PKCS#8. Such a key must load
         // from VARLINK_SSH_KEY and sign directly, without an agent and
         // without a .pub file.
-        const PKCS8_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIJp/ivWBrtAi7u6Z72WTMWrpu1zVlz4Ls6+mJkD8mu2c
------END PRIVATE KEY-----
-";
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("key");
         std::fs::write(&key_path, PKCS8_PRIVATE_KEY).unwrap();
