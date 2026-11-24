@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-//! Fetch and validate SSH `authorized_keys` from a remote source.
+//! Fetch and validate SSH `authorized_keys` from a remote source, and parse
+//! SSH private keys in the OpenSSH format or as PKCS#8.
 //!
-//! Shared by `varlink-httpd import-ssh` and `amutablectl` so the
-//! `gh:<user>` / `https://` resolution and key validation live in one
-//! place instead of being duplicated per consumer.
+//! Shared by `varlink-httpd import-ssh` and `varlink-http-client` so the
+//! `gh:<user>` / `https://` resolution and key parsing and validation live
+//! in one place instead of being duplicated per consumer.
 
 use anyhow::{Context, bail};
 use std::io::Write as _;
 
+mod key;
+
+pub use key::parse_private_key;
 pub use ssh_key;
 
 /// A validated set of authorized keys.
