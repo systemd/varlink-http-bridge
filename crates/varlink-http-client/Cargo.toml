@@ -7,7 +7,7 @@ description = "Client side of the varlink-http-bridge: dial a varlink-httpd and 
 
 [features]
 default = ["sshauth"]
-sshauth = ["dep:ssh-key", "dep:sshauth", "varlink-http-core/sshauth"]
+sshauth = ["dep:ssh-key", "dep:ssh-key-import", "dep:sshauth", "dep:zeroize", "varlink-http-core/sshauth"]
 
 [dependencies]
 varlink-http-core = { path = "../varlink-http-core", default-features = false }
@@ -25,6 +25,8 @@ tokio-openssl = "0.6"
 # From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
 tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086" }
 ssh-key = { version = "0.6", optional = true }
+ssh-key-import = { path = "../ssh-key-import", optional = true }
+zeroize = { version = "1", optional = true }
 sshauth = { workspace = true, optional = true }
 
 [dev-dependencies]

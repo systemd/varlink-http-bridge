@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
@@ -11,6 +11,7 @@ use varlink_http_core::TlsChannelBinding;
 use varlink_http_core::sshauth_token::{
     SSHAUTH_NONCE_HEADER, SignedParts, signer_from_agent, signer_from_private_key,
 };
+use zeroize::Zeroizing;
 
 use super::VARLINK_SSH_KEY_ENV;
 use crate::WebSocket;
@@ -341,15 +342,17 @@ fn generate_nonce() -> String {
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn read_private_key(key_path: &str) -> Result<Option<ssh_key::PrivateKey>> {
     let privkey_path = key_path.strip_suffix(".pub").unwrap_or(key_path);
-    let privkey = match ssh_key::PrivateKey::read_openssh_file(Path::new(privkey_path)) {
-        Ok(privkey) => privkey,
-        Err(ssh_key::Error::Io(std::io::ErrorKind::NotFound)) => return Ok(None),
+    let data = match std::fs::read_to_string(privkey_path) {
+        Ok(data) => Zeroizing::new(data),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(
-                anyhow::Error::new(e).context(format!("loading private key from {privkey_path}"))
+                anyhow::Error::new(e).context(format!("reading private key from {privkey_path}"))
             );
         }
     };
+    let privkey = ssh_key_import::parse_private_key(&data)
+        .with_context(|| format!("loading private key from {privkey_path}"))?;
     ensure_supported_algorithm(&privkey.algorithm(), key_path)?;
     Ok(Some(privkey))
 }
@@ -439,6 +442,26 @@ M5XaGJkYC6+fw2SICxlSJQC5WK+3AAAAkNe45MiHjROFtso/EbHFZ2jhoBMGe3kpqZDfNC
             let err = format!("{err:#}");
             assert!(err.contains(expected), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_pkcs8_key_signs_without_agent() {
+        // vmspawn writes its private keys as PKCS#8. Such a key must load
+        // from VARLINK_SSH_KEY and sign directly, without an agent and
+        // without a .pub file.
+        const PKCS8_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJp/ivWBrtAi7u6Z72WTMWrpu1zVlz4Ls6+mJkD8mu2c
+-----END PRIVATE KEY-----
+";
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        std::fs::write(&key_path, PKCS8_PRIVATE_KEY).unwrap();
+
+        let keys = list_ssh_keys(key_path.to_str(), None).await.unwrap();
+        assert!(
+            matches!(keys.as_slice(), [SshKey::PrivateKey { .. }]),
+            "the PKCS#8 key did not load as a private key"
+        );
     }
 
     #[test]
