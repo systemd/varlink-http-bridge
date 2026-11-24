@@ -6,7 +6,9 @@ license = "LGPL-2.1-or-later"
 
 [dependencies]
 anyhow = "1.0.100"
-ssh-key = "0.6"
+ed25519-dalek = { version = "2", default-features = false, features = ["pem", "zeroize"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pem"] }
+ssh-key = { version = "0.6", features = ["ed25519", "p256"] }
 sshauth = { workspace = true }
 tempfile = "3.27"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
