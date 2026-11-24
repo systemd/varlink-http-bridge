@@ -59,7 +59,7 @@ fn private_key_from_pkcs8(pem: &str) -> anyhow::Result<ssh_key::PrivateKey> {
 mod tests {
     use super::*;
 
-    // Key pairs as `ssh-keygen -m PKCS8` writes them.
+    /// An Ed25519 private key as `ssh-keygen -m PKCS8` writes it.
     const ED25519_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJp/ivWBrtAi7u6Z72WTMWrpu1zVlz4Ls6+mJkD8mu2c
 -----END PRIVATE KEY-----
