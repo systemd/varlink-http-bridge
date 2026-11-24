@@ -2769,6 +2769,7 @@ dependencies = [
  "log",
  "openssl",
  "ssh-key",
+ "ssh-key-import",
  "sshauth",
  "tempfile",
  "tokio",
@@ -2776,6 +2777,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-vsock",
  "varlink-http-core",
+ "zeroize",
 ]
 
 [[package]]
