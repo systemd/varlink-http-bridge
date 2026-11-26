@@ -79,12 +79,7 @@ fn hmac_id128(key: &[u8], msg: &[u8]) -> anyhow::Result<u128> {
     // the libsystemd crate has this too, but would add nom plus a
     // duplicate nix dependency for one function. Reconsider if we
     // need more from rusts libsystemd
-    use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer};
-
-    let key = PKey::hmac(key).context("creating HMAC key")?;
-    let mut signer = Signer::new(MessageDigest::sha256(), &key).context("creating signer")?;
-    signer.update(msg).context("hashing")?;
-    let mac = signer.sign_to_vec().context("computing HMAC")?;
+    let mac = crate::tls::hmac_sha256(key, msg)?;
 
     let mut id = [0u8; 16];
     id.copy_from_slice(&mac[..16]);
