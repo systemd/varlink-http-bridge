@@ -32,3 +32,5 @@ sshauth = { workspace = true, optional = true }
 varlink-http-core = { path = "../varlink-http-core", default-features = false, features = ["test-helpers"] }
 tempfile = "3.27"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
+# test certificates that do not depend on the TLS library under test
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
