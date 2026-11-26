@@ -169,7 +169,7 @@ impl ApiKeyCache {
         self.files
             .values()
             .flat_map(|f| &f.entries)
-            .find(|e| openssl::memcmp::eq(&e.digest, digest))
+            .find(|e| varlink_http_bridge::tls::constant_time_eq(&e.digest, digest))
             .map(|e| e.name.clone())
     }
 
@@ -327,7 +327,7 @@ impl Authenticator for ApiKeyAuthenticator {
 
         let token_str = request.bearer_token()?;
         validate_api_key(token_str)?;
-        let digest = openssl::sha::sha256(token_str.as_bytes());
+        let digest = varlink_http_bridge::tls::sha256(token_str.as_bytes());
         let name = keys.lookup(&digest).context("unknown API key")?;
 
         info!(
@@ -405,7 +405,7 @@ fn default_api_keys_path() -> PathBuf {
 
 pub(crate) fn generate_api_key() -> String {
     let mut buf = [0u8; 32];
-    openssl::rand::rand_bytes(&mut buf).expect("openssl PRNG failed");
+    varlink_http_bridge::tls::random_bytes(&mut buf).expect("the system PRNG failed");
     format!("{API_KEY_PREFIX}{}", HEXLOWER.encode(&buf))
 }
 
@@ -417,7 +417,7 @@ pub(crate) fn append_api_key(path: &Path, key: &str, name: Option<&str>) -> anyh
 
     validate_api_key(key)?;
 
-    let hex = HEXLOWER.encode(&openssl::sha::sha256(key.as_bytes()));
+    let hex = HEXLOWER.encode(&varlink_http_bridge::tls::sha256(key.as_bytes()));
     let name = name.unwrap_or(&hex[..8]);
     // The name is a whitespace-separated field on the key line.
     if name.chars().any(char::is_whitespace) {

@@ -336,8 +336,8 @@ fn signer_for_key(key: &SshKey) -> Result<sshauth::TokenSigner> {
 
 fn generate_nonce() -> String {
     let mut buf = [0u8; 16];
-    openssl::rand::rand_bytes(&mut buf).expect("openssl PRNG failed");
-    openssl::base64::encode_block(&buf)
+    varlink_http_core::tls::random_bytes(&mut buf).expect("the system PRNG failed");
+    varlink_http_core::tls::base64(&buf)
 }
 
 /// Read a private key from `key_path`.

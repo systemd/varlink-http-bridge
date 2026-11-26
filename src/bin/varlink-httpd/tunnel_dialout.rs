@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 
 use varlink_http_bridge::BoxedStream;
 use varlink_http_bridge::node_id::NodeId;
+use varlink_http_bridge::tls;
 use varlink_http_bridge::tunnel::{TUNNEL_PATH, TunnelStream, server_handshake};
 use varlink_http_bridge::ws::WsByteStream;
 
@@ -166,7 +167,7 @@ async fn dial_loop(
 fn with_jitter(base: Duration) -> Duration {
     let mut byte = [0u8; 1];
     // a zero delay on every failure would turn the dial loop into a busy loop
-    if openssl::rand::rand_bytes(&mut byte).is_err() {
+    if tls::random_bytes(&mut byte).is_err() {
         return base;
     }
     base.mul_f32(f32::from(byte[0]) / 255.0)

@@ -9,6 +9,7 @@
 pub mod secret_file;
 #[cfg(feature = "sshauth")]
 pub mod sshauth_token;
+pub mod tls;
 pub mod ws;
 
 /// Default port for the HTTP bridge when listening on or connecting via vsock.
