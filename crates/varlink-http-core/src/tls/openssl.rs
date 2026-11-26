@@ -2,13 +2,15 @@
 
 //! The OpenSSL backend of [`crate::tls`].
 
+use std::path::Path;
 use std::pin::Pin;
 
-use anyhow::Context;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use anyhow::{Context, bail};
+use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use super::{ClientCert, Roots, Verify};
 use crate::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN, TlsChannelBinding};
 
 /// An established TLS session over `S`.
@@ -32,6 +34,31 @@ impl Certificate {
             .collect())
     }
 
+    /// Returns the fingerprint of the public key: base64 of the SHA-256
+    /// digest of the DER-encoded `SubjectPublicKeyInfo`, which is what
+    /// `curl --pinnedpubkey sha256//…` expects.
+    ///
+    /// # Errors
+    /// Returns an error if the key cannot be extracted or DER-encoded.
+    pub fn public_key_pin(&self) -> anyhow::Result<String> {
+        let spki = self
+            .0
+            .public_key()
+            .context("reading certificate public key")?
+            .public_key_to_der()
+            .context("encoding SubjectPublicKeyInfo")?;
+        Ok(super::base64(&sha256(&spki)))
+    }
+
+    /// Returns whether the certificate names itself as its own issuer.
+    #[must_use]
+    pub fn is_self_signed(&self) -> bool {
+        self.0
+            .issuer_name()
+            .try_cmp(self.0.subject_name())
+            .is_ok_and(std::cmp::Ordering::is_eq)
+    }
+
     /// Returns the subject as text, like `CN=host, O=org`.
     #[must_use]
     pub fn subject(&self) -> String {
@@ -46,27 +73,6 @@ impl Certificate {
             .collect::<Vec<_>>()
             .join(", ")
     }
-}
-
-/// Fingerprint of a certificate's public key: base64 of the SHA-256 digest
-/// of the DER-encoded `SubjectPublicKeyInfo`.
-///
-/// httpd prints it if a self-signed cert is used, and the client pins against it.
-/// The encoding matches what `curl --pinnedpubkey sha256//…` expects.
-///
-/// # Errors
-/// Returns an error if the key cannot be extracted or DER-encoded.
-pub fn public_key_pin(cert: &openssl::x509::X509Ref) -> anyhow::Result<String> {
-    use anyhow::Context;
-
-    let spki = cert
-        .public_key()
-        .context("reading certificate public key")?
-        .public_key_to_der()
-        .context("encoding SubjectPublicKeyInfo")?;
-    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &spki)
-        .context("hashing SubjectPublicKeyInfo")?;
-    Ok(openssl::base64::encode_block(&digest))
 }
 
 /// Exports the RFC 9266 channel binding of an established TLS 1.3 session.
@@ -162,19 +168,11 @@ impl Acceptor {
     }
 }
 
-/// A trust store holding only the certificates in `ca_path`.
-///
-/// # Errors
-/// Returns an error if `ca_path` cannot be read, contains no PEM certificate,
-/// or the store cannot be assembled.
-pub fn exclusive_ca_store(
-    ca_path: &std::path::Path,
-) -> anyhow::Result<openssl::x509::store::X509Store> {
-    use anyhow::{Context, bail};
-
+/// Returns a trust store holding only the certificates in `ca_path`.
+fn exclusive_ca_store(ca_path: &Path) -> anyhow::Result<openssl::x509::store::X509Store> {
     let pem = std::fs::read(ca_path)
         .with_context(|| format!("reading CA certificate {}", ca_path.display()))?;
-    let certs = openssl::x509::X509::stack_from_pem(&pem)
+    let certs = X509::stack_from_pem(&pem)
         .with_context(|| format!("parsing CA certificate {}", ca_path.display()))?;
     if certs.is_empty() {
         bail!("no PEM certificate found in {}", ca_path.display());
@@ -188,6 +186,98 @@ pub fn exclusive_ca_store(
             .with_context(|| format!("adding a certificate from {}", ca_path.display()))?;
     }
     Ok(store.build())
+}
+
+/// The client side of TLS. Building one is expensive, so reuse it.
+#[derive(Clone)]
+pub struct Connector(SslConnector);
+
+impl Connector {
+    /// Returns a TLS 1.3 only connector that verifies servers against the
+    /// system CA store, without a client certificate.
+    ///
+    /// # Errors
+    /// Returns an error if the TLS library cannot be set up.
+    pub fn system() -> anyhow::Result<Self> {
+        Self::new(&Roots::System, None, None)
+    }
+
+    /// Returns a TLS 1.3 only connector. `client_cert` is presented to
+    /// servers that ask for one. With `verify` the callback has the last
+    /// word on the server certificate, otherwise it has to validate against
+    /// `roots`.
+    ///
+    /// # Errors
+    /// Returns an error if a file cannot be loaded, or the client
+    /// certificate and key do not match.
+    pub fn new(
+        roots: &Roots,
+        client_cert: Option<&ClientCert>,
+        verify: Option<Verify>,
+    ) -> anyhow::Result<Self> {
+        let mut builder =
+            SslConnector::builder(SslMethod::tls_client()).context("creating TLS connector")?;
+        // the RFC 9266 channel binding is only guaranteed unique with TLS 1.3
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .context("requiring TLS 1.3")?;
+
+        if let Some(ClientCert { cert, key }) = client_cert {
+            builder
+                .set_certificate_chain_file(cert)
+                .with_context(|| format!("loading client certificate {}", cert.display()))?;
+            builder
+                .set_private_key_file(key, SslFiletype::PEM)
+                .with_context(|| format!("loading client key {}", key.display()))?;
+            builder
+                .check_private_key()
+                .context("client certificate and key do not match")?;
+        }
+
+        if let Roots::Exclusive(ca) = roots {
+            // set_ca_file would extend the pre-loaded system store
+            builder.set_cert_store(
+                exclusive_ca_store(ca)
+                    .with_context(|| format!("loading CA certificate {}", ca.display()))?,
+            );
+        }
+
+        if let Some(verify) = verify {
+            builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
+                // errors above the leaf abort on their own
+                if ctx.error_depth() != 0 {
+                    return chain_ok;
+                }
+                ctx.current_cert()
+                    .is_some_and(|cert| verify(&Certificate(cert.to_owned()), chain_ok))
+            });
+        }
+        Ok(Self(builder.build()))
+    }
+
+    /// Performs the TLS handshake on a connected `stream`. Returns the
+    /// session and whether the server certificate validated against the
+    /// roots, which can be false only if a [`Verify`] accepted it.
+    ///
+    /// `verify_hostname=false` is for transports without a hostname; the
+    /// certificate chain is still verified.
+    ///
+    /// # Errors
+    /// Returns an error if the handshake fails.
+    pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        domain: &str,
+        verify_hostname: bool,
+        stream: S,
+    ) -> anyhow::Result<(Stream<S>, bool)> {
+        let mut config = self.0.configure().context("TLS configure")?;
+        config.set_verify_hostname(verify_hostname);
+        let ssl = config.into_ssl(domain).context("TLS setup")?;
+        let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream).context("TLS stream")?;
+        Pin::new(&mut tls_stream).connect().await?;
+        let validated = tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK;
+        Ok((tls_stream, validated))
+    }
 }
 
 /// Returns the SHA-256 digest of `data`.
@@ -228,7 +318,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openssl::x509::{X509, X509StoreContext, store::X509StoreRef};
+    use openssl::x509::{X509StoreContext, store::X509StoreRef};
 
     type Identity = (X509, openssl::pkey::PKey<openssl::pkey::Private>);
 
@@ -329,6 +419,54 @@ mod tests {
             !accepts(ctx.cert_store(), &leaf.0),
             "a pre-loaded authority must not survive"
         );
+    }
+
+    /// Rejecting inside the verify callback must abort before we send our own
+    /// certificate; rejecting after the handshake would already have leaked it.
+    #[tokio::test]
+    async fn a_refused_server_never_sees_our_client_certificate() {
+        for reject in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = identity("srv", None);
+            let client = identity("cli", None);
+            let client_cert = ClientCert {
+                cert: dir.path().join("cli.pem"),
+                key: dir.path().join("cli.key"),
+            };
+            std::fs::write(&client_cert.cert, client.0.to_pem().unwrap()).unwrap();
+            std::fs::write(
+                &client_cert.key,
+                client.1.private_key_to_pem_pkcs8().unwrap(),
+            )
+            .unwrap();
+
+            let mut acceptor = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server()).unwrap();
+            acceptor.set_certificate(&server.0).unwrap();
+            acceptor.set_private_key(&server.1).unwrap();
+            // any client certificate is fine, so one that was sent is kept
+            // even when the handshake fails afterwards
+            acceptor.set_verify_callback(SslVerifyMode::PEER, |_ok, _ctx| true);
+            let acceptor = acceptor.build();
+
+            let (ours, theirs) = tokio::io::duplex(64 * 1024);
+            let saw_client_cert = tokio::spawn(async move {
+                let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
+                let mut tls = tokio_openssl::SslStream::new(ssl, theirs).unwrap();
+                let _ = Pin::new(&mut tls).accept().await;
+                tls.ssl().peer_certificate().is_some()
+            });
+
+            let verify: Verify = std::sync::Arc::new(move |_cert, _chain_ok| !reject);
+            let connector = Connector::new(&Roots::System, Some(&client_cert), Some(verify));
+            let handshake = connector.unwrap().connect("srv", false, ours).await;
+
+            assert_eq!(handshake.is_err(), reject);
+            assert_eq!(
+                saw_client_cert.await.unwrap(),
+                !reject,
+                "reject={reject}: the server must only see our certificate when we accept it"
+            );
+        }
     }
 
     #[test]

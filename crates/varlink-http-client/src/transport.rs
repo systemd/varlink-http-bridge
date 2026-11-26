@@ -5,14 +5,13 @@
 //! `client_auth`) adds its headers to.
 
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use tokio_tungstenite::tungstenite;
 
+use varlink_http_core::tls::{self, Certificate, ClientCert};
 use varlink_http_core::{AsyncStream, BoxedStream, TlsChannelBinding};
 
 use crate::WebSocket;
@@ -170,13 +169,6 @@ fn record_known_host(path: &Path, peer: &str, host: &KnownHost) -> Result<()> {
     Ok(())
 }
 
-/// Whether the certificate names itself as its own issuer.
-fn is_self_signed(cert: &openssl::x509::X509Ref) -> bool {
-    cert.issuer_name()
-        .try_cmp(cert.subject_name())
-        .is_ok_and(std::cmp::Ordering::is_eq)
-}
-
 /// What `known-hosts` has to say about the peer, if a file is in use at all.
 #[derive(Debug)]
 enum Tofu {
@@ -190,12 +182,9 @@ enum Tofu {
 
 /// Whether the server key is `pin`, with or without the `sha256//` prefix;
 /// `mismatch` is the refusal otherwise.
-fn pin_matches(
-    cert: &openssl::x509::X509Ref,
-    pin: &str,
-    mismatch: &'static str,
-) -> Result<(), &'static str> {
-    let actual = varlink_http_core::tls::public_key_pin(cert)
+fn pin_matches(cert: &Certificate, pin: &str, mismatch: &'static str) -> Result<(), &'static str> {
+    let actual = cert
+        .public_key_pin()
         .map_err(|_| "cannot fingerprint the server key")?;
     if pin.strip_prefix("sha256//").unwrap_or(pin) == actual {
         Ok(())
@@ -212,10 +201,10 @@ fn pin_matches(
 /// [`KnownHost::TrustAuthority`] peer rotate its key: the new certificate
 /// validates and never reaches the rules below.
 ///
-/// The refusal reason is a message, not an error, because the OpenSSL verify
-/// callback can only answer yes or no and stores it for the caller.
+/// The refusal reason is a message, not an error, because [`tls::Verify`]
+/// can only answer yes or no and stores it for the caller.
 fn verify_server_cert(
-    cert: &openssl::x509::X509Ref,
+    cert: &Certificate,
     chain_ok: bool,
     trust: &ServerTrust,
     tofu: &Tofu,
@@ -234,7 +223,7 @@ fn verify_server_cert(
         }
         ServerTrust::SystemCas => {}
     }
-    if !is_self_signed(cert) {
+    if !cert.is_self_signed() {
         return Err("certificate does not validate against trust authority");
     }
 
@@ -275,15 +264,6 @@ pub enum ServerTrust {
     Pin(String),
 }
 
-/// The client's certificate and key, for servers that require mTLS.
-#[derive(Debug, Clone)]
-pub(crate) struct ClientCert {
-    /// The certificate chain, PEM.
-    pub(crate) cert: PathBuf,
-    /// The private key for it, PEM.
-    pub(crate) key: PathBuf,
-}
-
 /// How a bridge is reached: TCP or vsock, and for TLS how the server is
 /// trusted and who the client is.
 #[derive(Debug, Clone, Default)]
@@ -316,58 +296,30 @@ impl Transport {
         }
     }
 
-    /// An `SslConnector` for this transport. If the server certificate is
+    /// Returns a TLS connector for this transport. If the server certificate is
     /// refused, the reason lands in `refusal` for the error message.
-    fn ssl_connector(
+    fn tls_connector(
         &self,
         tofu: Tofu,
         refusal: Arc<OnceLock<&'static str>>,
-    ) -> Result<SslConnector> {
-        let mut builder = SslConnector::builder(SslMethod::tls_client())?;
-        // the RFC 9266 channel binding is only guaranteed unique with TLS 1.3
-        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-
-        if let Some(ClientCert { cert, key }) = &self.client_cert {
-            builder
-                .set_certificate_chain_file(cert)
-                .with_context(|| format!("loading client certificate {}", cert.display()))?;
-            builder
-                .set_private_key_file(key, SslFiletype::PEM)
-                .with_context(|| format!("loading client key {}", key.display()))?;
-            builder
-                .check_private_key()
-                .context("client certificate and key do not match")?;
-        }
-
-        if let ServerTrust::Ca(ca) = &self.server_trust {
-            builder.set_cert_store(
-                varlink_http_core::tls::exclusive_ca_store(ca)
-                    .with_context(|| format!("loading CA certificate {}", ca.display()))?,
-            );
-        }
-
+    ) -> Result<tls::Connector> {
+        let roots = match &self.server_trust {
+            ServerTrust::Ca(ca) => tls::Roots::Exclusive(ca.clone()),
+            ServerTrust::SystemCas | ServerTrust::Pin(_) => tls::Roots::System,
+        };
         let trust = self.server_trust.clone();
-        builder.set_verify_callback(SslVerifyMode::PEER, move |chain_ok, ctx| {
-            // errors above the leaf abort on their own
-            if ctx.error_depth() != 0 {
-                return chain_ok;
-            }
-            let Some(cert) = ctx.current_cert() else {
-                return false;
-            };
+        let verify: tls::Verify = Arc::new(move |cert, chain_ok| {
             match verify_server_cert(cert, chain_ok, &trust, &tofu) {
                 Ok(()) => true,
                 Err(why) => {
-                    // The callback can only answer yes or no, and OpenSSL
-                    // drops the certificate when it aborts, so the reason
+                    // The callback can only answer yes or no, so the reason
                     // has to be kept here.
                     let _ = refusal.set(why);
                     false
                 }
             }
         });
-
-        Ok(builder.build())
+        tls::Connector::new(&roots, self.client_cert.as_ref(), Some(verify))
     }
 
     /// TLS-handshake `stream`, returning it with the RFC 9266 channel binding.
@@ -395,36 +347,34 @@ impl Transport {
         let first_contact = matches!(tofu, Tofu::FirstContact);
 
         let refusal = Arc::new(OnceLock::new());
-        let connector = self.ssl_connector(tofu, Arc::clone(&refusal))?;
-        let mut config = connector.configure().context("SSL configure")?;
-        // Left on so CA-issued certificates are still name-checked; self-signed
-        // ones fail here too, which verify_server_cert tolerates.
-        config.set_verify_hostname(verify_hostname);
-        let ssl = config.into_ssl(domain).context("SSL setup")?;
-        let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)?;
-
-        if let Err(e) = Pin::new(&mut tls_stream).connect().await {
-            return Err(anyhow::Error::new(e).context(match refusal.get() {
-                Some(why) => format!("{peer}: {why}"),
-                None => error_context.to_string(),
-            }));
-        }
+        let connector = self.tls_connector(tofu, Arc::clone(&refusal))?;
+        // The hostname check stays on so CA-issued certificates are still
+        // name-checked; self-signed ones fail here too, which
+        // verify_server_cert tolerates.
+        let (tls_stream, validated) = connector
+            .connect(domain, verify_hostname, stream)
+            .await
+            .map_err(|e| {
+                e.context(match refusal.get() {
+                    Some(why) => format!("{peer}: {why}"),
+                    None => error_context.to_string(),
+                })
+            })?;
 
         if first_contact
             && let Some(known_hosts) = &self.known_hosts
-            && let Some(cert) = tls_stream.ssl().peer_certificate()
+            && let Some(cert) = tls::peer_certificate(&tls_stream)
         {
-            let observed =
-                if tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK {
-                    KnownHost::TrustAuthority
-                } else {
-                    KnownHost::Pin(varlink_http_core::tls::public_key_pin(&cert)?)
-                };
+            let observed = if validated {
+                KnownHost::TrustAuthority
+            } else {
+                KnownHost::Pin(cert.public_key_pin()?)
+            };
             record_known_host(known_hosts, peer, &observed)
                 .with_context(|| format!("recording what {peer} presented"))?;
         }
 
-        let tls_channel_binding = varlink_http_core::tls::channel_binding(&tls_stream);
+        let tls_channel_binding = tls::channel_binding(&tls_stream);
         Ok((Box::new(tls_stream), Some(tls_channel_binding)))
     }
 
@@ -604,7 +554,6 @@ pub(crate) async fn ws_upgrade(
 #[cfg(test)]
 mod pin_tests {
     use super::*;
-    use openssl::ssl::SslAcceptor;
     use std::time::Duration;
 
     #[test]
@@ -719,7 +668,9 @@ mod pin_tests {
 
     /// A throwaway certificate and what signs as it.
     struct Identity {
-        cert: openssl::x509::X509,
+        cert: Certificate,
+        /// The certificate as PEM.
+        pem: String,
         params: rcgen::CertificateParams,
         key: rcgen::KeyPair,
     }
@@ -742,12 +693,15 @@ mod pin_tests {
         }
         .unwrap()
         .pem();
-        let cert = openssl::x509::X509::from_pem(pem.as_bytes()).unwrap();
-        Identity { cert, params, key }
-    }
-
-    fn private_key(id: &Identity) -> openssl::pkey::PKey<openssl::pkey::Private> {
-        openssl::pkey::PKey::private_key_from_pem(id.key.serialize_pem().as_bytes()).unwrap()
+        let cert = Certificate::from_pem_bundle(pem.as_bytes())
+            .unwrap()
+            .remove(0);
+        Identity {
+            cert,
+            pem,
+            params,
+            key,
+        }
     }
 
     /// Rejecting inside the verify callback must abort before we send our own
@@ -755,53 +709,82 @@ mod pin_tests {
     #[tokio::test]
     async fn a_refused_server_never_sees_our_client_certificate() {
         for reject in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let write = |name: &str, pem: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, pem).unwrap();
+                path
+            };
             let server = identity("srv", None, false);
-            let client = identity("cli", None, false);
+            let ca = identity("ca", None, true);
+            let client = identity("cli", Some(&ca), false);
+            let server_cert = write("srv.pem", &server.pem);
+            let server_key = write("srv.key", &server.key.serialize_pem());
+            let client_cert = ClientCert {
+                cert: write("cli.pem", &client.pem),
+                key: write("cli.key", &client.key.serialize_pem()),
+            };
 
-            let mut acceptor = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server()).unwrap();
-            acceptor.set_certificate(&server.cert).unwrap();
-            acceptor.set_private_key(&private_key(&server)).unwrap();
-            acceptor.set_verify_callback(SslVerifyMode::PEER, |_ok, _ctx| true);
-            let acceptor = acceptor.build();
+            let acceptor = tls::Acceptor::new(
+                server_cert.to_str().unwrap(),
+                server_key.to_str().unwrap(),
+                true,
+            )
+            .unwrap();
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
-                let mut tls = tokio_openssl::SslStream::new(ssl, stream).unwrap();
-                let _ = Pin::new(&mut tls).accept().await;
-                let _ = tx.send(tls.ssl().peer_certificate().is_some());
+                let saw_client_cert = acceptor
+                    .accept(Some(&[ca.cert]), stream)
+                    .await
+                    .map(|tls| tls::peer_certificate(&tls).is_some());
+                let _ = tx.send(saw_client_cert);
             });
 
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let mut b = SslConnector::builder(SslMethod::tls_client()).unwrap();
-            b.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
-            b.set_certificate(&client.cert).unwrap();
-            b.set_private_key(&private_key(&client)).unwrap();
-            b.set_verify_callback(SslVerifyMode::PEER, move |_ok, _ctx| !reject);
-            let mut cfg = b.build().configure().unwrap();
-            cfg.set_verify_hostname(false);
-            let ssl = cfg.into_ssl("srv").unwrap();
-            let mut tls = tokio_openssl::SslStream::new(ssl, stream).unwrap();
-            let handshake = Pin::new(&mut tls).connect().await;
+            let connector = tls::Connector::new(
+                &tls::Roots::System,
+                Some(&client_cert),
+                Some(Arc::new(move |_cert, _chain_ok| !reject)),
+            )
+            .unwrap();
+            match connector.connect("srv", false, stream).await {
+                Ok((mut tls, _)) => {
+                    use tokio::io::AsyncReadExt;
+                    assert!(!reject, "a refused server must fail the handshake");
+                    // keeps the connection up until the server is done with it
+                    let _ = tls.read(&mut [0u8; 1]).await;
+                }
+                Err(e) => assert!(reject, "handshake failed: {e:#}"),
+            }
 
             let saw_client_cert = tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(handshake.is_err(), reject);
-            assert_eq!(
-                saw_client_cert, !reject,
-                "reject={reject}: the server must only see our certificate when we accept it"
-            );
+            if reject {
+                let err = saw_client_cert.expect_err("a refused server completed the handshake");
+                // only our alert shows that it was us who hung up, and a
+                // certificate is never sent after an alert
+                assert!(
+                    format!("{err:#}").to_lowercase().contains("alert"),
+                    "the server failed on its own: {err:#}"
+                );
+            } else {
+                assert!(
+                    saw_client_cert.unwrap(),
+                    "the server must see our certificate when we accept it"
+                );
+            }
         }
     }
 
     fn self_signed_pin() -> (Identity, String) {
         let id = identity("leaf", None, false);
-        let pin = varlink_http_core::tls::public_key_pin(&id.cert).unwrap();
+        let pin = id.cert.public_key_pin().unwrap();
         (id, pin)
     }
 
@@ -817,9 +800,7 @@ mod pin_tests {
     fn an_unprovable_issuer_is_refused_even_with_a_recorded_key() {
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let pin = Tofu::Recorded(KnownHost::Pin(
-            varlink_http_core::tls::public_key_pin(&leaf.cert).unwrap(),
-        ));
+        let pin = Tofu::Recorded(KnownHost::Pin(leaf.cert.public_key_pin().unwrap()));
         let err = verify_server_cert(&leaf.cert, false, &ServerTrust::SystemCas, &pin).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
     }
@@ -850,8 +831,7 @@ mod pin_tests {
 
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let leaf_pin =
-            ServerTrust::Pin(varlink_http_core::tls::public_key_pin(&leaf.cert).unwrap());
+        let leaf_pin = ServerTrust::Pin(leaf.cert.public_key_pin().unwrap());
         assert!(verify_server_cert(&leaf.cert, false, &leaf_pin, &Tofu::Off).is_ok());
 
         let err = verify_server_cert(&leaf.cert, false, &pinned, &Tofu::Off).unwrap_err();
