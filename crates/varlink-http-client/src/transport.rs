@@ -424,8 +424,7 @@ impl Transport {
                 .with_context(|| format!("recording what {peer} presented"))?;
         }
 
-        let tls_channel_binding =
-            varlink_http_core::tls::export_tls_channel_binding(tls_stream.ssl());
+        let tls_channel_binding = varlink_http_core::tls::channel_binding(&tls_stream);
         Ok((Box::new(tls_stream), Some(tls_channel_binding)))
     }
 

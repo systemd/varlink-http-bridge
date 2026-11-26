@@ -34,6 +34,7 @@ use tokio::signal;
 use tokio_vsock::VsockListener;
 use varlink_http_bridge::TlsChannelBinding;
 use varlink_http_bridge::sysconf::CredentialsLoader;
+use varlink_http_bridge::tls;
 use zlink::varlink_service::Proxy;
 
 mod auth_api_key;
@@ -332,24 +333,12 @@ async fn get_varlink_connection(
     Ok(connection)
 }
 
-fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
-    cert.subject_name()
-        .entries()
-        .filter_map(|e| {
-            let obj = e.object().nid().short_name().ok()?;
-            let val = e.data().to_string().ok()?;
-            Some(format!("{obj}={val}"))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &impl std::fmt::Display) {
-    match ssl.peer_certificate() {
-        Some(cert) => {
-            let subject = format_x509_subject(&cert);
-            info!("New TLS connection from {addr}, client cert: {subject}");
-        }
+fn log_tls_connection<S>(stream: &tls::Stream<S>, addr: &impl std::fmt::Display) {
+    match tls::peer_certificate(stream) {
+        Some(cert) => info!(
+            "New TLS connection from {addr}, client cert: {}",
+            cert.subject()
+        ),
         None => info!("New TLS connection from {addr}, no client cert"),
     }
 }
@@ -375,7 +364,7 @@ async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 /// are delivered through an mpsc channel.
 struct AsyncTlsListener<L: axum::serve::Listener> {
     local_addr: L::Addr,
-    receiver: tokio::sync::mpsc::Receiver<(tokio_openssl::SslStream<L::Io>, L::Addr)>,
+    receiver: tokio::sync::mpsc::Receiver<(tls::Stream<L::Io>, L::Addr)>,
 }
 
 impl<L> AsyncTlsListener<L>
@@ -424,7 +413,7 @@ where
     L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     L::Addr: Clone + Send + 'static,
 {
-    type Io = tokio_openssl::SslStream<L::Io>;
+    type Io = tls::Stream<L::Io>;
     type Addr = L::Addr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -458,9 +447,9 @@ impl axum::serve::Listener for PlainListener {
 
 impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, AsyncTlsListener<PlainListener>>) -> Self {
-        let ssl = target.io().ssl();
-        log_tls_connection(ssl, target.remote_addr());
-        let tls_channel_binding = varlink_http_bridge::tls::export_tls_channel_binding(ssl);
+        let stream = target.io();
+        log_tls_connection(stream, target.remote_addr());
+        let tls_channel_binding = tls::channel_binding(stream);
         Self::new(Some(tls_channel_binding))
     }
 }
@@ -475,10 +464,9 @@ impl Connected<IncomingStream<'_, VsockListener>> for VarlinkConnCache {
 
 impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, AsyncTlsListener<VsockListener>>) -> Self {
-        let ssl = target.io().ssl();
         let peer = target.remote_addr();
         info!("New TLS vsock connection from CID {}", peer.cid());
-        let tls_channel_binding = varlink_http_bridge::tls::export_tls_channel_binding(ssl);
+        let tls_channel_binding = tls::channel_binding(target.io());
         Self::new(Some(tls_channel_binding))
     }
 }
