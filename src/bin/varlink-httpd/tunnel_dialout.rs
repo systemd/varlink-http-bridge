@@ -263,11 +263,12 @@ async fn serve_tunnel(
 /// A TLS connector that verifies the relay against the system trust
 /// store. Building one is expensive, so build it once and reuse it.
 fn relay_tls_connector() -> Result<openssl::ssl::SslConnector> {
-    Ok(
-        openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-            .context("TLS connector")?
-            .build(),
-    )
+    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+        .context("TLS connector")?;
+    builder
+        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))
+        .context("requiring TLS 1.3")?;
+    Ok(builder.build())
 }
 
 async fn tls_connect(
