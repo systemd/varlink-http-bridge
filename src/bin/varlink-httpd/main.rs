@@ -347,15 +347,11 @@ fn log_tls_connection<S>(stream: &tls::Stream<S>, addr: &impl std::fmt::Display)
 async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     config: &TlsConfig,
     stream: S,
-) -> anyhow::Result<tokio_openssl::SslStream<S>> {
+) -> anyhow::Result<tls::Stream<S>> {
     // Per handshake so a CA that changed on disk applies to new connections
     // without restarting the listener.
-    let client_store = config
-        .client_trust
-        .as_ref()
-        .map(|trust| trust.store())
-        .transpose()?;
-    varlink_http_bridge::tls::tls_accept(&config.acceptor, client_store, stream).await
+    let client_cas = config.client_trust.as_ref().map(|trust| trust.cas());
+    config.acceptor.accept(client_cas.as_deref(), stream).await
 }
 
 /// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
@@ -485,16 +481,16 @@ struct ClientTrust {
 struct TrustCache {
     /// `None` when the file does not (yet) exist.
     mtime: Option<std::time::SystemTime>,
-    cas: Vec<openssl::x509::X509>,
+    cas: Vec<tls::Certificate>,
 }
 
 /// Read the CA certificates in `path`. Errors carry no path context, callers
 /// name the file themselves.
 ///
 /// An `Ok` empty vector means the file parsed but held no certificate.
-fn read_client_cas(path: &std::path::Path) -> anyhow::Result<Vec<openssl::x509::X509>> {
+fn read_client_cas(path: &std::path::Path) -> anyhow::Result<Vec<tls::Certificate>> {
     let pem = std::fs::read(path)?;
-    Ok(openssl::x509::X509::stack_from_pem(&pem)?)
+    tls::Certificate::from_pem_bundle(&pem)
 }
 
 impl ClientTrust {
@@ -579,17 +575,10 @@ impl ClientTrust {
         }
     }
 
-    /// A store for one handshake. `SSL_set0_verify_cert_store` takes ownership,
-    /// so this cannot be shared; the certificates themselves are refcounted and
-    /// only the store wrapper is rebuilt.
-    fn store(&self) -> anyhow::Result<openssl::x509::store::X509Store> {
+    /// Returns the CAs to verify the next client certificate against.
+    fn cas(&self) -> Vec<tls::Certificate> {
         self.maybe_reload();
-        let cache = self.cache.lock().unwrap();
-        let mut builder = openssl::x509::store::X509StoreBuilder::new()?;
-        for ca in &cache.cas {
-            builder.add_cert(ca.clone())?;
-        }
-        Ok(builder.build())
+        self.cache.lock().unwrap().cas.clone()
     }
 }
 
@@ -597,7 +586,7 @@ impl ClientTrust {
 /// CAs when mTLS is enabled.
 #[derive(Clone)]
 struct TlsConfig {
-    acceptor: openssl::ssl::SslAcceptor,
+    acceptor: tls::Acceptor,
     /// `None` when mTLS is off, so no client certificate is requested.
     client_trust: Option<Arc<ClientTrust>>,
     /// How long a client gets to complete its handshake before the
@@ -613,19 +602,10 @@ fn load_tls_config(
     client_ca_path: Option<&str>,
     require_client_cert: bool,
 ) -> anyhow::Result<TlsConfig> {
-    let mut builder = varlink_http_bridge::tls::tls_acceptor_builder(cert_path, key_path)?;
-
-    // The CAs store is configured per-handshake.
-    let client_trust = require_client_cert.then(|| {
-        builder.set_verify(
-            openssl::ssl::SslVerifyMode::PEER | openssl::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        );
-        Arc::new(ClientTrust::new(client_ca_path))
-    });
-
     Ok(TlsConfig {
-        acceptor: builder.build(),
-        client_trust,
+        acceptor: tls::Acceptor::new(cert_path, key_path, require_client_cert)?,
+        // The CAs are configured per-handshake.
+        client_trust: require_client_cert.then(|| Arc::new(ClientTrust::new(client_ca_path))),
         handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
     })
 }

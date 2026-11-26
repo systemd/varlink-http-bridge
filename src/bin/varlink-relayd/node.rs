@@ -31,7 +31,7 @@ pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub(crate) async fn serve(
     listener: TcpListener,
-    tls: Option<openssl::ssl::SslAcceptor>,
+    tls: Option<varlink_http_bridge::tls::Acceptor>,
     nodes: Arc<Nodes>,
 ) -> Result<()> {
     loop {
@@ -40,16 +40,13 @@ pub(crate) async fn serve(
         let tls = tls.clone();
         tokio::spawn(async move {
             let result = match tls {
-                Some(tls) => match tokio::time::timeout(
-                    HANDSHAKE_TIMEOUT,
-                    varlink_http_bridge::tls::tls_accept(&tls, None, stream),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => handle_node(Box::new(stream), &nodes, peer).await,
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(anyhow!("TLS handshake timed out")),
-                },
+                Some(tls) => {
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(None, stream)).await {
+                        Ok(Ok(stream)) => handle_node(Box::new(stream), &nodes, peer).await,
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(anyhow!("TLS handshake timed out")),
+                    }
+                }
                 None => handle_node(Box::new(stream), &nodes, peer).await,
             };
             // a public port sees scanners and half-open connections all day

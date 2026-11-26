@@ -2,8 +2,12 @@
 
 //! The OpenSSL backend of [`crate::tls`].
 
+use std::pin::Pin;
+
 use anyhow::Context;
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN, TlsChannelBinding};
 
@@ -90,53 +94,72 @@ pub fn peer_certificate<S>(stream: &Stream<S>) -> Option<Certificate> {
     stream.ssl().peer_certificate().map(Certificate)
 }
 
-/// Returns a `SslAcceptorBuilder` from the given {cert,key}_path with
-/// a minimum TLS1.3 version requirement for TLS channel binding.
-///
-/// # Errors
-/// Returns an error if the certificate or key cannot be loaded or do
-/// not match.
-pub fn tls_acceptor_builder(
-    cert_path: &str,
-    key_path: &str,
-) -> anyhow::Result<openssl::ssl::SslAcceptorBuilder> {
-    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+/// The server side of TLS: a certificate and key, TLS 1.3 only.
+#[derive(Clone)]
+pub struct Acceptor(SslAcceptor);
 
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
-    // (export_keying_material requires TLS 1.3).
-    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
-    builder.set_certificate_chain_file(cert_path)?;
-    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
-    builder.check_private_key()?;
-    Ok(builder)
-}
-
-/// Perform a TLS handshake on an already-accepted
-/// stream. `client_store` holds the CAs a client certificate is
-/// verified against. This runs per handshake the CAs can be rotated
-/// without rebuilding the acceptor.
-///
-/// # Errors
-/// Returns an error if the handshake fails.
-pub async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    acceptor: &openssl::ssl::SslAcceptor,
-    client_store: Option<openssl::x509::store::X509Store>,
-    stream: S,
-) -> anyhow::Result<tokio_openssl::SslStream<S>> {
-    use anyhow::Context;
-    let mut ssl = openssl::ssl::Ssl::new(acceptor.context()).context("SSL context error")?;
-    if let Some(store) = client_store {
-        ssl.set_verify_cert_store(store)
-            .context("installing client CA store")?;
+impl Acceptor {
+    /// Loads the PEM certificate chain and key. With `require_client_cert`
+    /// a handshake only succeeds for a client certificate that the CAs
+    /// passed to [`Acceptor::accept`] vouch for.
+    ///
+    /// # Errors
+    /// Returns an error if the certificate or key cannot be loaded or do
+    /// not match.
+    pub fn new(cert_path: &str, key_path: &str, require_client_cert: bool) -> anyhow::Result<Self> {
+        let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
+            .context("creating TLS acceptor")?;
+        // mozilla_modern_v5 allows TLS 1.2, but export_keying_material
+        // for the channel binding requires 1.3
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .context("requiring TLS 1.3")?;
+        builder
+            .set_certificate_chain_file(cert_path)
+            .with_context(|| format!("loading certificate {cert_path}"))?;
+        builder
+            .set_private_key_file(key_path, SslFiletype::PEM)
+            .with_context(|| format!("loading key {key_path}"))?;
+        builder
+            .check_private_key()
+            .context("certificate and key do not match")?;
+        if require_client_cert {
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        Ok(Self(builder.build()))
     }
-    let mut tls_stream =
-        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
-    std::pin::Pin::new(&mut tls_stream)
-        .accept()
-        .await
-        .context("TLS handshake failed")?;
-    Ok(tls_stream)
+
+    /// Performs the TLS handshake on an accepted `stream`. `client_cas` are
+    /// the CAs a client certificate is verified against in this handshake.
+    ///
+    /// # Errors
+    /// Returns an error if the handshake fails.
+    pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        client_cas: Option<&[Certificate]>,
+        stream: S,
+    ) -> anyhow::Result<Stream<S>> {
+        let mut ssl = openssl::ssl::Ssl::new(self.0.context()).context("SSL context error")?;
+        // per handshake so that the CAs can be rotated without a new acceptor
+        if let Some(cas) = client_cas {
+            // SSL_set0_verify_cert_store takes ownership, so the store
+            // cannot be shared; the certificates are refcounted
+            let mut store = openssl::x509::store::X509StoreBuilder::new()
+                .context("creating client CA store")?;
+            for ca in cas {
+                store.add_cert(ca.0.clone()).context("adding a client CA")?;
+            }
+            ssl.set_verify_cert_store(store.build())
+                .context("installing client CA store")?;
+        }
+        let mut tls_stream =
+            tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
+        Pin::new(&mut tls_stream)
+            .accept()
+            .await
+            .context("TLS handshake failed")?;
+        Ok(tls_stream)
+    }
 }
 
 /// A trust store holding only the certificates in `ca_path`.
