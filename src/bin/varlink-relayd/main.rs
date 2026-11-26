@@ -43,7 +43,7 @@ This command is EXPERIMENTAL.
 struct Args {
     bind_node: String,
     bind_caller: String,
-    tls: Option<openssl::ssl::SslAcceptor>,
+    tls: Option<varlink_http_bridge::tls::Acceptor>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -81,7 +81,7 @@ fn parse_args() -> Result<Args> {
 
     let tls = match (cert, key) {
         (Some(cert), Some(key)) => {
-            Some(varlink_http_bridge::tls::tls_acceptor_builder(&cert, &key)?.build())
+            Some(varlink_http_bridge::tls::Acceptor::new(&cert, &key, false)?)
         }
         (None, None) if insecure => {
             warn!("no --cert/--key: nodes connect over plain ws://");

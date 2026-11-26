@@ -1368,7 +1368,7 @@ fn test_mtls_unusable_trust_file_keeps_the_previous_cas() {
 
     std::fs::copy(&pki.ca_cert_path, &path).unwrap();
     let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
-    assert_eq!(trust.store().unwrap().all_certificates().len(), 1);
+    assert_eq!(trust.cas().len(), 1);
 
     for (what, content) in [
         ("empty", b"".as_slice()),
@@ -1380,7 +1380,7 @@ fn test_mtls_unusable_trust_file_keeps_the_previous_cas() {
     ] {
         std::fs::write(&path, content).unwrap();
         assert_eq!(
-            trust.store().unwrap().all_certificates().len(),
+            trust.cas().len(),
             1,
             "a file that is {what} must keep the CA already loaded"
         );
@@ -1399,11 +1399,7 @@ fn test_mtls_empty_trust_file_is_not_cached() {
 
     std::fs::write(&path, b"").unwrap();
     let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
-    assert_eq!(
-        trust.store().unwrap().all_certificates().len(),
-        0,
-        "an empty file must trust nothing"
-    );
+    assert_eq!(trust.cas().len(), 0, "an empty file must trust nothing");
 
     // Rewind the mtime to what the empty read saw, standing in for a write
     // that lands within the same tick.
@@ -1417,7 +1413,7 @@ fn test_mtls_empty_trust_file_is_not_cached() {
         .unwrap();
 
     assert_eq!(
-        trust.store().unwrap().all_certificates().len(),
+        trust.cas().len(),
         1,
         "the CA that arrived must be picked up, not shadowed by the empty read"
     );

@@ -5,8 +5,8 @@
 mod openssl;
 
 pub use self::openssl::{
-    Certificate, Stream, channel_binding, constant_time_eq, exclusive_ca_store, hmac_sha256,
-    peer_certificate, public_key_pin, random_bytes, sha256, tls_accept, tls_acceptor_builder,
+    Acceptor, Certificate, Stream, channel_binding, constant_time_eq, exclusive_ca_store,
+    hmac_sha256, peer_certificate, public_key_pin, random_bytes, sha256,
 };
 
 /// Encodes `data` as padded standard base64.
