@@ -366,7 +366,7 @@ async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         .as_ref()
         .map(|trust| trust.store())
         .transpose()?;
-    varlink_http_bridge::listen::tls_accept(&config.acceptor, client_store, stream).await
+    varlink_http_bridge::tls::tls_accept(&config.acceptor, client_store, stream).await
 }
 
 /// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
@@ -460,7 +460,7 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkC
     fn connect_info(target: IncomingStream<'_, AsyncTlsListener<PlainListener>>) -> Self {
         let ssl = target.io().ssl();
         log_tls_connection(ssl, target.remote_addr());
-        let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
+        let tls_channel_binding = varlink_http_bridge::tls::export_tls_channel_binding(ssl);
         Self::new(Some(tls_channel_binding))
     }
 }
@@ -478,7 +478,7 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkC
         let ssl = target.io().ssl();
         let peer = target.remote_addr();
         info!("New TLS vsock connection from CID {}", peer.cid());
-        let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
+        let tls_channel_binding = varlink_http_bridge::tls::export_tls_channel_binding(ssl);
         Self::new(Some(tls_channel_binding))
     }
 }
@@ -625,7 +625,7 @@ fn load_tls_config(
     client_ca_path: Option<&str>,
     require_client_cert: bool,
 ) -> anyhow::Result<TlsConfig> {
-    let mut builder = varlink_http_bridge::listen::tls_acceptor_builder(cert_path, key_path)?;
+    let mut builder = varlink_http_bridge::tls::tls_acceptor_builder(cert_path, key_path)?;
 
     // The CAs store is configured per-handshake.
     let client_trust = require_client_cert.then(|| {

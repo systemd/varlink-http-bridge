@@ -4,7 +4,10 @@
 
 mod openssl;
 
-pub use self::openssl::{constant_time_eq, hmac_sha256, random_bytes, sha256};
+pub use self::openssl::{
+    constant_time_eq, exclusive_ca_store, export_tls_channel_binding, hmac_sha256, public_key_pin,
+    random_bytes, sha256, tls_accept, tls_acceptor_builder,
+};
 
 /// Encodes `data` as padded standard base64.
 #[must_use]

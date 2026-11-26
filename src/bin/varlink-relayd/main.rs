@@ -81,7 +81,7 @@ fn parse_args() -> Result<Args> {
 
     let tls = match (cert, key) {
         (Some(cert), Some(key)) => {
-            Some(varlink_http_bridge::listen::tls_acceptor_builder(&cert, &key)?.build())
+            Some(varlink_http_bridge::tls::tls_acceptor_builder(&cert, &key)?.build())
         }
         (None, None) if insecure => {
             warn!("no --cert/--key: nodes connect over plain ws://");

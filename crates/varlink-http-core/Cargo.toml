@@ -24,6 +24,7 @@ socket2 = "0.6"
 # using openssl here to keep size small, rusttls adds ~1.8MB binary size
 # and nativetls does not support mTLS
 openssl = "0.10.81"
+tokio-openssl = "0.6"
 data-encoding = "2"
 sshauth = { workspace = true, optional = true }
 
