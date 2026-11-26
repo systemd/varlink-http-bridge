@@ -70,7 +70,9 @@ impl Connected<IncomingStream<'_, crate::AsyncTlsListener<TunnelListener>>>
     fn connect_info(target: IncomingStream<'_, crate::AsyncTlsListener<TunnelListener>>) -> Self {
         let ssl = target.io().ssl();
         crate::log_tls_connection(ssl, target.remote_addr());
-        Self::new(Some(varlink_http_bridge::export_tls_channel_binding(ssl)))
+        Self::new(Some(varlink_http_bridge::tls::export_tls_channel_binding(
+            ssl,
+        )))
     }
 }
 

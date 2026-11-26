@@ -2796,6 +2796,7 @@ dependencies = [
  "sshauth",
  "tempfile",
  "tokio",
+ "tokio-openssl",
  "tokio-tungstenite 0.30.0",
  "varlink-http-core",
 ]

@@ -195,8 +195,8 @@ fn pin_matches(
     pin: &str,
     mismatch: &'static str,
 ) -> Result<(), &'static str> {
-    let actual =
-        varlink_http_core::public_key_pin(cert).map_err(|_| "cannot fingerprint the server key")?;
+    let actual = varlink_http_core::tls::public_key_pin(cert)
+        .map_err(|_| "cannot fingerprint the server key")?;
     if pin.strip_prefix("sha256//").unwrap_or(pin) == actual {
         Ok(())
     } else {
@@ -341,7 +341,7 @@ impl Transport {
 
         if let ServerTrust::Ca(ca) = &self.server_trust {
             builder.set_cert_store(
-                varlink_http_core::exclusive_ca_store(ca)
+                varlink_http_core::tls::exclusive_ca_store(ca)
                     .with_context(|| format!("loading CA certificate {}", ca.display()))?,
             );
         }
@@ -418,13 +418,14 @@ impl Transport {
                 if tls_stream.ssl().verify_result() == openssl::x509::X509VerifyResult::OK {
                     KnownHost::TrustAuthority
                 } else {
-                    KnownHost::Pin(varlink_http_core::public_key_pin(&cert)?)
+                    KnownHost::Pin(varlink_http_core::tls::public_key_pin(&cert)?)
                 };
             record_known_host(known_hosts, peer, &observed)
                 .with_context(|| format!("recording what {peer} presented"))?;
         }
 
-        let tls_channel_binding = varlink_http_core::export_tls_channel_binding(tls_stream.ssl());
+        let tls_channel_binding =
+            varlink_http_core::tls::export_tls_channel_binding(tls_stream.ssl());
         Ok((Box::new(tls_stream), Some(tls_channel_binding)))
     }
 
@@ -812,7 +813,7 @@ mod pin_tests {
 
     fn self_signed_pin() -> (Identity, String) {
         let id = identity("leaf", None, false);
-        let pin = varlink_http_core::public_key_pin(&id.0).unwrap();
+        let pin = varlink_http_core::tls::public_key_pin(&id.0).unwrap();
         (id, pin)
     }
 
@@ -829,7 +830,7 @@ mod pin_tests {
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
         let pin = Tofu::Recorded(KnownHost::Pin(
-            varlink_http_core::public_key_pin(&leaf.0).unwrap(),
+            varlink_http_core::tls::public_key_pin(&leaf.0).unwrap(),
         ));
         let err = verify_server_cert(&leaf.0, false, &ServerTrust::SystemCas, &pin).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
@@ -861,7 +862,7 @@ mod pin_tests {
 
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let leaf_pin = ServerTrust::Pin(varlink_http_core::public_key_pin(&leaf.0).unwrap());
+        let leaf_pin = ServerTrust::Pin(varlink_http_core::tls::public_key_pin(&leaf.0).unwrap());
         assert!(verify_server_cert(&leaf.0, false, &leaf_pin, &Tofu::Off).is_ok());
 
         let err = verify_server_cert(&leaf.0, false, &pinned, &Tofu::Off).unwrap_err();

@@ -192,7 +192,7 @@ pub(crate) fn print_pin(cert_path: &Path) -> anyhow::Result<()> {
     let pem =
         std::fs::read(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
     let cert = X509::from_pem(&pem).with_context(|| format!("parsing {}", cert_path.display()))?;
-    let pin = varlink_http_bridge::public_key_pin(&cert)?;
+    let pin = varlink_http_bridge::tls::public_key_pin(&cert)?;
     eprintln!("TLS: using self-signed certificate, pin clients to sha256//{pin}");
     Ok(())
 }
@@ -234,13 +234,13 @@ mod tests {
     fn second_run_reuses_the_same_key_so_pins_survive() {
         let dir = tmpdir();
         let (cert_a, _) = load_or_generate(dir.path()).unwrap();
-        let pin_a = varlink_http_bridge::public_key_pin(
+        let pin_a = varlink_http_bridge::tls::public_key_pin(
             &X509::from_pem(&std::fs::read(&cert_a).unwrap()).unwrap(),
         )
         .unwrap();
 
         let (cert_b, _) = load_or_generate(dir.path()).unwrap();
-        let pin_b = varlink_http_bridge::public_key_pin(
+        let pin_b = varlink_http_bridge::tls::public_key_pin(
             &X509::from_pem(&std::fs::read(&cert_b).unwrap()).unwrap(),
         )
         .unwrap();

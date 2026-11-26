@@ -42,7 +42,7 @@ pub(crate) async fn serve(
             let result = match tls {
                 Some(tls) => match tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,
-                    varlink_http_bridge::listen::tls_accept(&tls, None, stream),
+                    varlink_http_bridge::tls::tls_accept(&tls, None, stream),
                 )
                 .await
                 {
