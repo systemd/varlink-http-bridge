@@ -1657,17 +1657,16 @@ fn test_tls_half_configured_is_rejected() {
 
 #[test_with::executable(openssl)]
 #[test]
-fn test_format_x509_subject() {
+fn test_certificate_subject() {
     let pki = make_test_pki();
     let pem = std::fs::read(&pki.client_cert_path).unwrap();
-    let cert = openssl::x509::X509::from_pem(&pem).unwrap();
-    let subject = format_x509_subject(&cert);
+    let subject = tls::Certificate::from_pem_bundle(&pem).unwrap()[0].subject();
     assert_eq!(subject, "CN=test-client");
 }
 
 #[test_with::executable(openssl)]
 #[test]
-fn test_format_x509_subject_multiple_fields() {
+fn test_certificate_subject_multiple_fields() {
     use std::process::Command;
 
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1686,8 +1685,7 @@ fn test_format_x509_subject_multiple_fields() {
     assert!(out.status.success());
 
     let pem = std::fs::read(d.join("cert.pem")).unwrap();
-    let cert = openssl::x509::X509::from_pem(&pem).unwrap();
-    let subject = format_x509_subject(&cert);
+    let subject = tls::Certificate::from_pem_bundle(&pem).unwrap()[0].subject();
     assert_eq!(subject, "O=TestOrg, CN=multi-field");
 }
 

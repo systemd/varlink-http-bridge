@@ -62,7 +62,7 @@ pub const TLS_CHANNEL_BINDING_LEN: usize = 32;
 pub struct TlsChannelBinding(String);
 
 impl TlsChannelBinding {
-    /// Test-only: real bindings come from [`tls::export_tls_channel_binding`].
+    /// Test-only: real bindings come from [`tls::channel_binding`].
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())

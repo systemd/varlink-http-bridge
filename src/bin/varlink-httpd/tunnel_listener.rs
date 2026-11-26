@@ -68,11 +68,9 @@ impl Connected<IncomingStream<'_, crate::AsyncTlsListener<TunnelListener>>>
     for crate::VarlinkConnCache
 {
     fn connect_info(target: IncomingStream<'_, crate::AsyncTlsListener<TunnelListener>>) -> Self {
-        let ssl = target.io().ssl();
-        crate::log_tls_connection(ssl, target.remote_addr());
-        Self::new(Some(varlink_http_bridge::tls::export_tls_channel_binding(
-            ssl,
-        )))
+        let stream = target.io();
+        crate::log_tls_connection(stream, target.remote_addr());
+        Self::new(Some(varlink_http_bridge::tls::channel_binding(stream)))
     }
 }
 

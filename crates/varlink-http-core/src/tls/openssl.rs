@@ -3,8 +3,46 @@
 //! The OpenSSL backend of [`crate::tls`].
 
 use anyhow::Context;
+use openssl::x509::X509;
 
 use crate::{TLS_CHANNEL_BINDING_LABEL, TLS_CHANNEL_BINDING_LEN, TlsChannelBinding};
+
+/// An established TLS session over `S`.
+pub type Stream<S> = tokio_openssl::SslStream<S>;
+
+/// An X.509 certificate.
+#[derive(Clone)]
+pub struct Certificate(X509);
+
+impl Certificate {
+    /// Parses every certificate in `pem`. A PEM without any certificate is
+    /// an empty vector, not an error.
+    ///
+    /// # Errors
+    /// Returns an error if a certificate in `pem` is malformed.
+    pub fn from_pem_bundle(pem: &[u8]) -> anyhow::Result<Vec<Self>> {
+        Ok(X509::stack_from_pem(pem)
+            .context("parsing PEM certificates")?
+            .into_iter()
+            .map(Self)
+            .collect())
+    }
+
+    /// Returns the subject as text, like `CN=host, O=org`.
+    #[must_use]
+    pub fn subject(&self) -> String {
+        self.0
+            .subject_name()
+            .entries()
+            .filter_map(|e| {
+                let obj = e.object().nid().short_name().ok()?;
+                let val = e.data().to_string().ok()?;
+                Some(format!("{obj}={val}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 /// Fingerprint of a certificate's public key: base64 of the SHA-256 digest
 /// of the DER-encoded `SubjectPublicKeyInfo`.
@@ -27,23 +65,29 @@ pub fn public_key_pin(cert: &openssl::x509::X509Ref) -> anyhow::Result<String> {
     Ok(openssl::base64::encode_block(&digest))
 }
 
-/// Export the TLS channel binding value from an established TLS 1.3 session.
-///
-/// Returns the base64-encoded result of `export_keying_material` per RFC 9266.
+/// Exports the RFC 9266 channel binding of an established TLS 1.3 session.
 ///
 /// # Panics
-/// Panics if `export_keying_material` fails (should never happen with
-/// TLS 1.3) or if the export does not work because of an underlying
-/// bug in openssl and returns only zeros (should also never happen).
-pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> TlsChannelBinding {
+/// Panics if the export fails or yields only zeros, neither of which
+/// happens with TLS 1.3.
+#[must_use]
+pub fn channel_binding<S>(stream: &Stream<S>) -> TlsChannelBinding {
     let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
-    ssl.export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
+    stream
+        .ssl()
+        .export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
         .expect("export_keying_material must succeed with TLS 1.3");
     assert!(
         buf.iter().any(|&b| b != 0),
         "TLS channel binding must not be all zeros"
     );
-    TlsChannelBinding(openssl::base64::encode_block(&buf))
+    TlsChannelBinding(super::base64(&buf))
+}
+
+/// Returns the certificate the peer presented, if any.
+#[must_use]
+pub fn peer_certificate<S>(stream: &Stream<S>) -> Option<Certificate> {
+    stream.ssl().peer_certificate().map(Certificate)
 }
 
 /// Returns a `SslAcceptorBuilder` from the given {cert,key}_path with
