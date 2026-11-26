@@ -718,48 +718,37 @@ mod pin_tests {
         );
     }
 
-    type Identity = (
-        openssl::x509::X509,
-        openssl::pkey::PKey<openssl::pkey::Private>,
-    );
+    /// A throwaway certificate and what signs as it.
+    struct Identity {
+        cert: openssl::x509::X509,
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+    }
 
     /// A throwaway identity. Given an `issuer` the certificate is signed by
     /// it and so is not self-signed; without one it signs itself.
     fn identity(cn: &str, issuer: Option<&Identity>, is_ca: bool) -> Identity {
-        use openssl::{asn1::Asn1Time, ec, hash::MessageDigest, nid::Nid, pkey::PKey, x509};
-
-        let group = ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let key = PKey::from_ec_key(ec::EcKey::generate(&group).unwrap()).unwrap();
-
-        let mut nb = x509::X509NameBuilder::new().unwrap();
-        nb.append_entry_by_nid(Nid::COMMONNAME, cn).unwrap();
-        let name = nb.build();
-
-        let mut b = x509::X509::builder().unwrap();
-        b.set_version(2).unwrap();
-        b.set_subject_name(&name).unwrap();
-        match issuer {
-            Some((cert, _)) => b.set_issuer_name(cert.subject_name()).unwrap(),
-            None => b.set_issuer_name(&name).unwrap(),
-        }
-        b.set_pubkey(&key).unwrap();
-        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-            .unwrap();
-        b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-            .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
         if is_ca {
-            b.append_extension(
-                x509::extension::BasicConstraints::new()
-                    .critical()
-                    .ca()
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         }
-        b.sign(issuer.map_or(&key, |(_, k)| k), MessageDigest::sha256())
-            .unwrap();
-        (b.build(), key)
+        let pem = match issuer {
+            Some(ca) => params.signed_by(&key, &rcgen::Issuer::from_params(&ca.params, &ca.key)),
+            None => params.self_signed(&key),
+        }
+        .unwrap()
+        .pem();
+        let cert = openssl::x509::X509::from_pem(pem.as_bytes()).unwrap();
+        Identity { cert, params, key }
+    }
+
+    fn private_key(id: &Identity) -> openssl::pkey::PKey<openssl::pkey::Private> {
+        openssl::pkey::PKey::private_key_from_pem(id.key.serialize_pem().as_bytes()).unwrap()
     }
 
     /// Rejecting inside the verify callback must abort before we send our own
@@ -771,8 +760,8 @@ mod pin_tests {
             let client = identity("cli", None, false);
 
             let mut acceptor = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server()).unwrap();
-            acceptor.set_certificate(&server.0).unwrap();
-            acceptor.set_private_key(&server.1).unwrap();
+            acceptor.set_certificate(&server.cert).unwrap();
+            acceptor.set_private_key(&private_key(&server)).unwrap();
             acceptor.set_verify_callback(SslVerifyMode::PEER, |_ok, _ctx| true);
             let acceptor = acceptor.build();
 
@@ -790,8 +779,8 @@ mod pin_tests {
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let mut b = SslConnector::builder(SslMethod::tls_client()).unwrap();
             b.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
-            b.set_certificate(&client.0).unwrap();
-            b.set_private_key(&client.1).unwrap();
+            b.set_certificate(&client.cert).unwrap();
+            b.set_private_key(&private_key(&client)).unwrap();
             b.set_verify_callback(SslVerifyMode::PEER, move |_ok, _ctx| !reject);
             let mut cfg = b.build().configure().unwrap();
             cfg.set_verify_hostname(false);
@@ -813,7 +802,7 @@ mod pin_tests {
 
     fn self_signed_pin() -> (Identity, String) {
         let id = identity("leaf", None, false);
-        let pin = varlink_http_core::tls::public_key_pin(&id.0).unwrap();
+        let pin = varlink_http_core::tls::public_key_pin(&id.cert).unwrap();
         (id, pin)
     }
 
@@ -822,7 +811,7 @@ mod pin_tests {
         let (id, _) = self_signed_pin();
         // a deliberately wrong recorded key must not veto the CA
         let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
-        assert!(verify_server_cert(&id.0, true, &ServerTrust::SystemCas, &wrong).is_ok());
+        assert!(verify_server_cert(&id.cert, true, &ServerTrust::SystemCas, &wrong).is_ok());
     }
 
     #[test]
@@ -830,9 +819,9 @@ mod pin_tests {
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
         let pin = Tofu::Recorded(KnownHost::Pin(
-            varlink_http_core::tls::public_key_pin(&leaf.0).unwrap(),
+            varlink_http_core::tls::public_key_pin(&leaf.cert).unwrap(),
         ));
-        let err = verify_server_cert(&leaf.0, false, &ServerTrust::SystemCas, &pin).unwrap_err();
+        let err = verify_server_cert(&leaf.cert, false, &ServerTrust::SystemCas, &pin).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
     }
 
@@ -841,11 +830,11 @@ mod pin_tests {
         let (id, pin) = self_signed_pin();
         let system = ServerTrust::SystemCas;
         // first contact, Transport::handshake records afterwards
-        assert!(verify_server_cert(&id.0, false, &system, &Tofu::FirstContact).is_ok());
+        assert!(verify_server_cert(&id.cert, false, &system, &Tofu::FirstContact).is_ok());
         let recorded = Tofu::Recorded(KnownHost::Pin(pin));
-        assert!(verify_server_cert(&id.0, false, &system, &recorded).is_ok());
+        assert!(verify_server_cert(&id.cert, false, &system, &recorded).is_ok());
         let wrong = Tofu::Recorded(KnownHost::Pin("AAAA=".to_string()));
-        let err = verify_server_cert(&id.0, false, &system, &wrong).unwrap_err();
+        let err = verify_server_cert(&id.cert, false, &system, &wrong).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
     }
 
@@ -856,16 +845,17 @@ mod pin_tests {
         let (id, pin) = self_signed_pin();
         // as varlink-httpd prints it, and bare
         let printed = ServerTrust::Pin(format!("sha256//{pin}"));
-        assert!(verify_server_cert(&id.0, false, &printed, &Tofu::Off).is_ok());
+        assert!(verify_server_cert(&id.cert, false, &printed, &Tofu::Off).is_ok());
         let pinned = ServerTrust::Pin(pin);
-        assert!(verify_server_cert(&id.0, false, &pinned, &Tofu::Off).is_ok());
+        assert!(verify_server_cert(&id.cert, false, &pinned, &Tofu::Off).is_ok());
 
         let ca = identity("ca", None, true);
         let leaf = identity("leaf", Some(&ca), false);
-        let leaf_pin = ServerTrust::Pin(varlink_http_core::tls::public_key_pin(&leaf.0).unwrap());
-        assert!(verify_server_cert(&leaf.0, false, &leaf_pin, &Tofu::Off).is_ok());
+        let leaf_pin =
+            ServerTrust::Pin(varlink_http_core::tls::public_key_pin(&leaf.cert).unwrap());
+        assert!(verify_server_cert(&leaf.cert, false, &leaf_pin, &Tofu::Off).is_ok());
 
-        let err = verify_server_cert(&leaf.0, false, &pinned, &Tofu::Off).unwrap_err();
+        let err = verify_server_cert(&leaf.cert, false, &pinned, &Tofu::Off).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
     }
 
@@ -876,9 +866,9 @@ mod pin_tests {
         let (id, pin) = self_signed_pin();
         let (other, _) = self_signed_pin();
         let pinned = ServerTrust::Pin(pin);
-        let err = verify_server_cert(&other.0, true, &pinned, &Tofu::Off).unwrap_err();
+        let err = verify_server_cert(&other.cert, true, &pinned, &Tofu::Off).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
-        assert!(verify_server_cert(&id.0, true, &pinned, &Tofu::Off).is_ok());
+        assert!(verify_server_cert(&id.cert, true, &pinned, &Tofu::Off).is_ok());
     }
 
     /// Without a `known-hosts` file there is no first contact to trust.
@@ -886,7 +876,7 @@ mod pin_tests {
     fn without_known_hosts_a_self_signed_server_is_refused() {
         let (id, _) = self_signed_pin();
         let err =
-            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &Tofu::Off).unwrap_err();
+            verify_server_cert(&id.cert, false, &ServerTrust::SystemCas, &Tofu::Off).unwrap_err();
         assert!(err.contains("known-hosts"), "{err}");
     }
 
@@ -898,7 +888,7 @@ mod pin_tests {
         let (id, _) = self_signed_pin();
         let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
         let err =
-            verify_server_cert(&id.0, false, &ServerTrust::SystemCas, &ca_backed).unwrap_err();
+            verify_server_cert(&id.cert, false, &ServerTrust::SystemCas, &ca_backed).unwrap_err();
         assert!(err.contains("Refusing the downgrade"), "{err}");
     }
 
@@ -912,7 +902,7 @@ mod pin_tests {
             let leaf = identity(cn, Some(&ca), false);
             let ca_backed = Tofu::Recorded(KnownHost::TrustAuthority);
             assert!(
-                verify_server_cert(&leaf.0, true, &ServerTrust::SystemCas, &ca_backed).is_ok(),
+                verify_server_cert(&leaf.cert, true, &ServerTrust::SystemCas, &ca_backed).is_ok(),
                 "{cn} must be accepted"
             );
         }
@@ -922,7 +912,7 @@ mod pin_tests {
     fn a_configured_ca_disables_first_contact_trust() {
         let (id, _) = self_signed_pin();
         let ca = ServerTrust::Ca("/etc/varlinkctl-http/server-ca-file".into());
-        let err = verify_server_cert(&id.0, false, &ca, &Tofu::FirstContact).unwrap_err();
+        let err = verify_server_cert(&id.cert, false, &ca, &Tofu::FirstContact).unwrap_err();
         assert!(err.contains("server-ca-file"), "{err}");
     }
 }
