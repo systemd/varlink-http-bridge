@@ -9,8 +9,8 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use varlink_http_bridge::node_id::MachineId;
+use varlink_http_bridge::tls;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -133,24 +133,37 @@ fn connect_via_relay(connect_addr: &str, id: &str) -> TcpStream {
 /// GET `path` from the bridge over an established CONNECT `stream`,
 /// inside an end-to-end TLS session the relay never sees.
 fn get_via(stream: TcpStream, id: &str, path: &str) -> String {
-    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     // the certificate is self-signed and nothing pins it here
-    builder.set_verify(SslVerifyMode::NONE);
-    let mut tls = builder
+    let accept_any: tls::Verify = std::sync::Arc::new(|_cert, _chain_ok| true);
+    let connector = tls::Connector::new(&tls::Roots::System, None, Some(accept_any)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
-        .configure()
-        .unwrap()
-        .verify_hostname(false)
-        .connect(id, stream)
-        .expect("TLS handshake through the tunnel");
-    tls.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {id}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .unwrap();
-    let mut response = String::new();
-    tls.read_to_string(&mut response)
-        .expect("reading bridge response");
-    response
+        .unwrap();
+    let get = async {
+        stream.set_nonblocking(true).unwrap();
+        let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+        let (mut tls, _) = connector
+            .connect(id, false, stream)
+            .await
+            .expect("TLS handshake through the tunnel");
+        tls.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {id}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tls.read_to_string(&mut response)
+            .await
+            .expect("reading bridge response");
+        response
+    };
+    // the read timeout of `stream` is void once tokio owns the socket
+    runtime
+        .block_on(async { tokio::time::timeout(DEADLINE, get).await })
+        .expect("timed out talking to the bridge")
 }
 
 #[test]
