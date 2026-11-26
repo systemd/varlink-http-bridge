@@ -64,11 +64,9 @@ rustix = { version = "1.0", features = ["net", "process", "system"] }
 tokio-vsock = { version = "0.7", features = ["axum08"] }
 vsock = "0.5"
 socket2 = "0.6"
-# using openssl here to keep size small, rusttls adds ~1.8MB binary size
-# and nativetls does not support mTLS
-# 0.10.81: Asn1StringRef::to_string (format_x509_subject)
+# only for generating the self-signed certificate, everything else goes
+# through varlink_http_core::tls
 openssl = "0.10.81"
-tokio-openssl = "0.6"
 indoc = "2.0.7"
 ssh-key = { version = "0.6", optional = true }
 sshauth = { workspace = true, optional = true }

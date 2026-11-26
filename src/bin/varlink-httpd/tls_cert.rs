@@ -27,6 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use varlink_http_bridge::secret_file::{SecretAccess, check_secret_file};
+use varlink_http_bridge::tls;
 
 /// Ten years. A self-signed certificate has no revocation story.
 const VALIDITY_DAYS: u32 = 3650;
@@ -191,8 +192,12 @@ pub(crate) fn load_or_generate(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)>
 pub(crate) fn print_pin(cert_path: &Path) -> anyhow::Result<()> {
     let pem =
         std::fs::read(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
-    let cert = X509::from_pem(&pem).with_context(|| format!("parsing {}", cert_path.display()))?;
-    let pin = varlink_http_bridge::tls::public_key_pin(&cert)?;
+    let certs = tls::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("parsing {}", cert_path.display()))?;
+    let cert = certs
+        .first()
+        .with_context(|| format!("no PEM certificate found in {}", cert_path.display()))?;
+    let pin = cert.public_key_pin()?;
     eprintln!("TLS: using self-signed certificate, pin clients to sha256//{pin}");
     Ok(())
 }
@@ -234,16 +239,15 @@ mod tests {
     fn second_run_reuses_the_same_key_so_pins_survive() {
         let dir = tmpdir();
         let (cert_a, _) = load_or_generate(dir.path()).unwrap();
-        let pin_a = varlink_http_bridge::tls::public_key_pin(
-            &X509::from_pem(&std::fs::read(&cert_a).unwrap()).unwrap(),
-        )
-        .unwrap();
+        let pin = |path: &Path| {
+            tls::Certificate::from_pem_bundle(&std::fs::read(path).unwrap()).unwrap()[0]
+                .public_key_pin()
+                .unwrap()
+        };
+        let pin_a = pin(&cert_a);
 
         let (cert_b, _) = load_or_generate(dir.path()).unwrap();
-        let pin_b = varlink_http_bridge::tls::public_key_pin(
-            &X509::from_pem(&std::fs::read(&cert_b).unwrap()).unwrap(),
-        )
-        .unwrap();
+        let pin_b = pin(&cert_b);
 
         assert_eq!(pin_a, pin_b, "regeneration must not invalidate client pins");
     }

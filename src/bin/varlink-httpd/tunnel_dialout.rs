@@ -25,7 +25,7 @@ use crate::tunnel_listener::StreamSink;
 /// the relay opens to `sink`.
 pub(crate) fn start(url: &str, node_id: NodeId, sink: StreamSink) -> Result<()> {
     let target = TunnelUrl::parse(url)?;
-    let relay_tls = target.tls.then(relay_tls_connector).transpose()?;
+    let relay_tls = target.tls.then(tls::Connector::system).transpose()?;
     tokio::spawn(dial_loop(target, node_id, relay_tls, sink));
     Ok(())
 }
@@ -126,7 +126,7 @@ type Tunnel = h2::server::Connection<WsByteStream<BoxedStream>, bytes::Bytes>;
 async fn dial_loop(
     target: TunnelUrl,
     node_id: NodeId,
-    relay_tls: Option<openssl::ssl::SslConnector>,
+    relay_tls: Option<tls::Connector>,
     sink: StreamSink,
 ) {
     let relay = target.authority();
@@ -175,7 +175,7 @@ fn with_jitter(base: Duration) -> Duration {
 
 async fn dial(
     target: &TunnelUrl,
-    relay_tls: Option<&openssl::ssl::SslConnector>,
+    relay_tls: Option<&tls::Connector>,
     node_id: NodeId,
     timeouts: &TunnelTimeouts,
 ) -> Result<Tunnel> {
@@ -187,7 +187,13 @@ async fn dial(
             .context("connecting to relay")?;
         varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp)?;
         let stream: BoxedStream = match relay_tls {
-            Some(connector) => Box::new(tls_connect(connector, &target.host, tcp).await?),
+            Some(connector) => Box::new(
+                connector
+                    .connect(&target.host, true, tcp)
+                    .await
+                    .context("TLS connect to relay")?
+                    .0,
+            ),
             None => Box::new(tcp),
         };
         let (ws, _response) = tokio_tungstenite::client_async_with_config(
@@ -259,35 +265,6 @@ async fn serve_tunnel(
             Err(e) => debug!("tunnel stream {stream_id}: {e}"),
         }
     }
-}
-
-/// A TLS connector that verifies the relay against the system trust
-/// store. Building one is expensive, so build it once and reuse it.
-fn relay_tls_connector() -> Result<openssl::ssl::SslConnector> {
-    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-        .context("TLS connector")?;
-    builder
-        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))
-        .context("requiring TLS 1.3")?;
-    Ok(builder.build())
-}
-
-async fn tls_connect(
-    connector: &openssl::ssl::SslConnector,
-    host: &str,
-    tcp: TcpStream,
-) -> Result<tokio_openssl::SslStream<TcpStream>> {
-    let ssl = connector
-        .configure()
-        .context("TLS configure")?
-        .into_ssl(host)
-        .context("TLS setup")?;
-    let mut stream = tokio_openssl::SslStream::new(ssl, tcp).context("TLS stream")?;
-    std::pin::Pin::new(&mut stream)
-        .connect()
-        .await
-        .context("TLS connect to relay")?;
-    Ok(stream)
 }
 
 #[cfg(test)]

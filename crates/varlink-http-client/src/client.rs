@@ -14,8 +14,9 @@ use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
 
 use crate::client_auth::ClientAuth;
-use crate::transport::{ClientCert, ServerTrust, Transport};
+use crate::transport::{ServerTrust, Transport};
 use crate::ws::WsByteStream;
+use varlink_http_core::tls::ClientCert;
 
 /// A credential and the method that presents it.
 #[non_exhaustive]
