@@ -1,6 +1,6 @@
 [package]
 name = "varlink-http-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
 description = "Client side of the varlink-http-bridge: dial a varlink-httpd and get a WebSocket that carries raw varlink"
