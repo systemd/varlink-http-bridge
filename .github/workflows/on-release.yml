@@ -1,0 +1,50 @@
+name: On release
+run-name: On release ${{ github.event.release.tag_name }}
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bump-version:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Open version bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+            echo "::error::$TAG is not a minor release like v1.2.0"
+            exit 1
+          fi
+          IFS=. read -r major minor _ <<< "${TAG#v}"
+          next="$major.$((minor + 1)).0"
+          branch="bump-version-$next"
+          title="many: bump version to $next"
+
+          sed -i "s/^version = \".*\"/version = \"$next\"/" Cargo.toml crates/*/Cargo.toml
+          sed -i "s/^Version:\( *\).*/Version:\1$next/" varlink-httpd.spec
+          cargo update --workspace
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --create "$branch"
+          body="$TAG is released, main now carries the version of the next release. The release workflow checks for it."
+          git commit --all --message "$title" --message "$body"
+          # --force and the PR check make a re-run update the PR of a
+          # previous attempt.
+          git push --force origin "$branch"
+          if [ -z "$(gh pr list --head "$branch" --json number --jq '.[]')" ]; then
+            gh pr create --base main --head "$branch" --title "$title" --body "$body"
+          fi

@@ -1,0 +1,116 @@
+name: Release
+run-name: Release${{ inputs.rc && ' candidate' || '' }}
+
+# Drafts a release, publishing it creates the tag. on-release.yml takes over
+# from there.
+on:
+  workflow_dispatch:
+    inputs:
+      rc:
+        description: Release candidate
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+      prev: ${{ steps.next.outputs.prev }}
+    steps:
+      - name: Check branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::releases are cut from main, not from ${GITHUB_REF}"
+          exit 1
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: next
+        name: Compute next version
+        env:
+          RC: ${{ inputs.rc }}
+        run: |
+          set -euo pipefail
+          # main only cuts minor releases, patch releases come from release
+          # branches. rcs are skipped, so all rcs and the final release of one
+          # version are the same minor bump.
+          last=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1) || true
+          IFS=. read -r major minor _ <<< "${last:-v0.0.0}"
+          version="${major#v}.$((minor + 1)).0"
+
+          # The bump PR of the previous release moved these to this version.
+          bad=0
+          check() {
+            if [ "$2" != "$version" ]; then
+              echo "::error file=$1::version is \"$2\" but the next release is $version"
+              bad=1
+            fi
+          }
+          for f in Cargo.toml crates/*/Cargo.toml; do
+            check "$f" "$(sed -n 's/^version = "\(.*\)"$/\1/p' "$f")"
+          done
+          check varlink-httpd.spec "$(sed -n 's/^Version: *//p' varlink-httpd.spec)"
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+
+          # The notes of a final release cover everything since the last final
+          # release, those of an rc only what changed since the previous rc.
+          prev=$last
+          if [ "$RC" = true ]; then
+            n=$(git tag --list "v$version-rc.*" | sed "s/^v$version-rc\.//" | sort -n | tail -n1)
+            if [ -n "$n" ]; then
+              prev="v$version-rc.$n"
+            fi
+            tag="v$version-rc.$((${n:-0} + 1))"
+          else
+            tag="v$version"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "prev=$prev"
+          } >> "$GITHUB_OUTPUT"
+          echo "Drafting **$tag** with changes since ${prev:-the beginning}" >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PREV: ${{ needs.version.outputs.prev }}
+          RC: ${{ inputs.rc }}
+        run: |
+          set -euo pipefail
+          # Until it is published the tag does not exist, so a re-run computes
+          # the same tag again and replaces the draft.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --yes
+          fi
+          # Publishing tags the commit that ci tested, not whatever main
+          # points to by then.
+          args=(--draft --target "$GITHUB_SHA" --generate-notes)
+          if [ -n "$PREV" ]; then
+            args+=(--notes-start-tag "$PREV")
+          fi
+          if [ "$RC" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
