@@ -21,9 +21,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 # and nativetls does not support mTLS
 openssl = "0.10.81"
 tokio-openssl = "0.6"
-# TODO: switch back to crates.io once tokio-vsock releases a version with
-# From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
-tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock.git", rev = "c6225086" }
+tokio-vsock = "0.7"
 ssh-key = { version = "0.6", optional = true }
 ssh-key-import = { path = "../ssh-key-import", optional = true }
 zeroize = { version = "1", optional = true }

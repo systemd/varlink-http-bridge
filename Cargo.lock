@@ -2511,8 +2511,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-vsock"
-version = "0.7.2"
-source = "git+https://github.com/rust-vsock/tokio-vsock.git?rev=c6225086#c6225086ee112a823d92f301b38f068f09dd984a"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "676ade3d183052ca2703288b48f63a2e82633a24836ca279eb6724ab2a97b05d"
 dependencies = [
  "axum",
  "bytes",
