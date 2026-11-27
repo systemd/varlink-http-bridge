@@ -2789,6 +2789,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
+ "log",
  "openssl",
  "rustix",
  "socket2",
