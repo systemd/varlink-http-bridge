@@ -2,7 +2,7 @@
 %undefine _debugsource_packages
 
 Name:           varlink-httpd
-Version:        0.1.0
+Version:        0.2.0
 Release:        %autorelease
 Summary:        HTTP bridge for local varlink services
 

@@ -1,6 +1,6 @@
 [package]
 name = "varlink-http-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
 description = "What the varlink-http-bridge daemons and their client share: the WebSocket byte stream, TLS channel binding, sshauth tokens and secret file checks"

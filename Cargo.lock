@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-key-import"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "varlink-http-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "varlink-http-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "varlink-http-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
