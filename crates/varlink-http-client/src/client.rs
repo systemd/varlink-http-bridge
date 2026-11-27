@@ -23,6 +23,8 @@ pub enum Auth {
     /// `Authorization: Bearer <key>`, the key as `varlink-httpd gen-api-key`
     /// printed it.
     ApiKey(String),
+    /// `Authorization: Bearer <token>`, a JWT obtained out of band.
+    Jwt(String),
     /// A signature with the key file at `path`: a private key directly, or
     /// a `.pub` or hardware key through the agent at `agent`. Needs TLS;
     /// connecting to a plain URL is an error.
@@ -42,6 +44,7 @@ impl fmt::Debug for Auth {
         // manual so that the key stays out of logs
         match self {
             Self::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
+            Self::Jwt(_) => f.write_str("Jwt(<redacted>)"),
             Self::SshKey { path, agent } => f
                 .debug_struct("SshKey")
                 .field("path", path)
@@ -72,8 +75,9 @@ impl Client {
     /// The configuration `varlinkctl-http` uses: the trust files from the
     /// first existing of `$XDG_CONFIG_HOME/varlinkctl-http`,
     /// `~/.config/varlinkctl-http` and `/etc/varlinkctl-http`, the API key
-    /// from `VARLINK_API_KEY` or the `api-key` file there, and the SSH key
-    /// from `VARLINK_SSH_KEY` or the agent at `SSH_AUTH_SOCK`. See the
+    /// from `VARLINK_API_KEY` or the `api-key` file there, the JWT from
+    /// `VARLINK_JWT`, and the SSH key from `VARLINK_SSH_KEY` or the agent at
+    /// `SSH_AUTH_SOCK`. See the
     /// bridge README.
     ///
     /// # Errors
@@ -82,6 +86,7 @@ impl Client {
     pub fn from_env() -> Result<Self> {
         let mut auths = Vec::new();
         auths.extend(crate::api_key_client::auth_from_env()?);
+        auths.extend(crate::jwt_client::auth_from_env());
         auths.extend(crate::sshauth_client::auth_from_env());
         ClientBuilder {
             transport: Transport::from_env(),
@@ -95,7 +100,7 @@ impl Client {
     /// `url` is the full endpoint, `https://host:1031/ws/services/io.systemd.Hostname`
     /// (`/ws/sockets/` is the older spelling); `http` and `vsock://cid:port`
     /// work the same way. The first applicable auth method wins: the API key
-    /// if set, else the SSH key or every key in the agent, else no credential
+    /// if set, else the JWT, else the SSH key or every key in the agent, else no credential
     /// and the server decides. The ssh-agent path may wait for a hardware key
     /// to be touched. The future is not `Send`.
     ///
@@ -227,6 +232,12 @@ impl ClientBuilder {
             methods.push(match auth {
                 Auth::ApiKey(key) => {
                     Box::new(crate::api_key_client::ApiKeyBearer::new(key, transport))
+                }
+                #[cfg(feature = "jwtauth")]
+                Auth::Jwt(token) => Box::new(crate::jwt_client::JwtBearer::new(token, transport)),
+                #[cfg(not(feature = "jwtauth"))]
+                Auth::Jwt(_) => {
+                    bail!("JWT auth was configured but this build lacks the 'jwtauth' feature")
                 }
                 Auth::SshKey { path, agent } => Box::new(crate::sshauth_client::SshSignature::new(
                     Some(path),

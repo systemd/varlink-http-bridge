@@ -41,9 +41,6 @@ pub(crate) fn auth_from_env() -> Option<Auth> {
 mod enabled;
 #[cfg(feature = "sshauth")]
 pub(crate) use enabled::SshSignature;
-// the transport tests check the 401 detection the retry loop relies on
-#[cfg(all(feature = "sshauth", test))]
-pub(crate) use enabled::is_http_unauthorized;
 
 #[cfg(not(feature = "sshauth"))]
 mod disabled {

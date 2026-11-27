@@ -8,6 +8,7 @@ description = "Client side of the varlink-http-bridge: dial a varlink-httpd and 
 [features]
 default = ["sshauth"]
 sshauth = ["dep:ssh-key", "dep:ssh-key-import", "dep:sshauth", "dep:zeroize", "varlink-http-core/sshauth"]
+jwtauth = []
 
 [dependencies]
 varlink-http-core = { path = "../varlink-http-core", default-features = false }

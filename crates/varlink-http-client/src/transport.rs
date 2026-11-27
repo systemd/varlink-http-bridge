@@ -1017,7 +1017,7 @@ mod tests {
         async fn test_ws_handshake_401_is_detected_as_unauthorized() {
             let err =
                 handshake_error("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
-            assert!(crate::sshauth_client::is_http_unauthorized(&err), "{err:#}");
+            assert!(crate::client_auth::is_http_unauthorized(&err), "{err:#}");
         }
 
         #[tokio::test]
@@ -1025,10 +1025,7 @@ mod tests {
             let err =
                 handshake_error("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
                     .await;
-            assert!(
-                !crate::sshauth_client::is_http_unauthorized(&err),
-                "{err:#}"
-            );
+            assert!(!crate::client_auth::is_http_unauthorized(&err), "{err:#}");
         }
     }
 }
