@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+//
+// varlink-httpd runs with DynamicUser=yes by default so the varlink services
+// ask polkit about every privileged operation.
+//
+// By default we ship an open rule, note that this can be customized.
+//
+// Match the unit, not the user, so nothing depends on NSS resolving the
+// DynamicUser.
+//
+// See https://polkit.pages.freedesktop.org/polkit/polkit.8.html for the rule
+// language and the subject attributes.
+polkit.addRule(function (action, subject) {
+    if (subject.system_unit === "varlink-httpd.service") {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

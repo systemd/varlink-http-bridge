@@ -1,0 +1,7 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of varlink-http-bridge.
+
+# Setgid so that files created here, e.g. by "varlink-httpd gen-api-key",
+# belong to the group the service reads them as.
+d /etc/varlink-httpd 2750 root varlink-httpd -
