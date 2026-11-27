@@ -53,7 +53,9 @@ async fn stub_node_hanging_streams(
     let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={id}");
     let (ws, _response) = tokio_tungstenite::client_async(url, tcp).await?;
     Ok(tokio::spawn(async move {
-        let mut conn = server_handshake(WsByteStream::new(ws)).await.unwrap();
+        let mut conn = server_handshake(WsByteStream::new(ws).close_on_shutdown())
+            .await
+            .unwrap();
         let mut streams = 0;
         let mut hung = Vec::new();
         while let Ok(Some(pending)) = TunnelStream::server(&mut conn).await {
