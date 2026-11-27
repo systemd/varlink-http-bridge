@@ -14,14 +14,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
         with:
           ref: main
-      - name: Open version bump PR
+      - id: next
+        name: Compute next version
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
@@ -30,12 +31,36 @@ jobs:
             exit 1
           fi
           IFS=. read -r major minor _ <<< "${TAG#v}"
-          next="$major.$((minor + 1)).0"
-          branch="bump-version-$next"
-          title="many: bump version to $next"
+          echo "version=$major.$((minor + 1)).0" >> "$GITHUB_OUTPUT"
+      - name: Move milestones
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          NEXT: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          milestones="repos/$GITHUB_REPOSITORY/milestones"
+          number=$(gh api --paginate "$milestones?state=open" --jq ".[] | select(.title == \"$TAG\") | .number")
+          if [ -n "$number" ]; then
+            gh api --method PATCH "$milestones/$number" -f state=closed > /dev/null
+          else
+            echo "::notice::there is no open milestone $TAG to close"
+          fi
+          if [ -z "$(gh api --paginate "$milestones?state=all" --jq ".[] | select(.title == \"v$NEXT\") | .number")" ]; then
+            gh api "$milestones" -f title="v$NEXT" > /dev/null
+          fi
+      - name: Open version bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          NEXT: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="bump-version-$NEXT"
+          title="many: bump version to $NEXT"
 
-          sed -i "s/^version = \".*\"/version = \"$next\"/" Cargo.toml crates/*/Cargo.toml
-          sed -i "s/^Version:\( *\).*/Version:\1$next/" varlink-httpd.spec
+          sed -i "s/^version = \".*\"/version = \"$NEXT\"/" Cargo.toml crates/*/Cargo.toml
+          sed -i "s/^Version:\( *\).*/Version:\1$NEXT/" varlink-httpd.spec
           cargo update --workspace
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -45,6 +70,7 @@ jobs:
           # --force and the PR check make a re-run update the PR of a
           # previous attempt.
           git push --force origin "$branch"
+          # The bump PR is the first change of the next version.
           if [ -z "$(gh pr list --head "$branch" --json number --jq '.[]')" ]; then
-            gh pr create --base main --head "$branch" --title "$title" --body "$body"
+            gh pr create --base main --head "$branch" --title "$title" --body "$body" --milestone "v$NEXT"
           fi
